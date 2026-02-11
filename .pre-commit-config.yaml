@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright 2025 Idiap Research Institute <contact@idiap.ch>
+# SPDX-FileContributor: Anshul Gupta <anshul.gupta@idiap.ch>
+# SPDX-License-Identifier: GPL-3.0-only
+
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+
+repos:
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-json
+      - id: check-shebang-scripts-are-executable
+      - id: check-toml
+      - id: check-xml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.0.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [--verbose, --strict, build, chore, ci, docs, feat, fix, perf, refactor, style, test]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.2
+    hooks:
+      - id: ruff
+        args: [ --fix, --ignore, "F405,F403"]
+      - id: ruff-format

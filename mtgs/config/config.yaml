@@ -1,0 +1,179 @@
+
+# SPDX-FileCopyrightText: Copyright 2025 Idiap Research Institute <contact@idiap.ch>
+# SPDX-FileContributor: Anshul Gupta <anshul.gupta@idiap.ch>
+# SPDX-License-Identifier: GPL-3.0-only
+
+device: cuda
+
+wandb:
+  project_name: MTGS
+  username: ...  # update username
+  log: True
+  watch_freq: 500
+  watch: null
+  group: null
+
+model:
+  patch_size: 14
+  head_size: 224
+  output: heatmap
+  token_dim: 768
+  image_size: ${data.image_size}
+  gaze_feature_dim: 512
+  encoder_depth: 12
+  encoder_num_heads: 12
+  encoder_num_global_tokens: 1
+  encoder_mlp_ratio: 4.0
+  encoder_use_qkv_bias: True
+  encoder_drop_rate: 0.0
+  encoder_attn_drop_rate: 0.0
+  encoder_drop_path_rate: 0.0
+  decoder_feature_dim: 128
+  decoder_hooks: [2, 5, 8, 11]
+  decoder_hidden_dims: [96, 192, 384, 768]
+  decoder_use_bn: True
+  gaze_weights: ... # update path
+  multivit_weights: False
+  weights: False  # {False, path to weights}
+
+head_detector:
+  checkpoint_file: ... # update path
+  detection_thr: 0.4
+  image_size: 640
+  conf_thr: 0.25
+  iou_thr: 0.45
+  expand_bbox: 0.1
+
+tracker:
+  det_threshold: 0.2
+  asso_threshold: 0.1
+  max_age: 300
+  inertia: 0.5
+
+data:
+  num_people: 4
+  image_size: 448
+  temporal_stride: 3
+  temporal_context: 2
+  heatmap_size: 64
+  return_head_mask: False
+  ann_root: ... # update path
+  num_samples: 36000    # GazeFollow: 108955, VSGaze: 36000
+  max_train_samples: null
+  max_val_samples: null
+  max_test_samples: null
+  gazefollow:
+    root: .../gazefollow_extended # update path
+  videocoatt:
+    root: .../VideoCoAtt_Dataset # update path
+  vat:
+    root: .../VideoAttentionTarget # update path
+  uco_laeo:
+    root: .../UCO-LAEO # update path
+  childplay:
+    root: .../ChildPlay # update path
+
+demo:
+  checkpoint_file: /${hydra:runtime.cwd}/../data/demo/mtgs_model.ckpt
+  video_file: /${hydra:runtime.cwd}/../data/demo/video.mp4
+  output_folder: /${hydra:runtime.cwd}/output_demo/
+  heatmap_pid: -1
+  inout_thr: 0.80
+  alpha: 0.5
+
+visualization:
+  show_gaze_vec: True
+  show_frame_nb: True
+  thickness: 2
+  font_scale: 2.0
+  colors: [[200, 0, 0], [0, 200, 0], [0, 0, 200], [200, 200, 0], [200, 0, 200], [0, 200, 200], [255, 99, 71], [47, 79, 79], [75, 0, 130], [255, 140, 0], [160, 82, 45], [255, 105, 180], [128, 128, 0]]
+  gaze_point_size: 24
+  head_center_size: 24
+
+image:
+  normalization:
+    mean: [0.44232, 0.40506, 0.36457]
+    std: [0.28674, 0.27776, 0.27995]
+
+experiment:
+  name: MTGS-dino-448
+  task: train+test
+  dataset: vsgaze # /!\ gazefollow, childplay, vat, videocoatt, uco_laeo, vsgaze
+  output_folder: ${hydra:run.dir} # to retrieve logs and checkpoints
+
+train:
+  seed: 101
+  matmul_precision: medium # highest, high, medium
+  precision: bf16-mixed  # 64 (double), 32 (full), 16 (16bit mixed), bf16-mixed (bfloat16 mixed). Defaults to 32.
+  epochs: 20
+  batch_size: 8
+  accumulate_grad_batches: 1
+  resume: False
+  resume_from: null
+  freeze:
+    gaze_encoder: False
+    gaze_encoder_backbone: False
+    image_tokenizer: True
+    depth_tokenizer: False
+    vit_encoder: True
+    vit_adaptor: False
+    gaze_decoder: False
+    inout_decoder: False
+  swa:
+    use: True
+    lr: [1e-6, 1e-6, 1e-6, 3e-7]
+    epoch_start: 12
+    annealing_epochs: 6
+
+val:
+  batch_size: 8
+
+test:
+  checkpoint: null
+  batch_size: 1
+
+optimizer:
+  lr: 1e-6
+  weight_decay: 1e-3
+
+scheduler:
+    type: CosineAnnealingWarmRestarts # {CosineAnnealingWarmRestarts, StepLR}
+    warmup_epochs: 4
+    t_0_epochs: 20
+    t_mult: 1
+
+hydra:
+  run:
+    dir: /${hydra:runtime.cwd}/../experiments/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+  job_logging:
+    version: 1
+
+    root:
+      level: INFO
+      handlers: [console, file]
+
+    handlers:
+      console:
+        class: colorlog.StreamHandler
+        formatter: color
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: file
+        filename: ${hydra:run.dir}/mylog.log
+
+    formatters:
+      color:
+        format: "%(log_color)s%(asctime)s | %(name)s | %(levelname)-8s | %(message)s"
+        datefmt: "%H:%M:%S"
+        class: colorlog.ColoredFormatter
+        log_colors:
+          DEBUG:    cyan
+          INFO:     green
+          WARNING:  yellow
+          ERROR:    red
+          CRITICAL: bold_red
+      file:
+        format: "%(asctime)s | %(name)s | %(levelname)-8s | %(message)s"
+        datefmt: "%H:%M:%S"
