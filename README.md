@@ -40,7 +40,7 @@ Results on GazeFollow test set:
 | Gaze-LLE [CVPR'25]        | 448x448    | **0.956**  | 0.104      | 0.045      |
 | MTGS-static [NeurIPS'24]  | 224x224    | 0.929      | 0.116      | 0.059      |
 | MTGS-DINO-static          | 224x224    | 0.944      | 0.101      | 0.045      |
-| MTGS-DINO-static          | 448x448    | 0.949      | **0.098**  | **0.043**  |
+| MTGS-DINO-static          | 448x448    | 0.948      | **0.094**  | **0.041**  |
 
 Results on the VideoAttentionTarget test set:
 
