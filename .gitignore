@@ -2,18 +2,44 @@
 # SPDX-FileContributor: Anshul Gupta <anshul.gupta@idiap.ch>
 # SPDX-License-Identifier: GPL-3.0-only
 
+# W&B / 학습 로그
 wandb/
 lightning_logs/
 .hydra/
 .ipynb_checkpoints/
 csvs/
-experiments/
-*.pyc
-*__pycache__**
-*trash*
-*.log
-*backup*
-data/
-mtgs/notebooks/
 outputs/
-scripts/logs/
+mtgs/notebooks/
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+dist/
+build/
+*.so
+.env
+
+# 임시/백업
+*trash*
+*backup*
+
+# 데이터셋 (대용량 이미지/어노테이션)
+data/
+
+# 실험 결과 및 체크포인트
+experiments/
+
+# SLURM 로그
+logs/
+*.log
+
+# 사전학습 가중치 파일
+weights/
+
+# Claude Code 로컬 설정 (공유 불필요)
+.claude/settings*.json
+
+# 논문 PDF
+A_Unified_Model_for_Gaze_Following_and_Social_Gaze_Prediction.pdf

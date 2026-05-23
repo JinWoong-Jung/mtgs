@@ -86,6 +86,8 @@ class ChildPlayDataset_temporal(Dataset):
             index_keep = np.arange(len(self.paths), step=self.stride)
             self.paths = self.paths[index_keep]
 
+        self.paths = np.array([p for p in self.paths if os.path.exists(os.path.join(root, p))])
+
     def __getitem__(self, index):
         path = self.paths[index]
         clip, frame = path.split("/")[1:]

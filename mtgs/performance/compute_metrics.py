@@ -223,5 +223,11 @@ if __name__ == "__main__":
 
     pickle_path = '.../test_predictions.p'
     with open(pickle_path, 'rb') as f:
-        results = CPU_Unpickler(f).load()
+        unpickler = CPU_Unpickler(f)
+        results = []
+        while True:
+            try:
+                results.append(unpickler.load())
+            except EOFError:
+                break
     compute(results, shuffle=False, thr=0.5)

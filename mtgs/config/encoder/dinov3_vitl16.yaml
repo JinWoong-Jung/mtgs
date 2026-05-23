@@ -1,0 +1,7 @@
+# @package model
+encoder_name: dinov3_vitl16
+patch_size: 16
+token_dim: 1024
+encoder_depth: 24
+encoder_num_heads: 16
+decoder_hooks: [5, 11, 17, 23]

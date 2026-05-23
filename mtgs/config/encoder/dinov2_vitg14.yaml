@@ -1,0 +1,7 @@
+# @package model
+encoder_name: dinov2_vitg14
+patch_size: 14
+token_dim: 1536
+encoder_depth: 40
+encoder_num_heads: 24
+decoder_hooks: [9, 19, 29, 39]

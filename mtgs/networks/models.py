@@ -25,7 +25,9 @@ from mtgs.train.losses import (
     compute_sharingan_loss,
     compute_interact_loss,
     compute_social_loss,
+    social_loss,
     compute_inout_loss,
+    compute_null_node_loss,
 )
 
 from mtgs.performance.metrics import (
@@ -66,6 +68,14 @@ class MTGSModel(pl.LightningModule):
             decoder_use_bn=cfg.model.decoder_use_bn,
             temporal_context=cfg.data.temporal_context,
             output=cfg.model.output,
+            encoder_name=cfg.model.encoder_name,
+            interaction_type=cfg.interaction.type,
+            graph_num_layers=cfg.interaction.graph.num_layers,
+            graph_hidden_channels=cfg.interaction.graph.hidden_channels,
+            graph_heads=cfg.interaction.graph.heads,
+            graph_use_null_node=cfg.interaction.graph.use_null_node,
+            graph_use_gaze_prior=cfg.interaction.graph.use_gaze_prior,
+            graph_prior_weight=cfg.interaction.graph.prior_weight,
         )
 
         self.cfg = cfg
@@ -74,7 +84,8 @@ class MTGSModel(pl.LightningModule):
         self.num_steps_in_epoch = math.ceil(
             self.num_tranining_samples / cfg.train.batch_size
         )
-        self.test_step_outputs = []
+        self._pred_file = None
+        self._pred_write_count = 0
 
         # Model weights paths
         self.model_weights = cfg.model.weights
@@ -130,7 +141,7 @@ class MTGSModel(pl.LightningModule):
     def _init_weights(self):
         # Load pre-trained weights
         if self.model_weights:
-            model_ckpt = torch.load(self.model_weights, map_location="cpu")
+            model_ckpt = torch.load(self.model_weights, map_location="cpu", weights_only=False)
             model_weights = OrderedDict(
                 [
                     (name.replace("model.", ""), value)
@@ -145,7 +156,7 @@ class MTGSModel(pl.LightningModule):
         else:
             # Load weights for Multi ViT
             if self.multivit_weights:
-                multivit_ckpt = torch.load(self.multivit_weights, map_location="cpu")
+                multivit_ckpt = torch.load(self.multivit_weights, map_location="cpu", weights_only=False)
                 image_tokenizer_weights = OrderedDict(
                     [
                         (name.replace("input_adapters.rgb.", ""), value)
@@ -175,7 +186,7 @@ class MTGSModel(pl.LightningModule):
                 del multivit_ckpt, image_tokenizer_weights, encoder_weights
 
             # Load Gaze Encoder Gaze360 Pre-trained Weights
-            gaze360_ckpt = torch.load(self.gaze_weights, map_location="cpu")
+            gaze360_ckpt = torch.load(self.gaze_weights, map_location="cpu", weights_only=False)
             gaze360_weights = OrderedDict(
                 [
                     (name.replace("base_head.", ""), value)
@@ -228,44 +239,76 @@ class MTGSModel(pl.LightningModule):
         return self.model(batch)
 
     def configure_optimizers(self):
-        # separate params for temporal modelling and shared attention prediction
-        temporal_params = [
-            {
-                "params": self.model.gaze_encoder_temporal.parameters(),
-                "name": "gaze-encoder-temporal",
-                "lr": self.cfg.optimizer.lr * 3,
-                "init_lr": self.cfg.optimizer.lr * 3,
-            },
-            {
-                "params": self.model.people_temporal.parameters(),
-                "name": "people-temporal",
-                "lr": self.cfg.optimizer.lr * 3,
-                "init_lr": self.cfg.optimizer.lr * 3,
-            },
-            {
-                "params": self.model.decoder_sa.parameters(),
-                "name": "decoder-sa",
-                "lr": self.cfg.optimizer.lr * 3,
-                "init_lr": self.cfg.optimizer.lr * 3,
-            },
-        ]
+        base_lr = self.cfg.optimizer.lr
 
-        other_params = []
-        for k, v in self.model.named_parameters():
-            if (
-                ("_temporal" not in k) and ("decoder_sa" not in k)
-            ):
-                other_params.append(v)
+        if self.model.use_graph:
+            high_lr_params = [
+                {
+                    "params": self.model.gaze_encoder_temporal.parameters(),
+                    "name": "gaze-encoder-temporal",
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
+                {
+                    "params": self.model.social_graph_blocks.parameters(),
+                    "name": "social-graph-blocks",
+                    "lr": base_lr * 10,
+                    "init_lr": base_lr * 10,
+                },
+                {
+                    "params": self.model.temporal_graph_blocks.parameters(),
+                    "name": "temporal-graph-blocks",
+                    "lr": base_lr * 5,
+                    "init_lr": base_lr * 5,
+                },
+            ]
+            high_lr_prefixes = {
+                "gaze_encoder_temporal",
+                "social_graph_blocks",
+                "temporal_graph_blocks",
+            }
+        else:
+            # Original: temporal modules + decoder_sa at 3× LR
+            high_lr_params = [
+                {
+                    "params": self.model.gaze_encoder_temporal.parameters(),
+                    "name": "gaze-encoder-temporal",
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
+                {
+                    "params": self.model.people_temporal.parameters(),
+                    "name": "people-temporal",
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
+                {
+                    "params": self.model.decoder_sa.parameters(),
+                    "name": "decoder-sa",
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
+            ]
+            high_lr_prefixes = {
+                "gaze_encoder_temporal",
+                "people_temporal",
+                "decoder_sa",
+            }
+
+        other_params = [
+            v for k, v in self.model.named_parameters()
+            if not any(k.startswith(prefix) for prefix in high_lr_prefixes)
+        ]
         other_params = [
             {
                 "params": other_params,
                 "name": "base",
-                "lr": self.cfg.optimizer.lr,
-                "init_lr": self.cfg.optimizer.lr,
+                "lr": base_lr,
+                "init_lr": base_lr,
             }
         ]
 
-        params = temporal_params + other_params
+        params = high_lr_params + other_params
         optimizer = optim.AdamW(params, weight_decay=self.cfg.optimizer.weight_decay)
 
         # cosine annealing
@@ -341,6 +384,8 @@ class MTGSModel(pl.LightningModule):
                 lah_pred,
                 laeo_pred,
                 coatt_pred,
+                null_logits_pred,
+                aux_lah_logits,
             ) = self(batch)
             batch_size, t, n, hm_h, hm_w = gaze_hm_pred.shape
             gaze_hm_pred = gaze_hm_pred.view(batch_size * t, n, hm_h, hm_w)
@@ -350,6 +395,8 @@ class MTGSModel(pl.LightningModule):
             )
             batch_size, t, n = gaze_pt_pred.shape[:-1]
             gaze_pt_pred = gaze_pt_pred.view(batch_size * t, n, -1)
+            null_logits_pred = None
+            aux_lah_logits = []
         gaze_vec_pred = gaze_vec_pred.view(batch_size * t, n, -1)
         inout_pred = inout_pred.view(batch_size * t, -1)
         lah_pred = lah_pred.view(batch_size * t, -1)
@@ -395,7 +442,39 @@ class MTGSModel(pl.LightningModule):
             coatt_gt,
             coatt_mask,
         )
-        loss += loss_social
+        # Graph mode: boost social loss weight to overcome randomly-initialized modules.
+        # Transformer mode keeps the original 1× to avoid hurting gaze dist performance.
+        social_scale = 2.0 if self.model.use_graph else 1.0
+        loss += social_scale * loss_social
+
+        # Null node supervision (graph mode only)
+        if null_logits_pred is not None:
+            num_valid_flat = batch["num_valid_people"].view(batch_size * t).clamp(min=1)
+            null_loss = compute_null_node_loss(
+                null_logits_pred,
+                batch["lah_labels"].view(batch_size * t, -1),
+                num_valid_flat,
+            )
+            loss = loss + 0.5 * null_loss
+            self.log(
+                "loss/train/null_node",
+                null_loss.item(),
+                batch_size=batch_size * t,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+            )
+
+        # Auxiliary LAH supervision from intermediate SocialGraphBlock layers (graph only).
+        if aux_lah_logits:
+            aux_total = None
+            for aux_lah in aux_lah_logits[:-1]:  # skip last (captured in main readout)
+                aux_lah_flat = aux_lah.view(batch_size * t, -1)
+                if lah_mask.any():
+                    layer_loss = social_loss(aux_lah_flat, lah_gt, lah_mask, pos_weight=3.0)
+                    aux_total = layer_loss if aux_total is None else aux_total + layer_loss
+            if aux_total is not None:
+                loss = loss + 0.3 * aux_total
 
         # Log Social Gaze Losses
         self.log(
@@ -481,6 +560,8 @@ class MTGSModel(pl.LightningModule):
                 lah_pred,
                 laeo_pred,
                 coatt_pred,
+                _null,
+                _aux,
             ) = self(batch)
             # only take outputs of central frame
             batch_size, t, n, hm_h, hm_w = gaze_hm_pred.shape
@@ -734,6 +815,8 @@ class MTGSModel(pl.LightningModule):
                 lah_pred,
                 laeo_pred,
                 coatt_pred,
+                _null,
+                _aux,
             ) = self(batch)
             batch_size, t, num_people, hm_h, hm_w = gaze_hm_pred.shape
             # only take outputs of central frame
@@ -974,42 +1057,47 @@ class MTGSModel(pl.LightningModule):
                     sync_dist=True,
                 )
 
-        # Build output dict
+        # Build output dict — move tensors to CPU immediately to prevent GPU memory accumulation
         output = {
-            "head_bboxes": batch["head_bboxes"][:, middle_frame_idx, :, :],
-            "gp_pred": gaze_pt_pred,
-            "gp_gt": batch["gaze_pts"][:, middle_frame_idx, :, :],
-            "gv_pred": gaze_vec_pred,
-            "gv_gt": batch["gaze_vecs"][:, middle_frame_idx, :, :],
+            "head_bboxes": batch["head_bboxes"][:, middle_frame_idx, :, :].cpu(),
+            "gp_pred": gaze_pt_pred.cpu(),
+            "gp_gt": batch["gaze_pts"][:, middle_frame_idx, :, :].cpu(),
+            "gv_pred": gaze_vec_pred.cpu(),
+            "gv_gt": batch["gaze_vecs"][:, middle_frame_idx, :, :].cpu(),
             #   # optionally save gaze heatmaps
-            #   "hm_pred": gaze_hm_pred,
-            #   "hm_gt": batch["gaze_heatmaps"][:,middle_frame_idx,:,:,:],
-            "inout_gt": inout_gt,
+            #   "hm_pred": gaze_hm_pred.cpu(),
+            #   "hm_gt": batch["gaze_heatmaps"][:,middle_frame_idx,:,:,:].cpu(),
+            "inout_gt": inout_gt.cpu(),
             "path": batch["path"],
-            #                   "pids": batch['pids'],
-            "inout_pred": inout_pred,
-            "coatt_pred": coatt_pred,
-            "laeo_pred": laeo_pred,
-            "lah_pred": lah_pred,
-            "coatt_gt": coatt_gt,
-            "laeo_gt": laeo_gt,
-            "lah_gt": lah_gt,
+            "inout_pred": inout_pred.cpu(),
+            "coatt_pred": coatt_pred.cpu(),
+            "laeo_pred": laeo_pred.cpu(),
+            "lah_pred": lah_pred.cpu(),
+            "coatt_gt": coatt_gt.cpu(),
+            "laeo_gt": laeo_gt.cpu(),
+            "lah_gt": lah_gt.cpu(),
             "dataset": batch["dataset"],
-            "num_valid_people": batch["num_valid_people"],
+            "num_valid_people": batch["num_valid_people"].cpu(),
         }
-        self.test_step_outputs.append(output)
+        if self._pred_file is not None:
+            pickle.dump(output, self._pred_file)
+            self._pred_write_count += 1
+            if self._pred_write_count % 500 == 0:
+                self._pred_file.flush()
+
+    def on_test_start(self):
+        output_file = os.path.join(
+            self.cfg.experiment.output_folder, "test_predictions.p"
+        )
+        os.makedirs(self.cfg.experiment.output_folder, exist_ok=True)
+        self._pred_file = open(output_file, "wb")
+        self._pred_write_count = 0
 
     def on_test_epoch_end(self):
         # Reset metrics
         self.metrics["test_dist"].reset()
         # self.metrics["test_auc"].reset()
 
-        # Save test predictions
-        self._save_predictions(self.test_step_outputs)
-
-    def _save_predictions(self, outputs):
-        output_file = os.path.join(
-            self.cfg.experiment.output_folder, "test_predictions.p"
-        )
-        with open(output_file, "wb") as file:
-            pickle.dump(outputs, file)
+        if self._pred_file is not None:
+            self._pred_file.close()
+            self._pred_file = None

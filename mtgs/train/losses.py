@@ -24,19 +24,25 @@ def social_loss(social_pred, social_gt, mask, pos_weight=2.0):
         Dictionary representing the items to log (e.g. {"total_loss": total_loss})
     """
 
-    # set social_gt positions where mask is 0 to 0 (to avoid NaNs in loss computation)
-    social_gt = social_gt * mask
+    # Intersect annotation mask with finiteness: skip positions where the logit is
+    # non-finite (safety guard — root cause is dataset padding pid -2, but keep as
+    # defence against any future annotation/masking mismatches).
+    finite_mask = mask & torch.isfinite(social_pred)
+    num_instances = finite_mask.sum()
+    if num_instances == 0:
+        # No valid pairs: return a plain zero — avoids NaN from empty reduction.
+        return torch.tensor(0.0, device=social_pred.device)
 
-    num_instances = mask.sum()
+    # Index only valid, finite positions before BCE.
+    valid_pred = social_pred[finite_mask]
+    valid_gt = social_gt[finite_mask].float()
     loss = F.binary_cross_entropy_with_logits(
-        social_pred,
-        social_gt,
-        pos_weight=torch.tensor(pos_weight, device=social_gt.device),
-        reduction="none",
+        valid_pred,
+        valid_gt,
+        pos_weight=torch.tensor(pos_weight, device=valid_gt.device),
+        reduction="sum",
     )
-    loss = torch.mul(loss, mask).sum() / (num_instances + 1e-6)
-
-    return loss
+    return loss / num_instances.float()
 
 
 def compute_social_loss(
@@ -193,3 +199,60 @@ def compute_inout_loss(io_pred, io_gt, mask):
     bce_loss = (bce_loss * mask).sum() / mask.sum()
 
     return bce_loss
+
+
+def compute_null_node_loss(null_logits, lah_gt, num_valid_people):
+    """Null-node supervision for SocialGraphBlock.
+
+    For each valid source person g:
+      null_GT(g) = 1  if ALL lah_gt(g→j) == 0  (person g looks at nobody)
+      null_GT(g) = 0  if ANY lah_gt(g→j) == 1  (person g looks at someone)
+      skip            if ALL lah_gt(g→j) == -1  (no annotation for this person)
+
+    Valid people occupy the BACK slots (global positions N-nv..N-1) per the
+    dataset's prepend-zero padding convention. Edges in lah_gt are ordered as
+    itertools.permutations(range(N), 2), so pair (g, d) is at position
+    g*(N-1) + (d if d < g else d-1).
+
+    Args:
+        null_logits:       (BT, N)         source-to-null logits
+        lah_gt:            (BT, N*(N-1))   GT LAH labels (0 / 1 / -1)
+        num_valid_people:  (BT,) int       valid person count per frame
+
+    Returns:
+        Scalar BCE loss over all annotated (sample, person) pairs.
+    """
+    device = null_logits.device
+    BT = null_logits.shape[0]
+    N = null_logits.shape[1]
+
+    valid_logits = []
+    valid_gts = []
+
+    for bt in range(BT):
+        nv = int(num_valid_people[bt])
+        if nv <= 1:
+            continue
+        nv_start = N - nv  # valid people at global positions nv_start..N-1
+        for i_local in range(nv):
+            g = nv_start + i_local  # global position of this valid person
+            # Outgoing edge positions from g to other valid people
+            outgoing = [
+                g * (N - 1) + (d if d < g else d - 1)
+                for d in range(nv_start, N) if d != g
+            ]
+            lah_i = lah_gt[bt, outgoing]
+
+            if (lah_i == -1).all():
+                continue
+
+            null_gt = 0.0 if (lah_i == 1).any() else 1.0
+            valid_logits.append(null_logits[bt, g])
+            valid_gts.append(null_gt)
+
+    if not valid_logits:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    logits_t = torch.stack(valid_logits)
+    gts_t = torch.tensor(valid_gts, dtype=logits_t.dtype, device=device)
+    return F.binary_cross_entropy_with_logits(logits_t, gts_t)

@@ -1,0 +1,7 @@
+# @package model
+encoder_name: dinov2_vits14
+patch_size: 14
+token_dim: 384
+encoder_depth: 12
+encoder_num_heads: 6
+decoder_hooks: [2, 5, 8, 11]
