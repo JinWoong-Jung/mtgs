@@ -75,7 +75,6 @@ ViT Adaptor block i (InteractionBlock):  ← 변경 없음
        e_dir(i→j)   = MLP_dir(concat(h_i, h_j))  +  prior_weight * e_dir(i→j)^prior
      - iteration 1+:
        e_dir(i→j)   = MLP_dir(concat(h_i, h_j))          # prior 미적용
-     e_undir(i,j) = MLP_sa(h_i + h_j)   # 대칭이므로 합산 입력, 전 iteration 공통
 
   2. null node edge:
      e_null(i) = MLP_null(h_i)  # person i → null (directed)
@@ -83,15 +82,17 @@ ViT Adaptor block i (InteractionBlock):  ← 변경 없음
   3. edge weight 정규화:
      w_dir(i→j) = softmax_j( [e_dir(i→1), ..., e_dir(i→N-1), e_null(i)] )
                   # LAH: 배타적 gaze → softmax (null 포함)
-                  # -inf 불필요: PyG sparse는 유효 edge만 포함 → 패딩 노드 edge 자체가 없음
-     w_undir(i,j) = sigmoid(e_undir(i,j))
-                  # SA: 비배타적 → 독립 sigmoid, null 미참여
 
   4. message passing (directed):
-     msg_i = sum_j [ w_dir(j→i) * W_msg * h_j ]  +  w_null(i) * null_node_h
+     msg_i = sum_j [ w_dir(i→j) * W_msg * h_j ]  +  w_null(i) * W_msg(null_node)
 
   5. node 업데이트:
      h_i = LayerNorm(h_i + Linear(concat(h_i, msg_i)))
+
+[루프 종료 후 SA 계산]
+  e_sa(i,j) = MLP_sa(msg_i + msg_j)   # msg = 마지막 iteration의 directed outgoing aggregation
+  # 기존 e_undir(i,j) = MLP_sa(h_i + h_j) 무방향 엣지 방식에서 변경됨
+  # msg_i가 "i가 바라보는 장면 표현"을 담고 있어 SA 판단이 시선 방향 정보를 반영
 
 출력:
   - person_tokens_updated  (b*t, N, D)   — dense 복원 (null 제외, 패딩 위치 0)
@@ -619,3 +620,206 @@ Step 10 ablation (E1, E2 조합)
 - `decoder_lah`, `decoder_sa`, `decoder_laeo` — 삭제하지 않음 (transformer 모드에서 사용)
 - `compute_social_loss` — 변경 없음 (null node loss는 별도 추가)
 - 기존 모든 데이터셋 / 학습 루프 / 메트릭 코드 — 변경 없음
+
+---
+
+## [복구용] 이전 SocialGraphBlock 구현 (커스텀 directed GAT)
+
+> **복구 방법**: 아래 코드 블록 전체를 `adaptor_modules.py`의 현재 `SocialGraphBlock` 클래스와 교체하면 됨.
+> `mtgs_net.py`의 instantiation 인자(`hidden_channels`, `heads`, `use_null_node`, `use_gaze_prior`, `prior_weight`, `aggr`)도 그대로 사용 가능.
+
+**특징**: outgoing directed GAT + LAH cosine prior (iter 0에만) + null node + valid node masking
+
+```python
+class SocialGraphBlock(nn.Module):
+    """
+    Social interaction graph block replacing I^b_pp (Social Encoder).
+
+    Supports three aggregation modes (controlled by `aggr`):
+
+      "outgoing" (default):
+          msg_i = Σ_{i→j} α[i→j] · W_msg(h_j)  +  α_null[i] · W_msg(null_node)
+          softmax over destinations j (dim=-1).
+          i collects info from nodes it is looking at.
+          Null node: "i looks at no person" → null feature absorbed into msg_i.
+
+      "ingoing":
+          msg_i = Σ_{j→i} α[j→i] · W_msg(h_j)
+          softmax over sources j (dim=1).
+          i collects info from nodes looking at it.
+          Null node disabled (null has no meaningful gaze direction as a source).
+
+      "both":
+          msg_i = W_out(msg_out_i) + W_in(msg_in_i)
+          outgoing part includes null; ingoing part does not.
+
+    Geometric LAH cosine prior is injected into attention weights on iteration 0 only.
+    Social prediction (LAH/SA) is handled by the shared pair-wise decoder downstream.
+    """
+
+    def __init__(
+        self,
+        token_dim: int,
+        hidden_channels: int = 96,
+        heads: int = 8,           # unused; kept for API compatibility
+        num_layers: int = 2,      # internal message-passing iterations
+        use_null_node: bool = True,
+        use_gaze_prior: bool = True,
+        prior_weight: float = 0.5,
+        layer_idx: int = 0,       # unused; kept for API compatibility
+        aggr: str = "outgoing",   # "outgoing" | "ingoing" | "both"
+    ):
+        super().__init__()
+        assert aggr in ("outgoing", "ingoing", "both"), f"Unknown aggr: {aggr!r}"
+        self.num_layers     = num_layers
+        self.use_gaze_prior = use_gaze_prior
+        self.aggr           = aggr
+
+        # Null node is only meaningful in outgoing direction.
+        self.use_null_node = use_null_node and (aggr in ("outgoing", "both"))
+
+        # Learnable prior weight for attention routing only (single scalar).
+        self.prior_w_attn = nn.Parameter(torch.tensor(prior_weight))
+
+        # ── Attention scoring MLP (directed edge i→j) ───────────────────────
+        self.mlp_dir = MLP(token_dim * 2, hidden_channels, 1)
+        if self.use_null_node:
+            self.null_node = nn.Parameter(torch.zeros(token_dim))
+            self.mlp_null  = MLP(token_dim, hidden_channels, 1)
+
+        # ── Message passing & node update ────────────────────────────────────
+        self.W_msg       = nn.Linear(token_dim, token_dim, bias=False)
+        if aggr == "both":
+            # separate projections to combine outgoing and ingoing messages
+            self.W_combine_out = nn.Linear(token_dim, token_dim, bias=False)
+            self.W_combine_in  = nn.Linear(token_dim, token_dim, bias=False)
+        self.update_proj = nn.Linear(token_dim * 2, token_dim)
+        self.norm        = nn.LayerNorm(token_dim)
+
+        self._edge_cache: dict = {}
+
+    @staticmethod
+    def _build_edges(nv: int, device: torch.device):
+        """Directed edges in GT label order: [(s,d) for s in range(nv) for d in range(nv) if s!=d]."""
+        src = torch.tensor(
+            [s for s in range(nv) for d in range(nv) if s != d],
+            dtype=torch.long, device=device,
+        )
+        dst = torch.tensor(
+            [d for s in range(nv) for d in range(nv) if s != d],
+            dtype=torch.long, device=device,
+        )
+        return src, dst
+
+    def _get_edge_cache(self, N: int, device: torch.device) -> dict:
+        if N not in self._edge_cache:
+            src_N, dst_N = self._build_edges(N, device)
+            self._edge_cache[N] = {"src_N": src_N, "dst_N": dst_N}
+        return self._edge_cache[N]
+
+    def forward(
+        self,
+        person_tokens,
+        num_valid_people,
+        gaze_vecs=None,
+        head_bboxes=None,
+        readout=False,   # unused; kept for call-site compatibility
+    ):
+        """
+        Args:
+            person_tokens:    (B, N, D)
+            num_valid_people: (B,) int
+            gaze_vecs:        (B, N, 2) unit gaze direction
+            head_bboxes:      (B, N, 4) normalized [x1,y1,x2,y2]
+
+        Returns:
+            tokens_out: (B, N, D)  updated node features only.
+                        Social prediction (LAH/SA) is handled by the shared
+                        pair-wise decoder downstream, same as transformer mode.
+        """
+        B, N, D = person_tokens.shape
+        device  = person_tokens.device
+        dtype   = person_tokens.dtype
+
+        cache  = self._get_edge_cache(N, device)
+        src_N  = cache["src_N"]   # (E,)  E = N*(N-1)
+        dst_N  = cache["dst_N"]   # (E,)
+
+        # Valid nodes occupy the BACK slots [N-nv .. N-1]; front slots are padding.
+        node_valid = (
+            torch.arange(N, device=device).unsqueeze(0) >= (N - num_valid_people.unsqueeze(1))
+        )  # (B, N)
+        pair_valid = node_valid.unsqueeze(2) & node_valid.unsqueeze(1)   # (B, N, N)
+        diag_mask  = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
+
+        # ── Pre-compute LAH cosine prior (iteration-independent) ─────────────
+        lah_prior = None
+        if self.use_gaze_prior and gaze_vecs is not None and head_bboxes is not None:
+            centers = (head_bboxes[..., :2] + head_bboxes[..., 2:]) / 2   # (B, N, 2)
+            dir_ij    = F.normalize(centers[:, dst_N] - centers[:, src_N], dim=-1)
+            lah_prior = (gaze_vecs[:, src_N] * dir_ij).sum(-1)            # (B, E)
+
+        h = person_tokens.clone()
+
+        for iter_idx in range(self.num_layers):
+            # ── Directed edge attention scores ───────────────────────────────
+            h_i = h.unsqueeze(2).expand(B, N, N, D)
+            h_j = h.unsqueeze(1).expand(B, N, N, D)
+
+            e_dir_mat = self.mlp_dir(
+                torch.cat([h_i, h_j], dim=-1).reshape(B * N * N, 2 * D)
+            ).reshape(B, N, N)
+            e_dir_mat = e_dir_mat.masked_fill(diag_mask,   float("-inf"))
+            e_dir_mat = e_dir_mat.masked_fill(~pair_valid, float("-inf"))
+
+            # Inject LAH cosine prior into attention on iteration 0 only
+            if self.use_gaze_prior and lah_prior is not None and iter_idx == 0:
+                lah_prior_mat = torch.zeros(B, N, N, device=device, dtype=dtype)
+                lah_prior_mat[:, src_N, dst_N] = lah_prior.to(dtype)
+                e_dir_mat = e_dir_mat + self.prior_w_attn * lah_prior_mat
+
+            W_msg_h = self.W_msg(h)   # (B, N, D)
+
+            # ── Outgoing aggregation: i collects from nodes it looks at ──────
+            # α_out[i,j]: softmax over destinations j (dim=-1)
+            # msg_out_i = Σ_j α_out[i→j] · W_msg(h_j)
+            if self.aggr in ("outgoing", "both"):
+                if self.use_null_node:
+                    e_null = self.mlp_null(h.reshape(B * N, D)).reshape(B, N)
+                    e_null = e_null.masked_fill(~node_valid, float("-inf"))
+                    e_aug_out = torch.cat([e_dir_mat, e_null.unsqueeze(-1)], dim=-1)  # (B,N,N+1)
+                else:
+                    e_aug_out = e_dir_mat
+                all_inf_out = e_aug_out.isinf().all(dim=-1, keepdim=True)
+                e_aug_out   = e_aug_out.masked_fill(all_inf_out, 0.0)
+                alpha_out   = torch.softmax(e_aug_out, dim=-1)   # (B, N, N[+1])
+                msg_out = torch.einsum("bij,bjd->bid", alpha_out[:, :, :N], W_msg_h)
+                if self.use_null_node:
+                    alpha_null = alpha_out[:, :, N]   # (B, N)
+                    msg_out = msg_out + alpha_null.unsqueeze(-1) * self.W_msg(self.null_node).to(dtype)
+
+            # ── Ingoing aggregation: i collects from nodes looking at it ─────
+            # α_in[i,j]: softmax over sources j (dim=1), treating e_dir_mat[j,i] as score of j→i
+            # msg_in_i = Σ_j α_in[j→i] · W_msg(h_j)
+            if self.aggr in ("ingoing", "both"):
+                # mask invalid pairs before softmax (same pair_valid, diag already -inf)
+                e_in = e_dir_mat.masked_fill(e_dir_mat.isinf().all(dim=1, keepdim=True), 0.0)
+                alpha_in = torch.softmax(e_in, dim=1)   # (B, N, N): softmax over source dim
+                # alpha_in[b, j, i] = how much j contributes to i
+                msg_in = torch.einsum("bji,bjd->bid", alpha_in, W_msg_h)
+
+            # ── Combine ───────────────────────────────────────────────────────
+            if self.aggr == "outgoing":
+                msg = msg_out
+            elif self.aggr == "ingoing":
+                msg = msg_in
+            else:  # both
+                msg = self.W_combine_out(msg_out) + self.W_combine_in(msg_in)
+
+            # ── Node update ──────────────────────────────────────────────────
+            h_new = self.update_proj(torch.cat([h, msg], dim=-1))
+            h_new = self.norm(h + h_new).to(dtype)
+            h = torch.where(node_valid.unsqueeze(-1), h_new, h)
+
+        return h.float()
+```

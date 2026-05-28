@@ -15,28 +15,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 import torchvision.transforms.functional as TF
-from transformers import AutoModel
-
 from mtgs.utils import pair, build_2d_sincos_posemb
 from mtgs.networks.adaptor_modules import InteractionBlock, SocialGraphBlock, TemporalGraphBlock
 
 import logging
 
 logger = logging.getLogger(__name__)
-
-_DINOV2_MODELS = {"dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"}
-_DINOV3_HF_IDS = {
-    "dinov3_vitb16": "facebook/dinov3-vitb16-pretrain-lvd1689m",
-    "dinov3_vitl16": "facebook/dinov3-vitl16-pretrain-lvd1689m",
-}
-
-
-def _reverse_edge_idx(nv: int, device: torch.device) -> torch.Tensor:
-    """For edges ordered [(s,d) for s in range(nv) for d in range(nv) if s!=d],
-    return the index of the reverse edge (d,s) for each position."""
-    pairs = [(s, d) for s in range(nv) for d in range(nv) if s != d]
-    pair_to_idx = {p: i for i, p in enumerate(pairs)}
-    return torch.tensor([pair_to_idx[(d, s)] for s, d in pairs], dtype=torch.long, device=device)
 
 
 # ==================================================================================================================== #
@@ -65,11 +49,9 @@ class MTGS(nn.Module):
         temporal_context: int = 2,
         hm_size=(64, 64),  # width, height
         output="heatmap",
-        encoder_name: str = "dinov2_vitb14",
         interaction_type: str = "transformer",
         graph_num_layers: int = 2,
-        graph_hidden_channels: int = 96,
-        graph_heads: int = 8,
+        graph_aggr: str = "outgoing",
         graph_use_null_node: bool = True,
         graph_use_gaze_prior: bool = True,
         graph_prior_weight: float = 0.5,
@@ -126,20 +108,11 @@ class MTGS(nn.Module):
         #     attn_drop_rate = encoder_attn_drop_rate,
         #     drop_path_rate = encoder_drop_path_rate
         # )
-        # scene encoder: DINOv2 (torch.hub) or DINOv3 (HuggingFace)
-        if encoder_name in _DINOV2_MODELS:
-            self.encoder = torch.hub.load("facebookresearch/dinov2", encoder_name)
-            self.num_prefix_tokens = 1  # CLS only
-        elif encoder_name in _DINOV3_HF_IDS:
-            self.encoder = AutoModel.from_pretrained(_DINOV3_HF_IDS[encoder_name])
-            self.num_prefix_tokens = 5  # CLS + 4 register tokens
-        else:
-            raise ValueError(f"Unknown encoder '{encoder_name}'. Choose from: {sorted(_DINOV2_MODELS | set(_DINOV3_HF_IDS))}")
-        self.encoder_name = encoder_name
+        # scene encoder: DinoV2
+        self.encoder = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
 
-        # interaction stage boundaries: split encoder_depth evenly into 4 stages
-        chunk = encoder_depth // 4
-        self.interaction_indexes = [[i * chunk, (i + 1) * chunk - 1] for i in range(4)]
+        # scene, person interaction
+        self.interaction_indexes = [[0, 2], [3, 5], [6, 8], [9, 11]]
         self.vit_adaptor = nn.Sequential(
             *[
                 InteractionBlock(
@@ -158,22 +131,16 @@ class MTGS(nn.Module):
             self.social_graph_blocks = nn.ModuleList([
                 SocialGraphBlock(
                     token_dim=token_dim,
-                    hidden_channels=graph_hidden_channels,
-                    heads=graph_heads,
                     num_layers=graph_num_layers,
+                    aggr=graph_aggr,
                     use_null_node=graph_use_null_node,
                     use_gaze_prior=graph_use_gaze_prior,
                     prior_weight=graph_prior_weight,
-                    layer_idx=i,
                 )
                 for i in range(len(self.interaction_indexes))
             ])
             self.temporal_graph_blocks = nn.ModuleList([
-                TemporalGraphBlock(
-                    token_dim=token_dim,
-                    hidden_channels=graph_hidden_channels,
-                    heads=graph_heads,
-                )
+                TemporalGraphBlock(token_dim=token_dim)
                 for _ in range(len(self.interaction_indexes))
             ])
         else:
@@ -208,6 +175,9 @@ class MTGS(nn.Module):
                 torch.zeros(window_size, gaze_feature_dim)
             )  # final used
 
+        # speaking status projection layer
+        self.speaking_proj = nn.Linear(1, token_dim)
+
         # gaze point decoder
         self.output = output
         if output == "heatmap":
@@ -233,8 +203,7 @@ class MTGS(nn.Module):
         else:
             self.gaze_decoder = LinearDecoder(token_dim // 2)
 
-        # projection layers + inout decoder: shared between transformer and graph modes.
-        # Loading a transformer checkpoint into graph mode reuses the pretrained weights.
+        # projection layers for social gaze prediction
         self.gaze_projs = nn.Sequential(
             *[
                 nn.Linear(token_dim, proj_feature_dim, bias=True)
@@ -245,15 +214,14 @@ class MTGS(nn.Module):
             proj_feature_dim * len(self.interaction_indexes)
         )
 
-        if not self.use_graph:
-            # social gaze decoders (transformer mode only; graph uses SocialGraphBlock edges)
-            self.decoder_lah = LinearDecoderSocialGraph(
-                proj_feature_dim * len(self.interaction_indexes)
-            )
-            #         self.decoder_laeo = LinearDecoderSocialGraph(proj_feature_dim*len(self.interaction_indexes))    # decoder for laeo
-            self.decoder_sa = LinearDecoderSocialGraph(
-                proj_feature_dim * len(self.interaction_indexes)
-            )
+        # gaze point, social gaze, inout decoders
+        self.decoder_lah = LinearDecoderSocialGraph(
+            proj_feature_dim * len(self.interaction_indexes)
+        )  # decoder for looking at heads
+        #         self.decoder_laeo = LinearDecoderSocialGraph(proj_feature_dim*len(self.interaction_indexes))    # decoder for laeo
+        self.decoder_sa = LinearDecoderSocialGraph(
+            proj_feature_dim * len(self.interaction_indexes)
+        )  # decoder for shared attention
 
     def forward(self, x):
         # Expected x = {"image": image, "heads": heads, "head_bboxes": head_bboxes, "coatt_ids": coatt_ids}
@@ -288,13 +256,10 @@ class MTGS(nn.Module):
         b, t, c, h_img, w_img = x["image"].shape
         # for MultiMAE
         # image_tokens, N_H, N_W = self.image_tokenizer(x["image"].view(b*t, c, h_img, w_img)) # (b*t, nt, d) / nt = num_tokens, d = token_dim; (N_H, N_W): number of patches (height, width)
-        imgs = x["image"].view(b * t, c, h_img, w_img)
-        if self.encoder_name in _DINOV2_MODELS:
-            image_tokens = self.encoder.prepare_tokens_with_masks(imgs)
-            position_embeddings = None
-        else:
-            image_tokens = self.encoder.embeddings(imgs)
-            position_embeddings = self.encoder.rope_embeddings(imgs)
+        # for DinoV2
+        image_tokens = self.encoder.prepare_tokens_with_masks(
+            x["image"].view(b * t, c, h_img, w_img)
+        )
 
         person_tokens = gaze_tokens.view(b * t, n, -1).clone()
         num_valid = x["num_valid_people"].view(b * t).clamp(min=1)  # (b*t,)
@@ -302,30 +267,27 @@ class MTGS(nn.Module):
         # Apply ViT Adaptor =================================================
         gaze_vec_bt    = gaze_vec.view(b * t, n, -1)              # (b*t, n, 2)
         head_bboxes_bt = x["head_bboxes"].view(b * t, n, -1)      # (b*t, n, 4)
-        lah_from_graph = sa_from_graph = null_from_graph = None
-        aux_lah_logits = []   # per-block LAH logits; last entry becomes the final prediction
         img_layers = []
         gaze_layers = []
+        alpha_null_in_list  = []
+        alpha_null_out_list = []
         for i, layer in enumerate(self.vit_adaptor):
             indexes = self.interaction_indexes[i]
-            if self.encoder_name in _DINOV2_MODELS:
-                encoder_blocks = self.encoder.blocks[indexes[0] : indexes[-1] + 1]
-            else:
-                encoder_blocks = self.encoder.model.layer[indexes[0] : indexes[-1] + 1]
             image_tokens, person_tokens = layer(
                 image_tokens,
                 person_tokens,
-                encoder_blocks,
+                self.encoder.blocks[indexes[0] : indexes[-1] + 1],
                 x["num_valid_people"],
-                position_embeddings=position_embeddings,
             )
             if self.use_graph:
-                person_tokens, lah_i, sa_i, null_i = self.social_graph_blocks[i](
+                # SocialGraphBlock returns (tokens, alpha_null_in, alpha_null_out).
+                # Social prediction is handled by the shared pair-wise decoder below.
+                person_tokens, a_null_in, a_null_out = self.social_graph_blocks[i](
                     person_tokens, num_valid, gaze_vec_bt, head_bboxes_bt,
                 )
-                aux_lah_logits.append(lah_i)
-                sa_from_graph   = sa_i     # overwritten each block; last block's value kept
-                null_from_graph = null_i   # same
+                if a_null_in is not None:
+                    alpha_null_in_list.append(a_null_in)
+                    alpha_null_out_list.append(a_null_out)
                 if t > 1:
                     person_tokens = (
                         self.temporal_graph_blocks[i](
@@ -350,78 +312,62 @@ class MTGS(nn.Module):
                         .permute([0, 2, 1, 3])
                         .reshape(b * t, n, -1)
                     )
-            # strip prefix tokens (CLS for DINOv2; CLS + register tokens for DINOv3)
-            img_layers.append(image_tokens[:, self.num_prefix_tokens :])
+            # save intermediate outputs
+            # for DinoV2, remove class token
+            img_layers.append(image_tokens[:, 1:])
             gaze_layers.append(person_tokens)
 
         if self.output == "heatmap":
-            # baseline decoders
-            #             hm_width, hm_height = self.hm_size
-            #             gaze_hm = self.gaze_hm_decoder(person_tokens.view(b * t * n, -1)) # (b*t*n, d) >> (b*t*n, 64, 64)
-            #             gaze_hm = gaze_hm.view(b, t, n, hm_height, hm_width)
-            #             # simpler HM decoder
-            #             gaze_hm = self.gaze_hm_decoder(img_layers[-1], gaze_layers[-1])
-            #             _, _, hm_height, hm_width = gaze_hm.shape
-            #             gaze_hm = gaze_hm.view(b, t, n, hm_height, hm_width)
             # conditional DPT
             gaze_hm = self.gaze_hm_decoder_new(img_layers, gaze_layers, (h_img, w_img))
             _, _, hm_height, hm_width = gaze_hm.shape
             gaze_hm = gaze_hm.view(b, t, n, hm_height, hm_width)
 
-        # Graph mode: final LAH logits come directly from the last SocialGraphBlock's
-        # edge computation (sa_from_graph and null_from_graph are already set in the loop).
-        if self.use_graph:
-            lah_from_graph = aux_lah_logits[-1]
-
-        # project and concat person tokens from each gaze layer (both modes)
-        proj_tokens = [
+        # project and concat person tokens from each gaze layer
+        person_tokens = [
             self.gaze_projs[i](gaze_layer) for i, gaze_layer in enumerate(gaze_layers)
         ]
-        proj_tokens = torch.cat(proj_tokens, axis=-1)   # (b*t, n, proj_feature_dim*4)
+        person_tokens = torch.cat(person_tokens, axis=-1)
 
-        # Classify inout (shared decoder)
-        inout = self.inout_decoder(proj_tokens.view(b * t * n, -1))  # (b*t*n, 1)
+        # Classify inout ====================================================
+        inout = self.inout_decoder(person_tokens.view(b * t * n, -1))  # (b*t*n, 1)
 
-        if self.use_graph:
-            # Social gaze from last SocialGraphBlock's edge logits
-            lah   = lah_from_graph   # (b*t, n*(n-1)) raw logits
-            coatt = sa_from_graph    # (b*t, n*(n-1)) raw logits
+        # make person pairs
+        indices = torch.tensor(
+            list(itertools.permutations(torch.arange(n), 2))
+        ).T  # (2, num_pairs)
+        num_pairs = indices.shape[1]
 
-            # LAEO = min(lah_ij, lah_ji) in logit space
-            rev_idx_N = _reverse_edge_idx(n, lah.device)
-            laeo = torch.min(lah, lah[:, rev_idx_N])
+        # (b*t, num_pairs, D) - left terms
+        opt_1 = torch.cat([person_tokens[:, [i], :] for i in indices[0]], dim=1)
+        # (b*t, num_pairs, D) - right terms
+        opt_2 = torch.cat([person_tokens[:, [j], :] for j in indices[1]], dim=1)
+        person_token_pairs = torch.cat([opt_1, opt_2], dim=2)  # (b*t, num_pairs, 2*D)
+        person_token_pairs = person_token_pairs.reshape(
+            b * t * num_pairs, -1
+        )  # (b*t*num_pairs, 2*D)
 
-            num_pairs = n * (n - 1)
+        # Predict social gaze
+        lah = self.decoder_lah(person_token_pairs).view(
+            b * t, num_pairs
+        )  # (b*t, num_pairs)
+        coatt = self.decoder_sa(person_token_pairs)  # (b*t*num_pairs, 1)
+        #         laeo = self.decoder_laeo(person_token_pairs)  # (b*t*num_pairs, 1)
+        # perform harmonic mean of LAH scores to infer LAEO
+        laeo = torch.zeros_like(lah)
+        indices = indices.T
+        for pi, pair in enumerate(indices):
+            corr_idx = torch.where((indices == pair[[1, 0]]).prod(-1))[0].item()
+            laeo[:, pi] = torch.min(lah[:, pi], lah[:, corr_idx])
+
+        # Aggregate dual-null alphas across layers (mean); None when not in graph mode.
+        if alpha_null_in_list:
+            alpha_null_in  = torch.stack(alpha_null_in_list,  dim=0).mean(0)  # (b*t, n)
+            alpha_null_out = torch.stack(alpha_null_out_list, dim=0).mean(0)  # (b*t, n)
+            alpha_null_in  = alpha_null_in.view(b, t, n)
+            alpha_null_out = alpha_null_out.view(b, t, n)
         else:
-            person_tokens = proj_tokens   # already computed above
-
-            # make person pairs
-            indices = torch.tensor(
-                list(itertools.permutations(torch.arange(n), 2))
-            ).T  # (2, num_pairs)
-            num_pairs = indices.shape[1]
-
-            # (b*t, num_pairs, D) - left terms
-            opt_1 = torch.cat([person_tokens[:, [i], :] for i in indices[0]], dim=1)
-            # (b*t, num_pairs, D) - right terms
-            opt_2 = torch.cat([person_tokens[:, [j], :] for j in indices[1]], dim=1)
-            person_token_pairs = torch.cat([opt_1, opt_2], dim=2)  # (b*t, num_pairs, 2*D)
-            person_token_pairs = person_token_pairs.reshape(
-                b * t * num_pairs, -1
-            )  # (b*t*num_pairs, 2*D)
-
-            # Predict social gaze
-            lah = self.decoder_lah(person_token_pairs).view(
-                b * t, num_pairs
-            )  # (b*t, num_pairs)
-            coatt = self.decoder_sa(person_token_pairs)  # (b*t*num_pairs, 1)
-            #         laeo = self.decoder_laeo(person_token_pairs)  # (b*t*num_pairs, 1)
-            # perform harmonic mean of LAH scores to infer LAEO
-            laeo = torch.zeros_like(lah)
-            indices = indices.T
-            for pi, pair in enumerate(indices):
-                corr_idx = torch.where((indices == pair[[1, 0]]).prod(-1))[0].item()
-                laeo[:, pi] = torch.min(lah[:, pi], lah[:, corr_idx])
+            alpha_null_in = alpha_null_out = None
 
         if self.output == "heatmap":
             return (
@@ -432,8 +378,8 @@ class MTGS(nn.Module):
                 lah.view(b, t, num_pairs),
                 laeo.view(b, t, num_pairs),
                 coatt.view(b, t, num_pairs),
-                null_from_graph,   # (b*t, n) in graph mode; None in transformer mode
-                aux_lah_logits,    # list of (b*t, n*(n-1)) per-layer LAH logits (graph only)
+                alpha_null_in,
+                alpha_null_out,
             )
         else: # only support for heatmap output for now
             logger.info("Incorrect output type selected!!!")

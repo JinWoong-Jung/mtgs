@@ -3,20 +3,6 @@
 # SPDX-FileContributor: Anshul Gupta <anshul.gupta@idiap.ch>
 # SPDX-License-Identifier: GPL-3.0-only
 
-# dinov2 -> image_size=448, dinov3 -> image_size=512 
-# 
-#   encoder          | patch_size | token_dim | encoder_depth | encoder_num_heads | decoder_hooks
-#   -----------------+------------+-----------+---------------+-------------------+-----------------
-#   dinov2_vits14    |     14     |    384    |      12       |         6         | [2, 5, 8, 11]
-#   dinov2_vitb14    |     14     |    768    |      12       |        12         | [2, 5, 8, 11]
-#   dinov2_vitl14    |     14     |   1024    |      24       |        16         | [5, 11, 17, 23]
-#   dinov2_vitg14    |     14     |   1536    |      40       |        24         | [9, 19, 29, 39]
-#   dinov3_vitb16    |     16     |    768    |      12       |        12         | [2, 5, 8, 11]
-#   dinov3_vitl16    |     16     |   1024    |      24       |        16         | [5, 11, 17, 23]
-defaults:
-  - encoder: dinov2_vitb14
-  - _self_
-
 device: cuda
 
 wandb:
@@ -28,12 +14,15 @@ wandb:
   group: gaze-social # update group name
 
 model:
-  # encoder_name, patch_size, token_dim, encoder_depth, encoder_num_heads, decoder_hooks
-  # are injected automatically from the selected encoder config (defaults.encoder above).
+  encoder_name: dinov2_vitb14
+  patch_size: 14
   head_size: 224
   output: heatmap
+  token_dim: 768
   image_size: ${data.image_size}
   gaze_feature_dim: 512
+  encoder_depth: 12
+  encoder_num_heads: 12
   encoder_num_global_tokens: 1
   encoder_mlp_ratio: 4.0
   encoder_use_qkv_bias: True
@@ -41,21 +30,22 @@ model:
   encoder_attn_drop_rate: 0.0
   encoder_drop_path_rate: 0.0
   decoder_feature_dim: 128
+  decoder_hooks: [2, 5, 8, 11]
   decoder_hidden_dims: [96, 192, 384, 768]
   decoder_use_bn: True
   gaze_weights: /home/jinwoongjung/MTGS/weights/gaze360_resnet18.pt # update path
   multivit_weights: False
-  weights: False  # {False, path to weights}
+  weights: "/home/jinwoongjung/MTGS/experiments/GazeFollow/train/checkpoints/best.ckpt"  # {False, path to weights}
 
 interaction:
-  type: transformer   # "transformer" | "graph"
+  type: graph   # "transformer" | "graph"
   graph:
-    num_layers: 2
-    hidden_channels: 96
-    heads: 8
-    use_null_node: true
-    use_gaze_prior: true
-    prior_weight: 0.5
+    num_layers: 2        # message passing iterations per block
+    aggr: "outgoing"     # "outgoing" | "ingoing" | "both"
+    use_null_node: true  # dual null nodes (Null_in / Null_out) in outgoing attention
+    use_gaze_prior: true # inject LAH cosine prior on iter 0
+    prior_weight: 0.5    # initial value of learnable prior_w_attn scalar
+    lambda_null: 0.5     # weight for dual-null routing loss (L_null_out + L_null_in)
 
 head_detector:
   checkpoint_file: /home/jinwoongjung/MTGS/weights/crowdhuman_yolov5m.pt # update path
@@ -73,7 +63,7 @@ tracker:
 
 data:
   num_people: 4
-  image_size: 448 # 448 for dinov2, 512 for dinov3
+  image_size: 448
   temporal_stride: 3
   temporal_context: 2
   heatmap_size: 64
@@ -129,8 +119,6 @@ train:
   epochs: 20
   batch_size: 8
   accumulate_grad_batches: 1
-  gradient_clip_val: null
-  gradient_clip_algorithm: null
   resume: False
   resume_from: null
   freeze:
@@ -144,7 +132,7 @@ train:
     inout_decoder: False
   swa:
     use: True
-    lr: [1e-6, 1e-6, 1e-6, 3e-7]  # 4 param groups (both transformer and graph)
+    lr: [1e-6, 1e-6, 1e-6, 3e-7]  # 4 param groups for transformer mode; graph mode (5 groups) overrides in train_vsgaze.sh
     epoch_start: 12
     annealing_epochs: 6
 
@@ -154,7 +142,6 @@ val:
 test:
   checkpoint: null
   batch_size: 1
-  max_people: null  # null = no limit, integer = skip samples with more people than this (N=11 for VSGaze -> ~4.7% samples skipped)
 
 optimizer:
   lr: 1e-6

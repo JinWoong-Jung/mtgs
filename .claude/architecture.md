@@ -48,11 +48,23 @@ image_tokens = dinov2.prepare_tokens_with_masks(image)  # (B*T, num_patches+1, 7
 [Injector]       person_tokens → image_tokens (cross-attn: person attends to scene)
 [ViT blocks 3개]  image_tokens self-attention (DINOv2 레이어 3개)
 [Extractor]      image_tokens → person_tokens (cross-attn: person reads updated scene)
-[People Interaction] person_tokens self-attention (사람들 간 상호작용)
-[People Temporal]   person_tokens temporal self-attention (시간 축 상호작용)
 ```
 
-총 4개 InteractionBlock → `img_layers[0..3]`, `gaze_layers[0..3]` 수집
+이후 모드에 따라 분기:
+
+**Transformer 모드:**
+```
+[People Interaction]  person_tokens self-attention (사람들 간 상호작용)
+[People Temporal]     person_tokens temporal self-attention (시간 축 상호작용)
+```
+
+**Graph 모드:**
+```
+[SocialGraphBlock]    outgoing directed graph message passing (사람 간 spatial 상호작용)
+[TemporalGraphBlock]  per-person MHA over T frames (시간 축 상호작용)
+```
+
+총 4개 반복 → `img_layers[0..3]`, `gaze_layers[0..3]` 수집
 
 ---
 
@@ -76,40 +88,28 @@ img_layers를 공간적 feature map으로 reshape: (B*T, D, H/patch, W/patch)
 
 ---
 
-## Step 5: Social Gaze 디코딩
+## Step 5: Social Gaze 디코딩 (양 모드 공통)
 
-**두 모드 공통** — `gaze_projs`와 `inout_decoder`는 transformer/graph 모드 모두 공유.  
-Transformer 체크포인트에서 Graph 모드로 fine-tuning 시 이 가중치들이 재사용됨.
+`gaze_projs`, `inout_decoder`, `decoder_lah`, `decoder_sa`는 transformer/graph 모드 모두 공유.  
+Transformer 체크포인트에서 Graph 모드로 fine-tuning 시 이 가중치들이 warm-start로 재사용됨.
 
 ```python
-# 모든 InteractionBlock에서 나온 person token을 projection 후 concat (양 모드 공통)
+# 모든 InteractionBlock에서 나온 person token을 projection 후 concat
 proj_tokens = cat([gaze_projs[i](gaze_layer) for i, gaze_layer in enumerate(gaze_layers)])
 # shape: (B*T, N, 128*4=512)
 
-# In-out 분류 (양 모드 공통 decoder)
+# In-out 분류
 inout = inout_decoder(proj_tokens.view(B*T*N, -1))     # (B*T*N, 1)
-```
 
-**Transformer 모드 전용** — pair-wise MLP decoder:
-
-```python
-# 모든 pair 조합 생성 (permutation)
-indices = permutations(range(N), 2)    # (N*(N-1), 2)
+# Pair-wise social gaze 예측 (양 모드 동일)
+indices = permutations(range(N), 2)                    # N*(N-1)개
 pairs = cat([proj_tokens[:, i], proj_tokens[:, j]], dim=-1)   # (B*T*num_pairs, 1024)
 
-lah   = decoder_lah(pairs)   # (B*T, num_pairs)
-coatt = decoder_sa(pairs)    # (B*T, num_pairs)
+lah   = decoder_lah(pairs).view(B*T, num_pairs)        # LAH
+coatt = decoder_sa(pairs)                              # SA
 
 # LAEO = min(LAH(i→j), LAH(j→i))
 laeo[pi] = min(lah[pi], lah[corr_idx])
-```
-
-**Graph 모드 전용** — `SocialGraphBlock`의 edge logit이 직접 LAH/SA 예측:
-
-```python
-# lah_from_graph = aux_lah_logits[-1]  → 마지막 블록의 LAH edge logit (B*T, N*(N-1))
-# sa_from_graph                        → 마지막 블록의 SA edge logit
-# LAEO: min(lah_ij, lah_ji) — _reverse_edge_idx() 로 역방향 인덱스 계산
 ```
 
 ---
@@ -122,9 +122,10 @@ laeo[pi] = min(lah[pi], lah[corr_idx])
 | Lightning 학습 모델 | `mtgs/networks/models.py` | `MTGSModel` |
 | Gaze 인코더 | `mtgs/networks/mtgs_net.py` | `GazeEncoder` |
 | ViT-Adaptor 블록 | `mtgs/networks/adaptor_modules.py` | `InteractionBlock` |
-| Graph Interaction | `mtgs/networks/adaptor_modules.py` | `SocialGraphBlock`, `TemporalGraphBlock` |
+| Social Graph (node update) | `mtgs/networks/adaptor_modules.py` | `SocialGraphBlock` |
+| Temporal Graph | `mtgs/networks/adaptor_modules.py` | `TemporalGraphBlock` |
 | DPT 히트맵 디코더 | `mtgs/networks/mtgs_net.py` | `ConditionalDPTDecoder` |
-| Social 디코더 (transformer) | `mtgs/networks/mtgs_net.py` | `LinearDecoderSocialGraph` |
+| Social 디코더 (양 모드 공유) | `mtgs/networks/mtgs_net.py` | `LinearDecoderSocialGraph` |
 | InOut 디코더 (양 모드 공유) | `mtgs/networks/mtgs_net.py` | `InOutDecoder` |
 
 ---
@@ -150,12 +151,12 @@ UCO-LAEO, VideoCoAtt 데이터에는 heatmap/angular 손실에 0.1 가중치 적
 ## 학습 최적화 세부사항
 
 - **옵티마이저**: AdamW (weight_decay=1e-3)
-- **학습률**: 기본 1e-6, gaze_encoder_temporal 3×, social/temporal graph blocks 10×/5× (별도 param group)
+- **학습률 (transformer 모드)**: 기본 1e-6, gaze_encoder_temporal/people_temporal/decoder_sa 3×
+- **학습률 (graph 모드)**: 기본 1e-6, social_graph_blocks 10×, temporal_graph_blocks 5×, gaze_encoder_temporal/decoder_lah/decoder_sa 3×
 - **스케줄러**: CosineAnnealingWarmRestarts (T_0=20 epochs, 4 epoch warmup)
-- **SWA**: epoch 12부터 시작, 6 epoch annealing, lr=[1e-6, 1e-6, 1e-6, 3e-7] (4 param groups, 양 모드 동일)
+- **SWA**: epoch 12부터 시작, 6 epoch annealing
 - **정밀도**: bf16-mixed
-- **Gradient Accumulation**: 1 (기본)
-- **Gradient Clipping**: 사용 안 함 (`gradient_clip_val: null`) — clipping이 transformer 모드 수렴을 방해함
+- **Gradient Clipping**: 사용 안 함 (`gradient_clip_val: null`)
 - **Frozen 레이어**: DINOv2 encoder + image_tokenizer (기본값)
 
 ---
@@ -175,14 +176,13 @@ gaze_hm_pred = gaze_hm_pred[:, middle_frame_idx, :]
 Social gaze 메트릭은 AUROC + AveragePrecision (threshold-free, ranking 기반):
 
 ```python
-# val/test 각 3종 × 2 = 12개 메트릭, 모두 CPU 누적
-self.val_coatt_auc  = tm.AUROC(task="binary", ignore_index=-1).cpu()
-self.val_laeo_auc   = tm.AUROC(task="binary", ignore_index=-1).cpu()
-self.val_lah_auc    = tm.AUROC(task="binary", ignore_index=-1).cpu()
+# val/test 각 3종 × 2 = 12개 메트릭, 모두 compute_on_cpu=True
+self.val_coatt_auc  = tm.AUROC(task="binary", ignore_index=-1, compute_on_cpu=True)
+self.val_laeo_auc   = tm.AUROC(task="binary", ignore_index=-1, compute_on_cpu=True)
+self.val_lah_auc    = tm.AUROC(task="binary", ignore_index=-1, compute_on_cpu=True)
 # ... (test_ 버전 동일)
 ```
 
-`.cpu()` 이유: 43k+ test 샘플을 GPU에 누적하면 스텝마다 growing tensor에 concat하는 비용이 증가해 속도가 급격히 저하됨 → CPU 누적으로 GPU 메모리 압박 해소.  
 ignore_index=-1: 패딩된 pair label(-1)은 메트릭 계산에서 자동 제외.
 
 ---

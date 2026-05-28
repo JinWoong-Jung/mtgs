@@ -1,21 +1,27 @@
 #!/bin/bash
 
-#SBATCH --job-name=vsgaze_test
+#SBATCH --job-name=vsgaze_train
 #SBATCH --gres=gpu:rtx6000:1
 #SBATCH --time=48:00:00
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
+#SBATCH -c 8
 #SBATCH -p gpu
-#SBATCH --output=logs/vsgaze_test_%j.out
-#SBATCH --error=logs/vsgaze_test_%j.err
+#SBATCH --output=logs/vsgaze_test_transformer_%j.out
+#SBATCH --error=logs/vsgaze_test_transformer_%j.err
 
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate mtgs
 export PYTHONNOUSERSITE=1
+export XFORMERS_DISABLED=1
 
+# sbatch 제출 디렉토리 기준으로 scripts/ 로 이동
 cd "$SLURM_SUBMIT_DIR/scripts"
 
-CHECKPOINT="/home/jinwoongjung/MTGS/experiments/2026-05-18/MTGS-dinov2-vitb14-448-VSGaze/train/checkpoints/best.ckpt"
+CHECKPOINT="/home/jinwoongjung/MTGS/weights/mtgs-vsgaze.ckpt"
 
-python main.py experiment.task=test \
-    test.checkpoint=$CHECKPOINT
+INTERACTION_TYPE="transformer" # "graph" or "transformer"
+EXP_NAME="test_VSGaze_${INTERACTION_TYPE}"
+
+python -s ./main.py experiment.task=test \
+    interaction.type=$INTERACTION_TYPE \
+    test.checkpoint=$CHECKPOINT \
+    "hydra.run.dir=\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}"

@@ -25,9 +25,8 @@ from mtgs.train.losses import (
     compute_sharingan_loss,
     compute_interact_loss,
     compute_social_loss,
-    social_loss,
+    compute_dual_null_loss,
     compute_inout_loss,
-    compute_null_node_loss,
 )
 
 from mtgs.performance.metrics import (
@@ -68,11 +67,9 @@ class MTGSModel(pl.LightningModule):
             decoder_use_bn=cfg.model.decoder_use_bn,
             temporal_context=cfg.data.temporal_context,
             output=cfg.model.output,
-            encoder_name=cfg.model.encoder_name,
             interaction_type=cfg.interaction.type,
             graph_num_layers=cfg.interaction.graph.num_layers,
-            graph_hidden_channels=cfg.interaction.graph.hidden_channels,
-            graph_heads=cfg.interaction.graph.heads,
+            graph_aggr=cfg.interaction.graph.aggr,
             graph_use_null_node=cfg.interaction.graph.use_null_node,
             graph_use_gaze_prior=cfg.interaction.graph.use_gaze_prior,
             graph_prior_weight=cfg.interaction.graph.prior_weight,
@@ -115,16 +112,6 @@ class MTGSModel(pl.LightningModule):
 
         self.val_lah_auc = tm.AUROC(task="binary", ignore_index=-1)
         self.val_lah_ap = tm.AveragePrecision(task="binary", ignore_index=-1)
-
-        # Define Test Metrics
-        self.test_coatt_auc = tm.AUROC(task="binary", ignore_index=-1)
-        self.test_coatt_ap = tm.AveragePrecision(task="binary", ignore_index=-1)
-
-        self.test_laeo_auc = tm.AUROC(task="binary", ignore_index=-1)
-        self.test_laeo_ap = tm.AveragePrecision(task="binary", ignore_index=-1)
-
-        self.test_lah_auc = tm.AUROC(task="binary", ignore_index=-1)
-        self.test_lah_ap = tm.AveragePrecision(task="binary", ignore_index=-1)
 
         # Define Loss Function
         self.compute_hm_loss = compute_interact_loss
@@ -239,9 +226,8 @@ class MTGSModel(pl.LightningModule):
         return self.model(batch)
 
     def configure_optimizers(self):
-        base_lr = self.cfg.optimizer.lr
-
         if self.model.use_graph:
+            base_lr = self.cfg.optimizer.lr
             high_lr_params = [
                 {
                     "params": self.model.gaze_encoder_temporal.parameters(),
@@ -261,54 +247,74 @@ class MTGSModel(pl.LightningModule):
                     "lr": base_lr * 5,
                     "init_lr": base_lr * 5,
                 },
+                {
+                    "params": list(self.model.decoder_lah.parameters())
+                              + list(self.model.decoder_sa.parameters()),
+                    "name": "social-decoders",
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
             ]
             high_lr_prefixes = {
                 "gaze_encoder_temporal",
                 "social_graph_blocks",
                 "temporal_graph_blocks",
+                "decoder_lah",
+                "decoder_sa",
             }
+            other_params = [
+                v for k, v in self.model.named_parameters()
+                if not any(k.startswith(prefix) for prefix in high_lr_prefixes)
+            ]
+            other_params = [
+                {
+                    "params": other_params,
+                    "name": "base",
+                    "lr": base_lr,
+                    "init_lr": base_lr,
+                }
+            ]
+            params = high_lr_params + other_params
         else:
-            # Original: temporal modules + decoder_sa at 3× LR
-            high_lr_params = [
+            # separate params for temporal modelling and shared attention prediction
+            temporal_params = [
                 {
                     "params": self.model.gaze_encoder_temporal.parameters(),
                     "name": "gaze-encoder-temporal",
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
+                    "lr": self.cfg.optimizer.lr * 3,
+                    "init_lr": self.cfg.optimizer.lr * 3,
                 },
                 {
                     "params": self.model.people_temporal.parameters(),
                     "name": "people-temporal",
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
+                    "lr": self.cfg.optimizer.lr * 3,
+                    "init_lr": self.cfg.optimizer.lr * 3,
                 },
                 {
                     "params": self.model.decoder_sa.parameters(),
                     "name": "decoder-sa",
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
+                    "lr": self.cfg.optimizer.lr * 3,
+                    "init_lr": self.cfg.optimizer.lr * 3,
                 },
             ]
-            high_lr_prefixes = {
-                "gaze_encoder_temporal",
-                "people_temporal",
-                "decoder_sa",
-            }
 
-        other_params = [
-            v for k, v in self.model.named_parameters()
-            if not any(k.startswith(prefix) for prefix in high_lr_prefixes)
-        ]
-        other_params = [
-            {
-                "params": other_params,
-                "name": "base",
-                "lr": base_lr,
-                "init_lr": base_lr,
-            }
-        ]
+            other_params = []
+            for k, v in self.model.named_parameters():
+                if (
+                    ("_temporal" not in k) and ("decoder_sa" not in k)
+                ):
+                    other_params.append(v)
+            other_params = [
+                {
+                    "params": other_params,
+                    "name": "base",
+                    "lr": self.cfg.optimizer.lr,
+                    "init_lr": self.cfg.optimizer.lr,
+                }
+            ]
 
-        params = high_lr_params + other_params
+            params = temporal_params + other_params
+
         optimizer = optim.AdamW(params, weight_decay=self.cfg.optimizer.weight_decay)
 
         # cosine annealing
@@ -384,8 +390,8 @@ class MTGSModel(pl.LightningModule):
                 lah_pred,
                 laeo_pred,
                 coatt_pred,
-                null_logits_pred,
-                aux_lah_logits,
+                alpha_null_in,
+                alpha_null_out,
             ) = self(batch)
             batch_size, t, n, hm_h, hm_w = gaze_hm_pred.shape
             gaze_hm_pred = gaze_hm_pred.view(batch_size * t, n, hm_h, hm_w)
@@ -393,10 +399,9 @@ class MTGSModel(pl.LightningModule):
             gaze_vec_pred, gaze_pt_pred, inout_pred, lah_pred, laeo_pred, coatt_pred = (
                 self(batch)
             )
+            alpha_null_in = alpha_null_out = None
             batch_size, t, n = gaze_pt_pred.shape[:-1]
             gaze_pt_pred = gaze_pt_pred.view(batch_size * t, n, -1)
-            null_logits_pred = None
-            aux_lah_logits = []
         gaze_vec_pred = gaze_vec_pred.view(batch_size * t, n, -1)
         inout_pred = inout_pred.view(batch_size * t, -1)
         lah_pred = lah_pred.view(batch_size * t, -1)
@@ -442,39 +447,24 @@ class MTGSModel(pl.LightningModule):
             coatt_gt,
             coatt_mask,
         )
-        # Graph mode: boost social loss weight to overcome randomly-initialized modules.
-        # Transformer mode keeps the original 1× to avoid hurting gaze dist performance.
-        social_scale = 2.0 if self.model.use_graph else 1.0
-        loss += social_scale * loss_social
+        loss += loss_social
 
-        # Null node supervision (graph mode only)
-        if null_logits_pred is not None:
-            num_valid_flat = batch["num_valid_people"].view(batch_size * t).clamp(min=1)
-            null_loss = compute_null_node_loss(
-                null_logits_pred,
-                batch["lah_labels"].view(batch_size * t, -1),
-                num_valid_flat,
+        # Dual-null routing loss (graph mode only, when null nodes are enabled)
+        if alpha_null_in is not None and alpha_null_out is not None:
+            lam_null = self.cfg.interaction.graph.get("lambda_null", 0.5)
+            inout_gt_bt  = batch["inout"].view(batch_size * t, n)
+            num_valid_bt = batch["num_valid_people"].view(batch_size * t)
+            loss_null_out, loss_null_in = compute_dual_null_loss(
+                alpha_null_out.view(batch_size * t, n),
+                alpha_null_in.view(batch_size * t, n),
+                inout_gt_bt,
+                lah_gt,
+                num_valid_bt,
             )
-            loss = loss + 0.5 * null_loss
-            self.log(
-                "loss/train/null_node",
-                null_loss.item(),
-                batch_size=batch_size * t,
-                prog_bar=False,
-                on_step=True,
-                on_epoch=True,
-            )
-
-        # Auxiliary LAH supervision from intermediate SocialGraphBlock layers (graph only).
-        if aux_lah_logits:
-            aux_total = None
-            for aux_lah in aux_lah_logits[:-1]:  # skip last (captured in main readout)
-                aux_lah_flat = aux_lah.view(batch_size * t, -1)
-                if lah_mask.any():
-                    layer_loss = social_loss(aux_lah_flat, lah_gt, lah_mask, pos_weight=3.0)
-                    aux_total = layer_loss if aux_total is None else aux_total + layer_loss
-            if aux_total is not None:
-                loss = loss + 0.3 * aux_total
+            loss_null = lam_null * (loss_null_out + loss_null_in)
+            loss = loss + loss_null
+            self.log("loss/train/null_out", loss_null_out.item(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+            self.log("loss/train/null_in",  loss_null_in.item(),  batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
 
         # Log Social Gaze Losses
         self.log(
@@ -560,8 +550,7 @@ class MTGSModel(pl.LightningModule):
                 lah_pred,
                 laeo_pred,
                 coatt_pred,
-                _null,
-                _aux,
+                *_,
             ) = self(batch)
             # only take outputs of central frame
             batch_size, t, n, hm_h, hm_w = gaze_hm_pred.shape
@@ -801,6 +790,15 @@ class MTGSModel(pl.LightningModule):
                     sync_dist=True,
                 )
 
+    def on_test_start(self):
+        output_file = os.path.join(
+            self.cfg.experiment.output_folder, "test_predictions.p"
+        )
+        os.makedirs(self.cfg.experiment.output_folder, exist_ok=True)
+        self._pred_file = open(output_file, "wb")
+        self._pred_file_path = output_file
+        self._pred_write_count = 0
+
     def test_step(self, batch, batch_idx):
         ni = int((batch["inout"] == 1).sum().item())
         #         assert n == ni, f"Expected all test samples to be looking inside. Got {n} samples, {ni} of which are looking inside."
@@ -815,8 +813,7 @@ class MTGSModel(pl.LightningModule):
                 lah_pred,
                 laeo_pred,
                 coatt_pred,
-                _null,
-                _aux,
+                *_,
             ) = self(batch)
             batch_size, t, num_people, hm_h, hm_w = gaze_hm_pred.shape
             # only take outputs of central frame
@@ -926,41 +923,26 @@ class MTGSModel(pl.LightningModule):
         laeo_mask = laeo_gt != -1
         lah_gt = batch["lah_labels"][:, middle_frame_idx, :]
         lah_mask = lah_gt != -1
-        # Update CoAtt Metrics
+
+        _coatt_pred_m = _coatt_gt_m = None
+        _laeo_pred_m = _laeo_gt_m = None
+        _lah_pred_m = _lah_gt_m = None
+
+        # CoAtt — collect for epoch-end metric computation
         if coatt_pred.sum() != 0:
             coatt_pred = torch.sigmoid(coatt_pred)
             coatt_gt = coatt_gt.long()
             if coatt_mask.sum() > 0:
-                self.test_coatt_auc(coatt_pred, coatt_gt)
-                self.test_coatt_ap(coatt_pred, coatt_gt)
-
-                self.log(
-                    "metric/test/coatt_auc",
-                    self.test_coatt_auc,
-                    batch_size=coatt_mask.sum(),
-                    prog_bar=True,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
-                self.log(
-                    "metric/test/coatt_ap",
-                    self.test_coatt_ap,
-                    batch_size=coatt_mask.sum(),
-                    prog_bar=True,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
+                _coatt_pred_m = coatt_pred.cpu()
+                _coatt_gt_m = coatt_gt.cpu()
 
         pair_indices = torch.tensor(
             list(itertools.permutations(torch.arange(num_people), 2))
         )
-        # Update LAEO metrics
+        # LAEO — collect for epoch-end metric computation
         if laeo_pred.sum() != 0:
             laeo_pred = torch.sigmoid(laeo_pred)
             laeo_gt = laeo_gt.long()
-            # peform arg max for laeo
             laeo_pred_argmax = torch.zeros_like(laeo_pred)
             for bi in range(batch_size):
                 for pi in range(num_people):
@@ -972,33 +954,13 @@ class MTGSModel(pl.LightningModule):
                         max_val, max_idx = torch.max(laeo_pred[bi][valid_indices], 0)
                         laeo_pred_argmax[bi][valid_indices[max_idx]] = max_val
             if laeo_mask.sum() > 0:
-                self.test_laeo_auc(laeo_pred_argmax, laeo_gt)
-                self.test_laeo_ap(laeo_pred_argmax, laeo_gt)
+                _laeo_pred_m = laeo_pred_argmax.cpu()
+                _laeo_gt_m = laeo_gt.cpu()
 
-                self.log(
-                    "metric/test/laeo_auc",
-                    self.test_laeo_auc,
-                    batch_size=laeo_mask.sum(),
-                    prog_bar=True,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
-                self.log(
-                    "metric/test/laeo_ap",
-                    self.test_laeo_ap,
-                    batch_size=laeo_mask.sum(),
-                    prog_bar=True,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
-
-        # Update LAH metrics
+        # LAH — collect for epoch-end metric computation
         if lah_pred.sum() != 0:
             lah_pred = torch.sigmoid(lah_pred)
             lah_gt = lah_gt.long()
-            # peform arg max for lah
             lah_pred_argmax = torch.zeros_like(lah_pred)
             lah_gt_metric = torch.zeros(batch_size, num_people).long() - 1
             lah_pred_metric = torch.zeros(batch_size, num_people)
@@ -1032,39 +994,17 @@ class MTGSModel(pl.LightningModule):
                                 ][gt_idx]
                             else:
                                 lah_pred_metric[bi][pi] = max_val
-            if (
-                (lah_gt_metric != -1).sum() > 0
-            ):
-                self.test_lah_auc(lah_pred_metric, lah_gt_metric)
-                self.test_lah_ap(lah_pred_metric, lah_gt_metric)
+            if (lah_gt_metric != -1).sum() > 0:
+                _lah_pred_m = lah_pred_metric.cpu()
+                _lah_gt_m = lah_gt_metric.cpu()
 
-                self.log(
-                    "metric/test/lah_auc",
-                    self.test_lah_auc,
-                    batch_size=(lah_gt_metric != -1).sum(),
-                    prog_bar=True,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
-                self.log(
-                    "metric/test/lah_ap",
-                    self.test_lah_ap,
-                    batch_size=(lah_gt_metric != -1).sum(),
-                    prog_bar=True,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
-
-        # Build output dict — move tensors to CPU immediately to prevent GPU memory accumulation
+        # Build output dict — move tensors to CPU to prevent GPU memory accumulation
         output = {
             "head_bboxes": batch["head_bboxes"][:, middle_frame_idx, :, :].cpu(),
             "gp_pred": gaze_pt_pred.cpu(),
             "gp_gt": batch["gaze_pts"][:, middle_frame_idx, :, :].cpu(),
             "gv_pred": gaze_vec_pred.cpu(),
             "gv_gt": batch["gaze_vecs"][:, middle_frame_idx, :, :].cpu(),
-            #   # optionally save gaze heatmaps
             #   "hm_pred": gaze_hm_pred.cpu(),
             #   "hm_gt": batch["gaze_heatmaps"][:,middle_frame_idx,:,:,:].cpu(),
             "inout_gt": inout_gt.cpu(),
@@ -1078,6 +1018,12 @@ class MTGSModel(pl.LightningModule):
             "lah_gt": lah_gt.cpu(),
             "dataset": batch["dataset"],
             "num_valid_people": batch["num_valid_people"].cpu(),
+            "coatt_pred_metric": _coatt_pred_m,
+            "coatt_gt_metric": _coatt_gt_m,
+            "laeo_pred_metric": _laeo_pred_m,
+            "laeo_gt_metric": _laeo_gt_m,
+            "lah_pred_metric": _lah_pred_m,
+            "lah_gt_metric": _lah_gt_m,
         }
         if self._pred_file is not None:
             pickle.dump(output, self._pred_file)
@@ -1085,19 +1031,44 @@ class MTGSModel(pl.LightningModule):
             if self._pred_write_count % 500 == 0:
                 self._pred_file.flush()
 
-    def on_test_start(self):
-        output_file = os.path.join(
-            self.cfg.experiment.output_folder, "test_predictions.p"
-        )
-        os.makedirs(self.cfg.experiment.output_folder, exist_ok=True)
-        self._pred_file = open(output_file, "wb")
-        self._pred_write_count = 0
-
     def on_test_epoch_end(self):
-        # Reset metrics
         self.metrics["test_dist"].reset()
-        # self.metrics["test_auc"].reset()
 
         if self._pred_file is not None:
             self._pred_file.close()
             self._pred_file = None
+
+        # Read per-batch metric tensors from pickle and compute social metrics once
+        coatt_preds, coatt_gts = [], []
+        laeo_preds, laeo_gts = [], []
+        lah_preds, lah_gts = [], []
+
+        with open(self._pred_file_path, "rb") as f:
+            while True:
+                try:
+                    b = pickle.load(f)
+                except EOFError:
+                    break
+                if b.get("coatt_pred_metric") is not None:
+                    coatt_preds.append(b["coatt_pred_metric"].reshape(-1))
+                    coatt_gts.append(b["coatt_gt_metric"].reshape(-1))
+                if b.get("laeo_pred_metric") is not None:
+                    laeo_preds.append(b["laeo_pred_metric"].reshape(-1))
+                    laeo_gts.append(b["laeo_gt_metric"].reshape(-1))
+                if b.get("lah_pred_metric") is not None:
+                    lah_preds.append(b["lah_pred_metric"].reshape(-1))
+                    lah_gts.append(b["lah_gt_metric"].reshape(-1))
+
+        def _log_social(preds_list, gts_list, prefix):
+            if not preds_list:
+                return
+            preds = torch.cat(preds_list)
+            gts = torch.cat(gts_list)
+            auc = tm.AUROC(task="binary", ignore_index=-1)(preds, gts)
+            ap = tm.AveragePrecision(task="binary", ignore_index=-1)(preds, gts)
+            self.log(f"metric/test/{prefix}_auc", auc, prog_bar=True, sync_dist=True)
+            self.log(f"metric/test/{prefix}_ap", ap, prog_bar=True, sync_dist=True)
+
+        _log_social(coatt_preds, coatt_gts, "coatt")
+        _log_social(laeo_preds, laeo_gts, "laeo")
+        _log_social(lah_preds, lah_gts, "lah")

@@ -10,10 +10,13 @@ ViT Adaptor가 4개의 stage로 나뉘므로, 매 stage 이후:
 
 ```
 stage i (i=0,1,2,3):
-  ViT Adaptor[i]          → image_tokens, person_tokens (b*t, N, D)  ← 언급만
-  SocialGraphBlock[i]     → person_tokens', lah_i, sa_i, null_i
-  TemporalGraphBlock[i]   → person_tokens''  (t>1 시에만)
+  ViT Adaptor[i]          → image_tokens, person_tokens (b*t, N, D)
+  SocialGraphBlock[i]     → person_tokens'          (B, N, D) — node features only
+  TemporalGraphBlock[i]   → person_tokens''          (t>1 시에만)
 ```
+
+모든 4개 stage의 `person_tokens`가 `gaze_layers[0..3]`에 저장되고,
+stage 종료 후 **공통 pair-wise decoder**로 LAH/SA 예측.
 
 ---
 
@@ -58,10 +61,9 @@ diag_mask:   [[T,F,F],[F,T,F],[F,F,T]]  (1, 3, 3)
 
 ```python
 centers = (head_bboxes[..., :2] + head_bboxes[..., 2:]) / 2   # (1, 3, 2)
-# centers[0] = [c0, c1, c2]  각 사람 head 중심점
 ```
 
-### LAH prior
+### LAH prior (attention routing 전용)
 
 각 directed edge (s→d)마다 "s의 gaze가 d 방향을 얼마나 향하나":
 
@@ -69,26 +71,11 @@ centers = (head_bboxes[..., :2] + head_bboxes[..., 2:]) / 2   # (1, 3, 2)
 dir(0→1) = normalize(c1 - c0)
 lah_prior[0→1] = cosine(gaze_vec[0], dir(0→1))   ∈ [-1, +1]
 lah_prior[0→2] = cosine(gaze_vec[0], dir(0→2))
-lah_prior[1→0] = cosine(gaze_vec[1], dir(1→0))
-... (총 6개)
+...  (총 6개)
 lah_prior shape: (1, 6)
 ```
 
-### SA prior
-
-두 시선 ray가 교차(수렴)하는가:
-
-```
-# 직선 교점 파라미터 (t_i, t_j)
-det = gaze_s[x] * gaze_d[y] - gaze_s[y] * gaze_d[x]
-t_i = ...  ; t_j = ...  (선형계 풀기)
-
-sa_prior[s→d] = (t_i > 0).float() + (t_j > 0).float() - 1.0
-              ∈ {-1, 0, +1}
-# +1: 두 시선이 서로를 향해 수렴
-# -1: 발산
-sa_prior shape: (1, 6)
-```
+> **주의**: prior는 attention softmax 라우팅에만 사용 (iteration 0). 최종 LAH logit에는 더하지 않음.
 
 ---
 
@@ -96,18 +83,16 @@ sa_prior shape: (1, 6)
 
 ### ── Iteration 0 ──
 
-#### 4-0-a. Edge logit 계산 (Dense N×N)
+#### 4-0-a. Directed attention score 계산 (Dense N×N)
 
 ```python
 h_i = h.unsqueeze(2).expand(1, 3, 3, 768)  # h_i[b,i,j] = h[b,i] (소스)
 h_j = h.unsqueeze(1).expand(1, 3, 3, 768)  # h_j[b,i,j] = h[b,j] (목적지)
 ```
 
-**LAH logit matrix** — `MLP_dir(cat(h_i, h_j))`:
+**Attention score matrix** — `MLP_dir(cat(h_i, h_j))`:
 
 ```
-cat shape: (1, 3, 3, 1536) → reshape → (9, 1536) → MLP_dir → (9, 1) → reshape → (1, 3, 3)
-
 e_dir_mat[0] =
         p0       p1       p2
 p0  [  -inf , e(0→1), e(0→2) ]   ← diag = -inf
@@ -115,34 +100,16 @@ p1  [ e(1→0),  -inf , e(1→2) ]
 p2  [ e(2→0), e(2→1),  -inf  ]
 ```
 
-**iter 0에서만 LAH prior 주입** (learnable scalar `prior_w_attn` 사용):
+**iter 0에서만 LAH prior 주입** (learnable scalar `prior_w_attn`):
 
 ```
-lah_prior_mat[0, src_N, dst_N] = lah_prior[0]
-# = [[  0  , p(0→1), p(0→2)],
-#    [p(1→0),  0   , p(1→2)],
-#    [p(2→0), p(2→1),  0   ]]
-
-e_dir_mat += prior_w_attn * lah_prior_mat   # prior_w_attn: nn.Parameter (init=0.5)
-```
-
-**SA logit matrix** — `MLP_sa(h_i + h_j)`:
-
-```
-(h_i + h_j) shape: (1, 3, 3, 768) → (9, 768) → MLP_sa → (9, 1) → (1, 3, 3)
-
-e_sa_mat[0] =
-        p0        p1        p2
-p0  [  s(0,0), s(0,1), s(0,2) ]   ← 대각도 값이 있지만 최종 출력 시 off-diagonal만 사용
-p1  [  s(1,0), s(1,1), s(1,2) ]   ← s(i,j) = s(j,i) (대칭)
-p2  [  s(2,0), s(2,1), s(2,2) ]
+e_dir_mat += prior_w_attn * lah_prior_mat
 ```
 
 **Null logit** — `MLP_null(h_i)`:
 
 ```
-h.reshape(3, 768) → MLP_null → (3, 1) → reshape → (1, 3)
-e_null[0] = [e_null(p0), e_null(p1), e_null(p2)]
+e_null[0] = [e_null(p0), e_null(p1), e_null(p2)]   (1, 3)
 ```
 
 ---
@@ -164,8 +131,7 @@ shape: (1, 3, 4)
 각 행(소스 i)에 대해 softmax → 합이 1:
 
 ```
-α[0] =  (row-wise softmax of e_aug)
-
+α[0] =
         p0       p1       p2      null
 p0  [   0  , α(0→1), α(0→2), α(0→∅) ]   합=1
 p1  [ α(1→0),  0   , α(1→2), α(1→∅) ]   합=1
@@ -173,24 +139,15 @@ p2  [ α(2→0), α(2→1),  0   , α(2→∅) ]   합=1
 ```
 
 해석:
-- `α(0→1)` = person 0이 person 1을 볼 확률
-- `α(0→∅)` = person 0이 아무도 안 볼 확률
+- `α(0→1)` = person 0이 person 1을 볼 확률 (outgoing)
+- `α(0→∅)` = person 0이 아무도 안 볼 확률 (null sink)
 
 ---
 
 #### 4-0-c. 메시지 패싱 — outgoing 어텐션 (내가 보는 j들이 기여)
 
 ```python
-W_msg_h = W_msg(h)   # (1, 3, 768) — 각 노드의 메시지 벡터
-```
-
-`α[:,:,:N]` 을 그대로 사용 (transpose 없음):
-
-```
-α[b, i, j] = "i가 j를 볼 확률"  →  "i 기준으로 내가 보는 j들"
-```
-
-```
+W_msg_h = W_msg(h)   # (1, 3, 768)
 msg[b,i] = Σ_j α[b, i, j] * W_msg_h[b, j]
 ```
 
@@ -201,22 +158,8 @@ msg[p0] = α(0→1) * W_msg(h1)  +  α(0→2) * W_msg(h2)
          + α(0→∅) * W_msg(null_node)
 ```
 
-- `α(0→1)` 이 크다 = person 0이 1을 보고 있다 → h1이 많이 반영됨
-- `α(0→∅)` 이 크다 = 0이 아무도 안 본다 → null feature가 반영됨
-
-**person 1의 메시지:**
-
-```
-msg[p1] = α(1→0) * W_msg(h0)  +  α(1→2) * W_msg(h2)
-         + α(1→∅) * W_msg(null_node)
-```
-
-**person 2의 메시지:**
-
-```
-msg[p2] = α(2→0) * W_msg(h0)  +  α(2→1) * W_msg(h1)
-         + α(2→∅) * W_msg(null_node)
-```
+- `α(0→1)` 이 크다 = p0이 p1을 보고 있다 → h1이 많이 반영됨
+- `α(0→∅)` 이 크다 = p0이 아무도 안 본다 → null feature 반영
 
 ---
 
@@ -224,60 +167,43 @@ msg[p2] = α(2→0) * W_msg(h0)  +  α(2→1) * W_msg(h1)
 
 ```python
 h_new[i] = update_proj(cat(h[i], msg[i]))   # Linear(1536 → 768)
-h[i]     = LayerNorm(h[i] + h_new[i])        # 잔차 연결 + 정규화
+h[i]     = LayerNorm(h[i] + h_new[i])
+h = where(node_valid, h_new, h)              # 패딩 슬롯 보호
 ```
-
-h 저장 후 `e_dir_last = e_dir_mat`, `e_sa_last = e_sa_mat`
 
 ---
 
 ### ── Iteration 1 ──
 
-동일 과정, 단 **LAH prior를 softmax에 주입하지 않음** (attention 안정화된 상태):
+동일 과정, 단 **LAH prior를 softmax에 주입하지 않음** (attention 안정화):
 
 ```
 e_dir_mat[0] =
         p0       p1       p2
 p0  [  -inf , e'(0→1), e'(0→2) ]   ← prior 없이 갱신된 h로 계산
-p1  [ e'(1→0),  -inf , e'(1→2) ]
-p2  [ e'(2→0), e'(2→1),  -inf  ]
+...
 ```
 
-메시지 패싱 → 노드 업데이트 → `e_dir_last`, `e_sa_last` 갱신.
+메시지 패싱 → 노드 업데이트.
 
 ---
 
-## Step 5: 출력 edge logit 추출 (GT 순서)
+## Step 5: 반환 — 업데이트된 node features만
 
 ```python
-lah_logits = e_dir_last[:, src_N, dst_N]   # (1, 6)
-# = [e'(0→1), e'(0→2), e'(1→0), e'(1→2), e'(2→0), e'(2→1)]
-
-# 예측용 prior 추가 (learnable scalar prior_w_lah, init=0.5)
-lah_logits += prior_w_lah * lah_prior   # (1, 6)
+return h.float()   # (B, N, D) = (1, 3, 768)
 ```
 
-```python
-sa_logits = e_sa_last[:, src_N, dst_N]   # (1, 6)
-# = [s'(0,1), s'(0,2), s'(1,0), s'(1,2), s'(2,0), s'(2,1)]
-# s'(i,j) == s'(j,i) (대칭)
-sa_logits += prior_w_sa * sa_prior   # learnable scalar prior_w_sa, init=0.5
-```
-
-```python
-null_logits = MLP_null(h_final)   # (1, 3) — 최종 업데이트된 h에서 계산
-```
+SocialGraphBlock은 node feature 업데이트만 담당.  
+LAH/SA 예측은 downstream의 **공통 pair-wise decoder**가 처리 (transformer 모드와 동일).
 
 ---
 
 ## Step 6: TemporalGraphBlock (t>1일 때)
 
-예를 들어 t=3 (temporal window):
-
 ```
 person_tokens: (b*t, N, D) = (3, 3, 768)
-→ reshape: (b, t, N, D).permute(0,2,1,3).reshape(b*N, t, D) = (3, 3, 768)
-  즉 [person0의 3프레임, person1의 3프레임, person2의 3프레임]
+→ reshape: (b*N, t, D) = (3, 3, 768)   [person별로 t 프레임 묶기]
 ```
 
 각 사람별로 t개 프레임 토큰에 **Multi-Head Self-Attention**:
@@ -292,6 +218,26 @@ person 2: [h2_t0, h2_t1, h2_t2] → MHA → [h2_t0', h2_t1', h2_t2']
 
 ---
 
+## Step 7: Social Gaze 예측 (공통, 4 stage 종료 후)
+
+```python
+# 4개 stage person tokens를 projection 후 concat
+proj_tokens = cat([gaze_projs[i](gaze_layers[i]) for i in range(4)])
+# shape: (B*T, N, 512)
+
+# pair-wise 조합
+indices = permutations(range(N), 2)        # N*(N-1)개
+opt_1 = proj_tokens[:, indices[0], :]
+opt_2 = proj_tokens[:, indices[1], :]
+pairs = cat([opt_1, opt_2], dim=-1)         # (B*T*num_pairs, 1024)
+
+lah   = decoder_lah(pairs).view(B*T, num_pairs)   # shared decoder
+coatt = decoder_sa(pairs)                          # shared decoder
+laeo[pi] = min(lah[pi], lah[corr_idx])             # LAEO 유도
+```
+
+---
+
 ## 4개 outer block의 역할 요약
 
 | Block | ViT Adaptor 단계 | SocialGraphBlock 역할 |
@@ -299,21 +245,22 @@ person 2: [h2_t0, h2_t1, h2_t2] → MHA → [h2_t0', h2_t1', h2_t2']
 | 0 | 초기 scene↔person cross-attn 후 | 기본적인 pair 관계 학습 (LAH prior 의존 큼) |
 | 1 | 중간 scene feature 융합 후 | 1차 refined된 토큰으로 관계 재추정 |
 | 2 | 더 deep한 scene feature 후 | 관계가 점점 정교해짐 |
-| 3 | 최종 scene feature 후 | **최종 LAH/SA/null 예측값 생성** |
+| 3 | 최종 scene feature 후 | 최종 refined person token 출력 |
 
-**Block 0~2의 lah_i** → `aux_lah_logits[0:3]` → 보조 손실 (0.3× 가중치)  
-**Block 3의 lah_i** → `lah_from_graph` → 메인 사회적 시선 손실
+모든 block의 출력이 `gaze_layers`에 누적되고, **마지막에 한 번** pair-wise decoder로 예측.
 
 ---
 
-## 출력 텐서 정리
+## 출력 텐서 정리 (SocialGraphBlock 단위)
 
 ```
 tokens_out:  (1, 3, 768)  — 다음 stage로 전달되는 갱신된 person token
-lah_logits:  (1, 6)       — LAH(0→1), LAH(0→2), LAH(1→0), LAH(1→2), LAH(2→0), LAH(2→1)
-sa_logits:   (1, 6)       — SA(0,1), SA(0,2), SA(1,0), SA(1,2), SA(2,0), SA(2,1)
-null_logits: (1, 3)       — Null(0), Null(1), Null(2)
 ```
 
-LAH는 sigmoid 적용 시 이진 확률; SA도 동일.  
-LAEO는 `min(lah_ij, lah_ji)` 로 유도 (별도 head 없음).
+최종 social gaze 예측 텐서 (forward 전체 기준):
+
+```
+lah:   (B, T, N*(N-1))  — decoder_lah(pair-wise concat)
+laeo:  (B, T, N*(N-1))  — min(lah_ij, lah_ji)
+coatt: (B, T, N*(N-1))  — decoder_sa(pair-wise concat)
+```

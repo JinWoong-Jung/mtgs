@@ -45,9 +45,7 @@ MTGS/
 │   ├── train_gazefollow.sh
 │   ├── train_vsgaze.sh       # VSGaze 학습+테스트 (train+test)
 │   └── test_vsgaze.sh        # ★ 신규: test 단독 실행 스크립트
-├── GCN_TODO.md               # ★ GCN Interaction Module 구현 계획
 └── logs/
-    └── vsgaze_train_1168.{out,err}  # 현재 학습/테스트 로그
 ```
 
 ---
@@ -75,14 +73,15 @@ MTGS/
 4. **ViT-Adaptor (InteractionBlock × 4)** — scene↔person cross-attention
 5. **People Interaction** — person token 간 self-attention (**Transformer 모드 전용**)
 6. **People Temporal** — 시간 축 person token self-attention (**Transformer 모드 전용**)
-7. **SocialGraphBlock × 4** — edge-based message passing (**Graph 모드 전용**): LAH/SA edge logit 직접 출력
-8. **TemporalGraphBlock × 4** — per-person temporal self-attention (**Graph 모드 전용**)
+7. **SocialGraphBlock × 4** — outgoing directed graph message passing (**Graph 모드 전용**): node feature 업데이트만 수행, social 예측은 downstream decoder에 위임
+8. **TemporalGraphBlock × 4** — per-person MHA over T frames (**Graph 모드 전용**)
 9. **ConditionalDPTDecoder** — multi-scale 디코더 → gaze heatmap
-10. **`gaze_projs` + `InOutDecoder`** — in/out 분류 헤드 (**Transformer/Graph 모드 공유**, fine-tuning 시 warm-start)
-11. **LinearDecoderSocialGraph** — LAH, SA pair-wise 분류 헤드 (**Transformer 모드 전용**; LAEO는 LAH에서 유도)
+10. **`gaze_projs` + `InOutDecoder`** — in/out 분류 헤드 (**Transformer/Graph 모드 공유**)
+11. **`decoder_lah` + `decoder_sa` (LinearDecoderSocialGraph)** — LAH, SA pair-wise 분류 헤드 (**Transformer/Graph 모드 공유**; Transformer checkpoint에서 warm-start)
 
 > **Graph 모드**: `interaction.type=graph`로 전환. SocialGraphBlock/TemporalGraphBlock이 People Interaction/Temporal을 대체.  
-> **Prior weights**: `SocialGraphBlock`의 geometric prior 가중치 3개가 모두 `nn.Parameter` (learnable scalar, init=0.5).
+> Social prediction (LAH/SA/LAEO)은 양 모드 모두 동일한 pair-wise decoder 경로 사용.  
+> **Prior weight**: `SocialGraphBlock`의 `prior_w_attn` 1개만 learnable (init=0.5). Attention routing에만 적용.
 
 ---
 

@@ -24,25 +24,19 @@ def social_loss(social_pred, social_gt, mask, pos_weight=2.0):
         Dictionary representing the items to log (e.g. {"total_loss": total_loss})
     """
 
-    # Intersect annotation mask with finiteness: skip positions where the logit is
-    # non-finite (safety guard — root cause is dataset padding pid -2, but keep as
-    # defence against any future annotation/masking mismatches).
-    finite_mask = mask & torch.isfinite(social_pred)
-    num_instances = finite_mask.sum()
-    if num_instances == 0:
-        # No valid pairs: return a plain zero — avoids NaN from empty reduction.
-        return torch.tensor(0.0, device=social_pred.device)
+    # set social_gt positions where mask is 0 to 0 (to avoid NaNs in loss computation)
+    social_gt = social_gt * mask
 
-    # Index only valid, finite positions before BCE.
-    valid_pred = social_pred[finite_mask]
-    valid_gt = social_gt[finite_mask].float()
+    num_instances = mask.sum()
     loss = F.binary_cross_entropy_with_logits(
-        valid_pred,
-        valid_gt,
-        pos_weight=torch.tensor(pos_weight, device=valid_gt.device),
-        reduction="sum",
+        social_pred,
+        social_gt,
+        pos_weight=torch.tensor(pos_weight, device=social_gt.device),
+        reduction="none",
     )
-    return loss / num_instances.float()
+    loss = torch.mul(loss, mask).sum() / (num_instances + 1e-6)
+
+    return loss
 
 
 def compute_social_loss(
@@ -201,58 +195,87 @@ def compute_inout_loss(io_pred, io_gt, mask):
     return bce_loss
 
 
-def compute_null_node_loss(null_logits, lah_gt, num_valid_people):
-    """Null-node supervision for SocialGraphBlock.
+def compute_dual_null_loss(alpha_null_out, alpha_null_in, inout_gt, lah_gt, num_valid_people):
+    """Dual-null supervision for SocialGraphBlock.
 
-    For each valid source person g:
-      null_GT(g) = 1  if ALL lah_gt(g→j) == 0  (person g looks at nobody)
-      null_GT(g) = 0  if ANY lah_gt(g→j) == 1  (person g looks at someone)
-      skip            if ALL lah_gt(g→j) == -1  (no annotation for this person)
+    L_null_out: BCE(alpha_null_out[g], inout_gt[g] == 0)
+        Out-of-frame person should route attention to Null_out.
+        Computed for every valid person with a known inout label.
 
-    Valid people occupy the BACK slots (global positions N-nv..N-1) per the
-    dataset's prepend-zero padding convention. Edges in lah_gt are ordered as
-    itertools.permutations(range(N), 2), so pair (g, d) is at position
-    g*(N-1) + (d if d < g else d-1).
+    L_null_in: BCE(alpha_null_in[g], all(lah_gt[g→j] == 0) AND inout_gt[g] == 1)
+        In-frame person who looks at nobody should route attention to Null_in.
+        Computed only when inout_gt==1 and at least one LAH annotation exists.
+
+    Valid people occupy BACK slots [N-nv .. N-1] per the padding convention.
+    LAH edges are ordered as itertools.permutations(range(N), 2), so pair
+    (g, d) is at position g*(N-1) + (d if d < g else d-1).
 
     Args:
-        null_logits:       (BT, N)         source-to-null logits
-        lah_gt:            (BT, N*(N-1))   GT LAH labels (0 / 1 / -1)
-        num_valid_people:  (BT,) int       valid person count per frame
+        alpha_null_out:   (BT, N) in [0,1] — probability of routing to Null_out
+        alpha_null_in:    (BT, N) in [0,1] — probability of routing to Null_in
+        inout_gt:         (BT, N) — 0=out-of-frame, 1=in-frame, -1=unknown
+        lah_gt:           (BT, N*(N-1)) — GT LAH labels (0 / 1 / -1)
+        num_valid_people: (BT,) int
 
     Returns:
-        Scalar BCE loss over all annotated (sample, person) pairs.
+        (loss_null_out, loss_null_in) — scalar BCE losses.
     """
-    device = null_logits.device
-    BT = null_logits.shape[0]
-    N = null_logits.shape[1]
+    device = alpha_null_out.device
+    BT = alpha_null_out.shape[0]
+    N  = alpha_null_out.shape[1]
 
-    valid_logits = []
-    valid_gts = []
+    out_probs, out_targets = [], []
+    in_probs,  in_targets  = [], []
 
     for bt in range(BT):
         nv = int(num_valid_people[bt])
-        if nv <= 1:
+        if nv == 0:
             continue
         nv_start = N - nv  # valid people at global positions nv_start..N-1
+
         for i_local in range(nv):
-            g = nv_start + i_local  # global position of this valid person
-            # Outgoing edge positions from g to other valid people
+            g  = nv_start + i_local
+            io = inout_gt[bt, g].item()
+
+            # ── L_null_out ────────────────────────────────────────────────────
+            # Every valid person with a known inout label contributes.
+            if io != -1:
+                out_probs.append(alpha_null_out[bt, g])
+                out_targets.append(1.0 if io == 0 else 0.0)
+
+            # ── L_null_in ─────────────────────────────────────────────────────
+            if io != 1:
+                continue
+            if nv <= 1:
+                # Only valid person in frame → must be looking at scene object
+                in_probs.append(alpha_null_in[bt, g])
+                in_targets.append(1.0)
+                continue
             outgoing = [
                 g * (N - 1) + (d if d < g else d - 1)
                 for d in range(nv_start, N) if d != g
             ]
             lah_i = lah_gt[bt, outgoing]
+            known_lah = lah_i[lah_i != -1]
+            if len(known_lah) == 0:
+                continue  # no annotation for this person
+            null_in_gt = 0.0 if (known_lah == 1).any() else 1.0
+            in_probs.append(alpha_null_in[bt, g])
+            in_targets.append(null_in_gt)
 
-            if (lah_i == -1).all():
-                continue
+    with torch.amp.autocast('cuda', enabled=False):
+        if out_probs:
+            probs_t   = torch.stack(out_probs).float()
+            targets_t = torch.tensor(out_targets, dtype=torch.float32, device=device)
+            loss_out  = F.binary_cross_entropy(probs_t, targets_t)
+        else:
+            loss_out  = torch.tensor(0.0, device=device, requires_grad=True)
 
-            null_gt = 0.0 if (lah_i == 1).any() else 1.0
-            valid_logits.append(null_logits[bt, g])
-            valid_gts.append(null_gt)
+        if in_probs:
+            probs_t   = torch.stack(in_probs).float()
+            targets_t = torch.tensor(in_targets, dtype=torch.float32, device=device)
+            loss_in   = F.binary_cross_entropy(probs_t, targets_t)
+        else:
+            loss_in   = torch.tensor(0.0, device=device, requires_grad=True)
 
-    if not valid_logits:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-
-    logits_t = torch.stack(valid_logits)
-    gts_t = torch.tensor(valid_gts, dtype=logits_t.dtype, device=device)
-    return F.binary_cross_entropy_with_logits(logits_t, gts_t)
+    return loss_out, loss_in

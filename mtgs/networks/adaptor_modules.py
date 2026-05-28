@@ -200,15 +200,10 @@ class InteractionBlock(nn.Module):
         else:
             self.extra_extractors = None
 
-    def forward(self, x, c, blocks, num_valid_people, position_embeddings=None):
+    def forward(self, x, c, blocks, num_valid_people):
         x = self.injector(query=x, feat=c)
         for idx, blk in enumerate(blocks):
-            # HuggingFace transformer blocks return a tuple; take the hidden states
-            if position_embeddings is not None:
-                out = blk(x, position_embeddings=position_embeddings)
-            else:
-                out = blk(x)
-            x = out[0] if isinstance(out, (tuple, list)) else out
+            x = blk(x)
         c = self.extractor(query=c, feat=x)
         if self.extra_extractors is not None:
             for extractor in self.extra_extractors:
@@ -219,26 +214,28 @@ class InteractionBlock(nn.Module):
 
 class SocialGraphBlock(nn.Module):
     """
-    Social interaction block with unified edge-based social predictions.
+    Social interaction graph block replacing I^b_pp (Social Encoder).
 
-    Edge logits computed during message passing serve dual roles:
-    attention weights for aggregation AND direct social predictions (LAH, SA).
-    No separate pair-reconstruction decoder is needed after this block.
+    Supports three aggregation modes (controlled by `aggr`):
 
-    LAH (directed):   e_dir(i→j) = MLP_dir(cat(h_i, h_j))
-    SA  (undirected): e_sa(i,j)  = MLP_sa(h_i + h_j)   (symmetric by construction)
-    Null:             e_null(i)  = MLP_null(h_i)
+      "outgoing" (default):
+          msg_i = Σ_{i→j} α[i→j] · W_msg(h_j)  +  α_null[i] · W_msg(null_node)
+          softmax over destinations j (dim=-1).
+          i collects info from nodes it is looking at.
+          Null node: "i looks at no person" → null feature absorbed into msg_i.
 
-    Geometric priors:
-      - LAH cosine prior injected into the softmax on iteration 0 only (attention routing)
-      - Both LAH and SA priors added to the final output logits (prediction bias)
+      "ingoing":
+          msg_i = Σ_{j→i} α[j→i] · W_msg(h_j)
+          softmax over sources j (dim=1).
+          i collects info from nodes looking at it.
+          Null node disabled (null has no meaningful gaze direction as a source).
 
-    Message aggregation uses OUTGOING attention — aggregating by whom i looks at:
-        msg_i = Σ_j α[i→j] · W_msg(h_j)  +  α_null[i] · W_msg(null_node)
+      "both":
+          msg_i = W_out(msg_out_i) + W_in(msg_in_i)
+          outgoing part includes null; ingoing part does not.
 
-    Output edge logits come from the final internal iteration, with priors applied.
-    Edge ordering matches GT label ordering:
-        [(s, d) for s in range(N) for d in range(N) if s != d]
+    Geometric LAH cosine prior is injected into attention weights on iteration 0 only.
+    Social prediction (LAH/SA) is handled by the shared pair-wise decoder downstream.
     """
 
     def __init__(
@@ -251,28 +248,38 @@ class SocialGraphBlock(nn.Module):
         use_gaze_prior: bool = True,
         prior_weight: float = 0.5,
         layer_idx: int = 0,       # unused; kept for API compatibility
+        aggr: str = "outgoing",   # "outgoing" | "ingoing" | "both"
     ):
         super().__init__()
+        assert aggr in ("outgoing", "ingoing", "both"), f"Unknown aggr: {aggr!r}"
         self.num_layers     = num_layers
-        self.use_null_node  = use_null_node
         self.use_gaze_prior = use_gaze_prior
+        self.aggr           = aggr
 
-        # Learnable prior weights — initialized to prior_weight, unconstrained.
-        # Three separate scalars: attention routing, LAH output, SA output.
+        # Null node is only meaningful in outgoing direction.
+        self.use_null_node = use_null_node and (aggr in ("outgoing", "both"))
+
+        # Learnable prior weight for attention routing only (single scalar).
         self.prior_w_attn = nn.Parameter(torch.tensor(prior_weight))
-        self.prior_w_lah  = nn.Parameter(torch.tensor(prior_weight))
-        self.prior_w_sa   = nn.Parameter(torch.tensor(prior_weight))
 
-        # ── Edge scoring MLPs ────────────────────────────────────────────────
+        # ── Attention scoring MLP (directed edge i→j) ───────────────────────
         self.mlp_dir = MLP(token_dim * 2, hidden_channels, 1)
-        self.mlp_sa  = MLP(token_dim,     hidden_channels, 1)
-        if use_null_node:
-            self.null_node = nn.Parameter(torch.zeros(token_dim))
-            self.mlp_null  = MLP(token_dim, hidden_channels, 1)
+        if self.use_null_node:
+            # Null_in : in-frame non-person targets (looks at scene object)
+            # Null_out: out-of-frame gaze (supervised by inout label)
+            self.null_in_node  = nn.Parameter(torch.zeros(token_dim))
+            self.null_out_node = nn.Parameter(torch.zeros(token_dim))
+            self.mlp_null_in   = MLP(token_dim * 2, hidden_channels, 1)
+            self.mlp_null_out  = MLP(token_dim * 2, hidden_channels, 1)
 
         # ── Message passing & node update ────────────────────────────────────
         self.W_msg       = nn.Linear(token_dim, token_dim, bias=False)
+        if aggr == "both":
+            # separate projections to combine outgoing and ingoing messages
+            self.W_combine_out = nn.Linear(token_dim, token_dim, bias=False)
+            self.W_combine_in  = nn.Linear(token_dim, token_dim, bias=False)
         self.update_proj = nn.Linear(token_dim * 2, token_dim)
+        self.W_gate      = nn.Linear(token_dim, token_dim)
         self.norm        = nn.LayerNorm(token_dim)
 
         self._edge_cache: dict = {}
@@ -312,10 +319,9 @@ class SocialGraphBlock(nn.Module):
             head_bboxes:      (B, N, 4) normalized [x1,y1,x2,y2]
 
         Returns:
-            tokens_out:  (B, N, D)       updated node features
-            lah_logits:  (B, N*(N-1))    LAH edge logits (final iter + priors)
-            sa_logits:   (B, N*(N-1))    SA  edge logits (final iter + prior)
-            null_logits: (B, N)          null-node logits from final h; zeros if disabled
+            tokens_out:     (B, N, D) updated node features.
+            alpha_null_in:  (B, N) or None — attention weight to Null_in (last iter).
+            alpha_null_out: (B, N) or None — attention weight to Null_out (last iter).
         """
         B, N, D = person_tokens.shape
         device  = person_tokens.device
@@ -332,96 +338,96 @@ class SocialGraphBlock(nn.Module):
         pair_valid = node_valid.unsqueeze(2) & node_valid.unsqueeze(1)   # (B, N, N)
         diag_mask  = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
 
-        # ── Pre-compute geometric priors (data-dependent, iteration-independent) ──
-        lah_prior = sa_prior = None
+        # ── Pre-compute LAH cosine prior (iteration-independent) ─────────────
+        lah_prior = None
         if self.use_gaze_prior and gaze_vecs is not None and head_bboxes is not None:
             centers = (head_bboxes[..., :2] + head_bboxes[..., 2:]) / 2   # (B, N, 2)
-
-            # LAH prior: cosine(gaze_i, dir_{i→j}), edge-list form (B, E)
             dir_ij    = F.normalize(centers[:, dst_N] - centers[:, src_N], dim=-1)
             lah_prior = (gaze_vecs[:, src_N] * dir_ij).sum(-1)            # (B, E)
 
-            # SA prior: gaze ray convergence, (B, E) ∈ {-1, 0, +1}
-            c_src = centers[:, src_N];   c_dst = centers[:, dst_N]
-            g_src = gaze_vecs[:, src_N]; g_dst = gaze_vecs[:, dst_N]
-            dc    = c_dst - c_src
-            det   = g_src[..., 0] * g_dst[..., 1] - g_src[..., 1] * g_dst[..., 0]
-            t_i   = (dc[..., 0] * g_dst[..., 1] - dc[..., 1] * g_dst[..., 0]) / (det + 1e-6)
-            t_j   = (dc[..., 0] * g_src[..., 1] - dc[..., 1] * g_src[..., 0]) / (det + 1e-6)
-            sa_prior = (t_i > 0).float() + (t_j > 0).float() - 1.0       # (B, E)
-
         h = person_tokens.clone()
-        e_dir_last = e_sa_last = None
+        _alpha_null_in  = None
+        _alpha_null_out = None
 
         for iter_idx in range(self.num_layers):
-            # ── Edge logit computation ───────────────────────────────────────
-            h_i = h.unsqueeze(2).expand(B, N, N, D)   # (B, N, N, D)
-            h_j = h.unsqueeze(1).expand(B, N, N, D)   # (B, N, N, D)
+            # ── Directed edge attention scores ───────────────────────────────
+            h_i = h.unsqueeze(2).expand(B, N, N, D)
+            h_j = h.unsqueeze(1).expand(B, N, N, D)
 
-            # LAH: directed, cat(h_i, h_j) → scalar
             e_dir_mat = self.mlp_dir(
                 torch.cat([h_i, h_j], dim=-1).reshape(B * N * N, 2 * D)
             ).reshape(B, N, N)
             e_dir_mat = e_dir_mat.masked_fill(diag_mask,   float("-inf"))
             e_dir_mat = e_dir_mat.masked_fill(~pair_valid, float("-inf"))
 
-            # SA: symmetric, h_i + h_j → scalar
-            e_sa_mat = self.mlp_sa(
-                (h_i + h_j).reshape(B * N * N, D)
-            ).reshape(B, N, N)
-
-            # Inject LAH prior into attention softmax on iter 0 only
+            # Inject LAH cosine prior into attention on iteration 0 only
             if self.use_gaze_prior and lah_prior is not None and iter_idx == 0:
                 lah_prior_mat = torch.zeros(B, N, N, device=device, dtype=dtype)
                 lah_prior_mat[:, src_N, dst_N] = lah_prior.to(dtype)
                 e_dir_mat = e_dir_mat + self.prior_w_attn * lah_prior_mat
 
-            # ── Softmax over outgoing edges per source node (+ null) ─────────
-            if self.use_null_node:
-                e_null = self.mlp_null(h.reshape(B * N, D)).reshape(B, N)
-                e_null = e_null.masked_fill(~node_valid, float("-inf"))
-                e_aug  = torch.cat([e_dir_mat, e_null.unsqueeze(-1)], dim=-1)  # (B, N, N+1)
-            else:
-                e_aug = e_dir_mat
+            W_msg_h = self.W_msg(h)   # (B, N, D)
 
-            all_inf = e_aug.isinf().all(dim=-1, keepdim=True)
-            e_aug   = e_aug.masked_fill(all_inf, 0.0)
-            alpha   = torch.softmax(e_aug, dim=-1)   # (B, N, N[+1])
+            # ── Outgoing aggregation: i collects from nodes it looks at ──────
+            # α_out[i,j]: softmax over destinations j (dim=-1)
+            # msg_out_i = Σ_j α_out[i→j] · W_msg(h_j)  +  α_in[i] · W_msg(null_in)  +  α_out[i] · W_msg(null_out)
+            if self.aggr in ("outgoing", "both"):
+                if self.use_null_node:
+                    # Node-dependent null scores: e_{i->null} = MLP_null([h_i; v_null])
+                    v_in  = self.null_in_node.expand(B, N, -1)   # (B, N, D)
+                    v_out = self.null_out_node.expand(B, N, -1)  # (B, N, D)
+                    e_null_in  = self.mlp_null_in(
+                        torch.cat([h, v_in],  dim=-1).reshape(B * N, 2 * D)
+                    ).reshape(B, N)
+                    e_null_out = self.mlp_null_out(
+                        torch.cat([h, v_out], dim=-1).reshape(B * N, 2 * D)
+                    ).reshape(B, N)
+                    e_null_in  = e_null_in.masked_fill(~node_valid, float("-inf"))
+                    e_null_out = e_null_out.masked_fill(~node_valid, float("-inf"))
+                    # (B, N, N+2): last two cols are null_in and null_out scores
+                    e_aug_out = torch.cat(
+                        [e_dir_mat, e_null_in.unsqueeze(-1), e_null_out.unsqueeze(-1)], dim=-1
+                    )
+                else:
+                    e_aug_out = e_dir_mat
+                all_inf_out = e_aug_out.isinf().all(dim=-1, keepdim=True)
+                e_aug_out   = e_aug_out.masked_fill(all_inf_out, 0.0)
+                alpha_out   = torch.softmax(e_aug_out, dim=-1)   # (B, N, N[+2])
+                msg_out = torch.einsum("bij,bjd->bid", alpha_out[:, :, :N], W_msg_h)
+                if self.use_null_node:
+                    _alpha_null_in  = alpha_out[:, :, N]      # (B, N)
+                    _alpha_null_out = alpha_out[:, :, N + 1]  # (B, N)
+                    msg_out = (
+                        msg_out
+                        + _alpha_null_in.unsqueeze(-1)  * self.W_msg(self.null_in_node).to(dtype)
+                        + _alpha_null_out.unsqueeze(-1) * self.W_msg(self.null_out_node).to(dtype)
+                    )
 
-            # ── Message aggregation — outgoing: whom i is looking at ────────────
-            # msg_i = Σ_j α[i→j] · W_msg(h_j)
-            W_msg_h = self.W_msg(h)                              # (B, N, D)
-            msg = torch.einsum(
-                "bij,bjd->bid", alpha[:, :, :N], W_msg_h
-            )
-            if self.use_null_node:
-                alpha_null = alpha[:, :, N]                      # (B, N): i→null weight
-                msg = msg + alpha_null.unsqueeze(-1) * self.W_msg(self.null_node).to(dtype)
+            # ── Ingoing aggregation: i collects from nodes looking at it ─────
+            # α_in[i,j]: softmax over sources j (dim=1), treating e_dir_mat[j,i] as score of j→i
+            # msg_in_i = Σ_j α_in[j→i] · W_msg(h_j)
+            if self.aggr in ("ingoing", "both"):
+                # mask invalid pairs before softmax (same pair_valid, diag already -inf)
+                e_in = e_dir_mat.masked_fill(e_dir_mat.isinf().all(dim=1, keepdim=True), 0.0)
+                alpha_in = torch.softmax(e_in, dim=1)   # (B, N, N): softmax over source dim
+                # alpha_in[b, j, i] = how much j contributes to i
+                msg_in = torch.einsum("bji,bjd->bid", alpha_in, W_msg_h)
 
-            # ── Node update ─────────────────────────────────────────────────
-            h_new = self.update_proj(torch.cat([h, msg], dim=-1))
-            h_new = self.norm(h + h_new).to(dtype)
+            # ── Combine ───────────────────────────────────────────────────────
+            if self.aggr == "outgoing":
+                msg = msg_out
+            elif self.aggr == "ingoing":
+                msg = msg_in
+            else:  # both
+                msg = self.W_combine_out(msg_out) + self.W_combine_in(msg_in)
+
+            # ── Node update ──────────────────────────────────────────────────
+            gate  = torch.sigmoid(self.W_gate(h))  # (B, N, D)
+            delta = self.update_proj(torch.cat([h, msg], dim=-1))
+            h_new = self.norm(h + gate * delta).to(dtype)
             h = torch.where(node_valid.unsqueeze(-1), h_new, h)
 
-            e_dir_last = e_dir_mat
-            e_sa_last  = e_sa_mat
-
-        # ── Extract edge-list logits in GT ordering, add priors ──────────────
-        lah_logits = e_dir_last[:, src_N, dst_N]   # (B, E)
-        sa_logits  = e_sa_last[:, src_N, dst_N]    # (B, E)
-
-        if self.use_gaze_prior and lah_prior is not None:
-            lah_logits = lah_logits + self.prior_w_lah * lah_prior.to(dtype)
-        if self.use_gaze_prior and sa_prior is not None:
-            sa_logits  = sa_logits  + self.prior_w_sa  * sa_prior.to(dtype)
-
-        # Null logits from fully-updated h
-        if self.use_null_node:
-            null_logits = self.mlp_null(h.reshape(B * N, D)).reshape(B, N) * node_valid.float()
-        else:
-            null_logits = torch.zeros(B, N, device=device)
-
-        return h.float(), lah_logits.float(), sa_logits.float(), null_logits.float()
+        return h.float(), _alpha_null_in, _alpha_null_out
 
 
 class TemporalGraphBlock(nn.Module):
