@@ -13,6 +13,7 @@ import itertools
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torchmetrics as tm
 import lightning.pytorch as pl
@@ -27,6 +28,7 @@ from mtgs.train.losses import (
     compute_social_loss,
     compute_dual_null_loss,
     compute_inout_loss,
+    social_loss,
 )
 
 from mtgs.performance.metrics import (
@@ -68,11 +70,20 @@ class MTGSModel(pl.LightningModule):
             temporal_context=cfg.data.temporal_context,
             output=cfg.model.output,
             interaction_type=cfg.interaction.type,
-            graph_num_layers=cfg.interaction.graph.num_layers,
+            graph_num_layers=cfg.interaction.num_layers,
             graph_aggr=cfg.interaction.graph.aggr,
             graph_use_null_node=cfg.interaction.graph.use_null_node,
             graph_use_gaze_prior=cfg.interaction.graph.use_gaze_prior,
             graph_prior_weight=cfg.interaction.graph.prior_weight,
+            graph_use_sa_prior=cfg.interaction.graph.use_sa_prior,
+            graph_sa_prior_weight=cfg.interaction.graph.sa_prior_weight,
+            gaze_graph_num_layers=cfg.interaction.num_layers,
+            gaze_graph_edge_dim=cfg.interaction.gaze_graph.edge_dim,
+            gaze_graph_use_prior=cfg.interaction.gaze_graph.use_prior,
+            gaze_graph_prior_weight=cfg.interaction.gaze_graph.prior_weight,
+            gaze_graph_region_anchor=cfg.interaction.gaze_graph.region_anchor,
+            interaction_order=cfg.interaction.order,
+            use_gws=cfg.interaction.use_gws,
         )
 
         self.cfg = cfg
@@ -125,6 +136,50 @@ class MTGSModel(pl.LightningModule):
         # Freeze Weights
         self._freeze()
 
+    @staticmethod
+    def _remap_gaze_graph_weights(weights):
+        """Back-compat warm-start for the two-path GazeGraphBlock.
+
+        A pre-split gaze_graph checkpoint has a single shared refinement
+        (`row_layer/col_layer/upd_*/norm_*/refresh/norm_e`) + one `edge_head`.
+        The new layout has two isolated refiners (`trunk.*`, `sa.*`) + per-type
+        heads (`head_lah/head_sa/head_null`). Copy the old shared weights onto
+        BOTH paths (and the old head onto all three heads) so LAH refinement is
+        preserved instead of cold-starting. No-op for new-layout checkpoints.
+        """
+        prefix = "gaze_graph_block."
+        has_old = any(k.startswith(prefix + "edge_head.") for k in weights)
+        has_new = any(k.startswith(prefix + "trunk.") for k in weights)
+        if not has_old or has_new:
+            return weights
+
+        refine_map = {
+            "row_layer": "row", "col_layer": "col",
+            "upd_src": "upd_src", "upd_tgt": "upd_tgt",
+            "norm_src": "norm_src", "norm_tgt": "norm_tgt",
+            "refresh": "refresh", "norm_e": "norm_e",
+        }
+        out = OrderedDict()
+        for k, v in weights.items():
+            if not k.startswith(prefix):
+                out[k] = v
+                continue
+            sub = k[len(prefix):]                       # e.g. "row_layer.self_attn..."
+            top = sub.split(".", 1)[0]
+            rest = sub[len(top):]                       # ".<param...>"
+            if top in refine_map:
+                new = refine_map[top] + rest
+                out[prefix + "trunk." + new] = v
+                out[prefix + "sa." + new] = v.clone()
+            elif top == "edge_head":
+                out[prefix + "head_lah" + rest] = v
+                out[prefix + "head_null" + rest] = v.clone()
+                out[prefix + "head_sa" + rest] = v.clone()
+            else:                                       # mlp_init, *xattn*, node projs, region/hm, etc.
+                out[k] = v
+        logger.info("Remapped pre-split GazeGraphBlock weights onto trunk/sa two-path layout")
+        return out
+
     def _init_weights(self):
         # Load pre-trained weights
         if self.model_weights:
@@ -135,6 +190,7 @@ class MTGSModel(pl.LightningModule):
                     for name, value in model_ckpt["state_dict"].items()
                 ]
             )
+            model_weights = self._remap_gaze_graph_weights(model_weights)
             self.model.load_state_dict(model_weights, strict=False)
             logger.info(
                 f"Successfully loaded pre-trained weights from {self.model_weights}"
@@ -200,6 +256,22 @@ class MTGSModel(pl.LightningModule):
             param.requires_grad = False
 
     def _freeze(self):
+        # Post-training recipe: frozen transformer trunk as a visual extractor,
+        # train ONLY the gaze graph head. Overrides the per-module flags below.
+        if getattr(self.cfg.train.freeze, "all_but_gaze_graph", False):
+            assert self.model.use_gaze_graph, \
+                "freeze.all_but_gaze_graph requires interaction.type=gaze_graph"
+            self.freeze_module(self.model)
+            for p in self.model.gaze_graph_block.parameters():
+                p.requires_grad = True
+            n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            n_total = sum(p.numel() for p in self.model.parameters())
+            logger.info(
+                "Frozen trunk (extractor); training ONLY gaze_graph_block "
+                f"({n_train:,} / {n_total:,} params trainable)."
+            )
+            return
+
         if self.cfg.train.freeze.gaze_encoder_backbone:
             logger.info("Freezing the Gaze Encoder backbone layers.")
             self.freeze_module(self.model.gaze_encoder.backbone)
@@ -236,20 +308,28 @@ class MTGSModel(pl.LightningModule):
                     "init_lr": base_lr * 3,
                 },
                 {
-                    "params": self.model.social_graph_blocks.parameters(),
+                    # directed (LAH) + undirected (SA) social graph blocks
+                    "params": list(self.model.social_graph_blocks.parameters())
+                              + list(self.model.sa_social_blocks.parameters()),
                     "name": "social-graph-blocks",
                     "lr": base_lr * 10,
                     "init_lr": base_lr * 10,
                 },
                 {
-                    "params": self.model.temporal_graph_blocks.parameters(),
+                    "params": list(self.model.temporal_graph_blocks.parameters())
+                              + list(self.model.sa_temporal_blocks.parameters()),
                     "name": "temporal-graph-blocks",
                     "lr": base_lr * 5,
                     "init_lr": base_lr * 5,
                 },
                 {
                     "params": list(self.model.decoder_lah.parameters())
-                              + list(self.model.decoder_sa.parameters()),
+                              + list(self.model.decoder_laeo.parameters())
+                              + list(self.model.decoder_sa.parameters())
+                              + list(self.model.sa_projs.parameters())
+                              + (list(self.model.gaze_scene_proj.parameters())
+                                 + list(self.model.gaze_fusion.parameters())
+                                 if self.model.use_gws else []),
                     "name": "social-decoders",
                     "lr": base_lr * 3,
                     "init_lr": base_lr * 3,
@@ -258,9 +338,63 @@ class MTGSModel(pl.LightningModule):
             high_lr_prefixes = {
                 "gaze_encoder_temporal",
                 "social_graph_blocks",
+                "sa_social_blocks",
                 "temporal_graph_blocks",
+                "sa_temporal_blocks",
                 "decoder_lah",
+                "decoder_laeo",
                 "decoder_sa",
+                "sa_projs",
+                "gaze_scene_proj",
+                "gaze_fusion",
+            }
+            other_params = [
+                v for k, v in self.model.named_parameters()
+                if not any(k.startswith(prefix) for prefix in high_lr_prefixes)
+            ]
+            other_params = [
+                {
+                    "params": other_params,
+                    "name": "base",
+                    "lr": base_lr,
+                    "init_lr": base_lr,
+                }
+            ]
+            params = high_lr_params + other_params
+        elif self.model.use_gaze_graph:
+            # Interaction module is identical to transformer mode (people_interaction
+            # + people_temporal); only the social head differs (gaze_graph_block,
+            # highest LR). 4 param groups → default 4-entry train.swa.lr. The unused
+            # decoder_lah/decoder_sa fall into "base" (no gradient).
+            base_lr = self.cfg.optimizer.lr
+            high_lr_params = [
+                {
+                    "params": self.model.gaze_encoder_temporal.parameters(),
+                    "name": "gaze-encoder-temporal",
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
+                {
+                    "params": self.model.people_temporal.parameters(),
+                    "name": "people-temporal",
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
+                {
+                    "params": self.model.gaze_graph_block.parameters(),
+                    "name": "gaze-graph-block",
+                    # ×3 to match the transformer social head (decoder_lah/sa). The
+                    # earlier ×10 amplified the CosineWarmRestarts LR spikes (T_0=4),
+                    # causing the epoch-8 collapse. ×3 = same param-group structure as
+                    # transformer → original scheduler/LR settings preserved.
+                    "lr": base_lr * 3,
+                    "init_lr": base_lr * 3,
+                },
+            ]
+            high_lr_prefixes = {
+                "gaze_encoder_temporal",
+                "people_temporal",
+                "gaze_graph_block",
             }
             other_params = [
                 v for k, v in self.model.named_parameters()
@@ -291,18 +425,23 @@ class MTGSModel(pl.LightningModule):
                     "init_lr": self.cfg.optimizer.lr * 3,
                 },
                 {
-                    "params": self.model.decoder_sa.parameters(),
-                    "name": "decoder-sa",
+                    "params": list(self.model.decoder_lah.parameters())
+                              + list(self.model.decoder_sa.parameters())
+                              + (list(self.model.gaze_scene_proj.parameters())
+                                 + list(self.model.gaze_fusion.parameters())
+                                 if self.model.use_gws else []),
+                    "name": "social-decoders",
                     "lr": self.cfg.optimizer.lr * 3,
                     "init_lr": self.cfg.optimizer.lr * 3,
                 },
             ]
 
+            high_lr_prefixes = {"gaze_encoder_temporal", "people_temporal",
+                                 "decoder_lah", "decoder_sa",
+                                 "gaze_scene_proj", "gaze_fusion"}
             other_params = []
             for k, v in self.model.named_parameters():
-                if (
-                    ("_temporal" not in k) and ("decoder_sa" not in k)
-                ):
+                if not any(k.startswith(p) for p in high_lr_prefixes):
                     other_params.append(v)
             other_params = [
                 {
@@ -363,6 +502,14 @@ class MTGSModel(pl.LightningModule):
 
             # Disable backward pass for SWA until the bug is fixed in lightning (https://github.com/Lightning-AI/lightning/issues/17245)
             self.automatic_optimization = False
+
+        # Post-training: keep the ENTIRE frozen trunk in eval mode so its BatchNorm
+        # running stats stay fixed — otherwise heatmap/in-out drift from the original
+        # checkpoint even with weights frozen. Only gaze_graph_block stays in train.
+        if getattr(self.cfg.train.freeze, "all_but_gaze_graph", False):
+            self._set_batchnorm_eval(self.model)   # whole trunk → eval (BN stats fixed)
+            self.model.gaze_graph_block.train()    # trained head stays in train mode
+            return
 
         # Set BN layers to eval mode for frozen modules
         if self.cfg.train.freeze.gaze_encoder:
@@ -436,6 +583,7 @@ class MTGSModel(pl.LightningModule):
         laeo_mask = laeo_gt != -1
         lah_gt = batch["lah_labels"].view(batch_size * t, -1)
         lah_mask = lah_gt != -1
+
         loss_social, logs_social = self.compute_social_loss(
             lah_pred,
             lah_gt,
@@ -465,6 +613,15 @@ class MTGSModel(pl.LightningModule):
             loss = loss + loss_null
             self.log("loss/train/null_out", loss_null_out.item(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
             self.log("loss/train/null_in",  loss_null_in.item(),  batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+        elif self.model.use_gaze_graph and alpha_null_in is not None:
+            # gaze_graph L_graph null-edge term: BCE(e_{i→Null}, inout==0).
+            # (LAH/SA edge BCE is already covered by compute_social_loss above.)
+            null_logit = alpha_null_in.view(batch_size * t, n)
+            io = batch["inout"].view(batch_size * t, n)
+            null_gt = (io == 0).float()
+            null_loss = social_loss(null_logit, null_gt, (io != -1), pos_weight=1.0)
+            loss = loss + null_loss
+            self.log("loss/train/null_edge", null_loss.item(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
 
         # Log Social Gaze Losses
         self.log(
@@ -708,6 +865,15 @@ class MTGSModel(pl.LightningModule):
             on_epoch=True,
             sync_dist=True,
         )
+        self.log(
+            "loss/val/social",
+            loss_social,
+            batch_size=n,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
 
         # Update CoAtt Metrics
         if coatt_pred.sum() != 0:
@@ -789,6 +955,22 @@ class MTGSModel(pl.LightningModule):
                     on_epoch=True,
                     sync_dist=True,
                 )
+
+    def on_validation_epoch_end(self):
+        aps = []
+        for m in (self.val_lah_ap, self.val_laeo_ap, self.val_coatt_ap):
+            try:
+                aps.append(m.compute())
+            except Exception:
+                pass
+        if aps:
+            self.log(
+                "metric/val/social_ap",
+                torch.stack(aps).mean(),
+                prog_bar=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
 
     def on_test_start(self):
         output_file = os.path.join(

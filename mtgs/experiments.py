@@ -70,6 +70,8 @@ class Experiment:
                     "epoch_start": self.cfg.train.swa.epoch_start,
                     "annealing_epochs": self.cfg.train.swa.annealing_epochs,
                 },
+                checkpoint_monitor=self.cfg.train.checkpoint_monitor,
+                checkpoint_mode=self.cfg.train.checkpoint_mode,
             )
 
         # Initialize -lighting- trainer

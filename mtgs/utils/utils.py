@@ -261,6 +261,42 @@ def generate_mask(bboxes, img_w, img_h):
     return mask.squeeze(0) if ndim == 1 else mask
 
 
+def spatial_softargmax2d(heatmap, temperature: float = 10.0):
+    """
+    Differentiable soft expected coordinates from a heatmap.
+
+    Computes the weighted centroid of the heatmap using temperature-scaled
+    softmax as weights. Unlike spatial_argmax2d, this is fully differentiable
+    and consistent between train and inference (no GT dependency).
+
+    Args:
+        heatmap (torch.Tensor): Shape (B, H, W) or (H, W). Values in [0, 1].
+        temperature (float): Sharpening factor for softmax. Higher → closer to
+            hard argmax. Default 10 works well for heatmaps in [0, 1].
+
+    Returns:
+        torch.Tensor: Normalized (x, y) coordinates in [0, 1], shape (B, 2) or (2,).
+    """
+    ndim = heatmap.ndim
+    if ndim == 2:
+        heatmap = heatmap.unsqueeze(0)
+
+    B, H, W = heatmap.shape
+    hm_flat = heatmap.reshape(B, -1).float()
+    weights = torch.softmax(hm_flat * temperature, dim=-1)  # (B, H*W)
+
+    grid_y = torch.linspace(0, 1, H, device=heatmap.device)
+    grid_x = torch.linspace(0, 1, W, device=heatmap.device)
+    gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    coords = torch.stack([gx.flatten(), gy.flatten()], dim=1)  # (H*W, 2) — (x, y)
+
+    points = (weights.unsqueeze(-1) * coords).sum(1)  # (B, 2)
+
+    if ndim == 2:
+        points = points[0]
+    return points
+
+
 def spatial_argmax2d(heatmap, normalize=True):
     """
     Function to locate the coordinates of the max value in the heatmap.

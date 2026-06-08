@@ -348,7 +348,8 @@ class VSGazeDataModule(pl.LightningDataModule):
             batch_size=self.batch_size[Stage.TRAIN],
             shuffle=True,
             num_workers=14,
-            pin_memory=False,
+            pin_memory=True,
+            persistent_workers=True,
         )
         return dataloader
 
@@ -363,7 +364,8 @@ class VSGazeDataModule(pl.LightningDataModule):
             batch_size=self.batch_size[Stage.VAL],
             shuffle=False,
             num_workers=6,
-            pin_memory=False,
+            pin_memory=True,
+            persistent_workers=True,
         )
         return dataloader
 
@@ -378,6 +380,7 @@ class VSGazeDataModule(pl.LightningDataModule):
             batch_size=self.batch_size[Stage.TEST],
             shuffle=True,
             num_workers=6,
-            pin_memory=False,
+            pin_memory=True,
+            persistent_workers=True,
         )
         return dataloader

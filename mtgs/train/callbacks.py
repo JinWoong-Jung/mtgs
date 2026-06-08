@@ -24,6 +24,8 @@ def build_callbacks(
     use_lr_monitor: bool = False,
     use_swa: bool = False,
     swa_params: Union[Dict, None] = None,
+    checkpoint_monitor: str = "metric/val/dist",
+    checkpoint_mode: str = "min",
 ) -> List:
     callbacks = []
 
@@ -31,8 +33,8 @@ def build_callbacks(
     checkpoint_cb = ModelCheckpoint(
         dirpath=checkpoint_folder,
         filename="best",
-        monitor="metric/val/dist",
-        mode="min",
+        monitor=checkpoint_monitor,
+        mode=checkpoint_mode,
         save_last=True,
         save_top_k=1,
         save_on_train_epoch_end=False,

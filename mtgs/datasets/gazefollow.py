@@ -177,6 +177,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=14,
             pin_memory=True,
+            persistent_workers=True,
         )
         return dataloader
 
@@ -192,6 +193,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=6,
             pin_memory=True,
+            persistent_workers=True,
         )
         return dataloader
 
@@ -207,6 +209,7 @@ class GazeFollowDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=4,
             pin_memory=True,
+            persistent_workers=True,
         )
         return dataloader
 

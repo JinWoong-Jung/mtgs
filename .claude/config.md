@@ -96,6 +96,35 @@ test:
 
 ---
 
+## Interaction 설정
+
+```yaml
+interaction:
+  type: hypergraph      # "transformer" | "graph" | "hypergraph"
+  order: "extract_first" # "inject_first" (원본 순서) | "extract_first" (신규)
+  num_layers: 2         # HypergraphBlock / SocialGraphBlock 내부 iteration 수
+
+  graph:                # graph 모드 전용
+    aggr: "outgoing"
+    use_null_node: true   # dual-null (loss 전용; 예측엔 미사용)
+    lambda_null: 0.5
+    use_gaze_prior: true  # directed 블록 LAH 방향 prior
+    prior_weight: 0.5
+    use_sa_prior: true    # ★ 이제 undirected SA 블록의 gaze·gaze prior를 제어 (directed 블록은 use_sa_prior=False 고정)
+    sa_prior_weight: 0.5
+  use_gws: false          # GWS: trunk에 gaze_scene_proj+gaze_fusion 융합 (별도 _gws decoder 없음)
+```
+
+**Graph 모드 구조 (2-graph 분리)**: directed `SocialGraphBlock`(LAH/LAEO/heatmap) + 전용 undirected `UndirectedSocialGraphBlock`(SA). LAEO는 `min(LAH_ij, LAH_ji)`로 derive (`decoder_laeo` 미사용). 자세한 내용은 [interaction_module.md](.claude/interaction_module.md), [architecture.md](.claude/architecture.md) 참조.
+
+**`interaction.order` 동작:**
+- `inject_first`: Injector → ViT → Extractor → Social (원본)
+- `extract_first`: Extractor → Social → Injector → ViT (scene-aware social interaction)
+
+**모드 간 호환 주의**: GazeFollow Stage1과 VSGaze Stage2는 반드시 동일한 `type` + `order` 조합 사용.
+
+---
+
 ## 옵티마이저/스케줄러
 
 ```yaml

@@ -4,14 +4,14 @@
 # SPDX-FileContributor: Anshul Gupta <anshul.gupta@idiap.ch>
 # SPDX-License-Identifier: GPL-3.0-only
 
-#SBATCH --job-name=vsgaze_train
+#SBATCH --job-name=postgraph
 #SBATCH --gres=gpu:rtx6000:1
 #SBATCH --time=48:00:00
 #SBATCH -c 8
 #SBATCH -p gpu
 #SBATCH --mem=96G
-#SBATCH --output=logs/vg_gaze_graph_%j.out
-#SBATCH --error=logs/vg_gaze_graph_%j.err
+#SBATCH --output=logs/postgraph_%j.out
+#SBATCH --error=logs/postgraph_%j.err
 
 # conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
 source /opt/miniconda3/etc/profile.d/conda.sh
@@ -27,27 +27,29 @@ else
     cd "$SLURM_SUBMIT_DIR/scripts"
 fi
 
-# set arguments
+# ── Post-training: frozen transformer trunk as a visual extractor ─────────────
+# 원본 transformer 모드 GazeFollow→VSGaze 완성본(mtgs-vsgaze.ckpt)을 그대로 로드해
+# trunk(visual + ViT-Adaptor + people_interaction/temporal + heatmap/inout/gaze
+# decoder) 전체를 FREEZE하고, 그 위에 gaze_graph_block만 학습한다.
+# gaze_graph 모드는 transformer interaction 모듈을 구조적으로 공유하므로
+# strict=False 로드 시 trunk 전부가 채워지고 gaze_graph_block만 random init된다.
 TASKS="train+test"
-WEIGHTS="/home/jinwoongjung/MTGS/experiments/2026-06-06/gf_gaze_graph_fixed/train/checkpoints/best.ckpt" # HuggingFace pretrained GazeFollow checkpoint
+WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-vsgaze.ckpt"
 
-INTERACTION_TYPE="gaze_graph"  # "transformer" | "graph" | "gaze_graph"
+INTERACTION_TYPE="gaze_graph"     # 고정: post-training은 gaze_graph 전용
 INTERACTION_ORDER="inject_first"  # "inject_first" (original) | "extract_first"
 
-EXP_NAME="vg_${INTERACTION_TYPE}_fixed"
+CHECKPOINTS_MONITOR="loss/val/social"
+CHECKPOINTS_MODE="min"
 
-# graph: 5 param groups. transformer/gaze_graph: 4 param groups.
-if [ "$INTERACTION_TYPE" = "graph" ]; then
-    SWA_LR_OVERRIDE="train.swa.lr=[1e-6,1e-6,1e-6,1e-6,3e-7]"
-else
-    SWA_LR_OVERRIDE=""
-fi
+EXP_NAME="postgraph"
 
 python -s ./main.py experiment.task=$TASKS \
     model.weights=$WEIGHTS \
     "experiment.name='${EXP_NAME}'" \
     interaction.type=$INTERACTION_TYPE \
     interaction.order=$INTERACTION_ORDER \
-    ${SWA_LR_OVERRIDE} \
+    train.freeze.all_but_gaze_graph=true \
+    train.checkpoint_monitor="$CHECKPOINTS_MONITOR" \
+    train.checkpoint_mode="$CHECKPOINTS_MODE" \
     "hydra.run.dir='\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}'"
-    

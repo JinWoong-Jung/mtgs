@@ -42,29 +42,60 @@ image_tokens = dinov2.prepare_tokens_with_masks(image)  # (B*T, num_patches+1, 7
 
 ## Step 3: ViT-Adaptor (4회 반복)
 
-각 `InteractionBlock`은 DINOv2 ViT 블록 3개를 감싸 아래를 순서대로 수행:
+각 `InteractionBlock`은 DINOv2 ViT 블록 3개를 감싸며, `interaction.order` 설정에 따라 실행 순서가 다름:
 
+**`inject_first` (기본/원본):**
 ```
-[Injector]       person_tokens → image_tokens (cross-attn: person attends to scene)
-[ViT blocks 3개]  image_tokens self-attention (DINOv2 레이어 3개)
-[Extractor]      image_tokens → person_tokens (cross-attn: person reads updated scene)
+[Injector]       person → scene cross-attn
+[ViT blocks 3개]  scene self-attn (DINOv2)
+[Extractor]      scene → person cross-attn
+[Social Block]   모드별 분기 (아래 참조)
 ```
 
-이후 모드에 따라 분기:
+**`extract_first` (신규):**
+```
+[Extractor]      scene → person cross-attn  ← scene-enriched 상태로 social 진행
+[Social Block]   모드별 분기 (아래 참조)
+[Injector]       person → scene cross-attn  ← socially-aware person token 주입
+[ViT blocks 3개]  scene self-attn (DINOv2)
+```
+
+`InteractionBlock`에 `forward_extract_only()`, `forward_inject_vit()` 메서드 추가로 분리 호출 지원.
+
+**Social Block 모드별 분기:**
 
 **Transformer 모드:**
 ```
-[People Interaction]  person_tokens self-attention (사람들 간 상호작용)
-[People Temporal]     person_tokens temporal self-attention (시간 축 상호작용)
+[People Interaction]  person_tokens self-attention
+[People Temporal]     temporal self-attention
 ```
 
-**Graph 모드:**
+**Graph 모드 (2-graph 분리):**
 ```
-[SocialGraphBlock]    outgoing directed graph message passing (사람 간 spatial 상호작용)
-[TemporalGraphBlock]  per-person MHA over T frames (시간 축 상호작용)
+trunk (LAH/LAEO/heatmap/inout):
+  [SocialGraphBlock]          outgoing directed graph, softmax + dual-null (null_in/null_out)
+  [TemporalGraphBlock]        per-person MHA over T frames
+SA 분기 (CoAtt 전용, trunk로 되먹이지 않는 평행 read-out):
+  [UndirectedSocialGraphBlock] sigmoid gated-mean, 대칭 edge, SA gaze prior
+  [sa_temporal_blocks]         per-person MHA over T frames
+```
+- 두 그래프는 매 블록에서 **같은 입력 토큰**(`sa_in` = directed 블록 직전 trunk)으로부터 평행 처리.
+- directed 블록만 trunk를 갱신 → 다음 블록·heatmap·scene으로 전파.
+- undirected 블록은 자기 스냅샷(`sa_layers`)만 `decoder_sa`로 보냄.
+- directed 블록은 LAH 방향 prior만 사용(`use_sa_prior=False`); SA gaze prior는 undirected 블록 소관.
+
+**Hypergraph 모드:**
+```
+[HypergraphBlock]     person hyperedge N개 + null_in + null_out
+                      → returns (h, attn_agg, attn_null_in)
+                        attn_agg[i,j]  = "i가 j를 보는 정도" (N→E softmax person 기여분)
+                        attn_null_in[i] = person i의 null_in 어텐션 (장면 사물 봄)
+[TemporalGraphBlock]  per-person MHA over T frames (Graph 모드와 공유)
 ```
 
-총 4개 반복 → `img_layers[0..3]`, `gaze_layers[0..3]` 수집
+총 4개 반복 → `img_layers[0..3]`, `gaze_layers[0..3]`(trunk) 수집  
+Graph 모드는 추가로 `sa_layers[0..3]`(undirected SA 분기) 수집  
+Graph/Hypergraph 모드는 `alpha_null_in_list[0..3]`, `alpha_null_out_list[0..3]` 수집 (dual-null loss 전용)
 
 ---
 
@@ -88,29 +119,45 @@ img_layers를 공간적 feature map으로 reshape: (B*T, D, H/patch, W/patch)
 
 ---
 
-## Step 5: Social Gaze 디코딩 (양 모드 공통)
-
-`gaze_projs`, `inout_decoder`, `decoder_lah`, `decoder_sa`는 transformer/graph 모드 모두 공유.  
-Transformer 체크포인트에서 Graph 모드로 fine-tuning 시 이 가중치들이 warm-start로 재사용됨.
+## Step 5: Social Gaze 디코딩 (모드별 분기)
 
 ```python
-# 모든 InteractionBlock에서 나온 person token을 projection 후 concat
-proj_tokens = cat([gaze_projs[i](gaze_layer) for i, gaze_layer in enumerate(gaze_layers)])
-# shape: (B*T, N, 128*4=512)
+# 공통: gaze_projs로 4 stage trunk token projection+concat
+proj_tokens = cat([gaze_projs[i](gaze_layer) for i in range(4)])  # (B*T, N, 512)
 
-# In-out 분류
-inout = inout_decoder(proj_tokens.view(B*T*N, -1))     # (B*T*N, 1)
-
-# Pair-wise social gaze 예측 (양 모드 동일)
-indices = permutations(range(N), 2)                    # N*(N-1)개
-pairs = cat([proj_tokens[:, i], proj_tokens[:, j]], dim=-1)   # (B*T*num_pairs, 1024)
-
-lah   = decoder_lah(pairs).view(B*T, num_pairs)        # LAH
-coatt = decoder_sa(pairs)                              # SA
-
-# LAEO = min(LAH(i→j), LAH(j→i))
-laeo[pi] = min(lah[pi], lah[corr_idx])
+# 공통: in-out 분류 (GWS fusion 적용 전 trunk 사용)
+inout = inout_decoder(proj_tokens.view(B*T*N, -1))   # (B*T*N, 1)
 ```
+
+**예측은 전 모드 통합** (`decoder_lah` / `decoder_sa` 공유, LAEO는 derive):
+
+```python
+# LAH path tokens = trunk(proj_tokens). SA path tokens:
+#   graph 모드  → sa_projs로 sa_layers 투영+concat (전용 undirected 분기)
+#   그 외      → trunk(proj_tokens) 재사용
+sa_tokens = cat([sa_projs[i](sa_layers[i]) for i in range(4)]) if use_graph else proj_tokens
+
+# LAH: 비대칭 [h_i ‖ h_j] (방향 i→j)
+pair_lah = cat([proj_tokens[:, src], proj_tokens[:, dst]], dim=-1)  # (B*T*P, 1024)
+lah   = decoder_lah(pair_lah).view(B*T, num_pairs)
+
+# SA: 대칭 [s_i+s_j ‖ |s_i−s_j|]
+pair_sym = cat([sa_tokens[:, src] + sa_tokens[:, dst],
+                (sa_tokens[:, src] - sa_tokens[:, dst]).abs()], dim=-1)
+coatt = decoder_sa(pair_sym).view(B*T, num_pairs)
+
+# LAEO ⟺ mutual LAH = logit-space AND (min) of both directions (전 모드 동일)
+laeo = minimum(lah, lah[:, rev_idx])   # rev_idx: (d,s) index for each (s,d), n별 캐시
+```
+
+핵심:
+- **LAEO는 더 이상 전용 decoder가 아님.** `min(LAH_ij, LAH_ji)` — transformer의 검증된 공식. `decoder_laeo`는 `__init__`에만 남은 미사용 dead weight(체크포인트 호환용).
+- **graph 모드만 SA를 trunk가 아닌 전용 undirected 분기 토큰으로 예측.** transformer/hypergraph는 `sa_tokens == proj_tokens`(trunk).
+- **null routing(`alpha_null_in/out`)은 예측에 안 들어감.** `compute_dual_null_loss`의 auxiliary supervision 전용 (graph 모드).  
+  (과거의 `lah_null_proj`·`sa_null_w`·`decoder_*_gws`·hypergraph temp scalar/`attn_layer_logits` 경로는 모두 제거됨.)
+
+**GWS (`use_gws=true`)**: heatmap·scene을 detach해 per-person `gaze_scene` embedding 추출 →
+`proj_tokens = gaze_fusion(cat([proj_tokens, gaze_scene_proj(gaze_scene)]))`로 trunk만 융합 (공유 decoder 그대로, SA 분기엔 미적용).
 
 ---
 
@@ -122,11 +169,13 @@ laeo[pi] = min(lah[pi], lah[corr_idx])
 | Lightning 학습 모델 | `mtgs/networks/models.py` | `MTGSModel` |
 | Gaze 인코더 | `mtgs/networks/mtgs_net.py` | `GazeEncoder` |
 | ViT-Adaptor 블록 | `mtgs/networks/adaptor_modules.py` | `InteractionBlock` |
-| Social Graph (node update) | `mtgs/networks/adaptor_modules.py` | `SocialGraphBlock` |
+| Social Graph (directed, LAH/LAEO) | `mtgs/networks/adaptor_modules.py` | `SocialGraphBlock` |
+| Social Graph (undirected, SA) | `mtgs/networks/adaptor_modules.py` | `UndirectedSocialGraphBlock` |
+| Hypergraph Block | `mtgs/networks/adaptor_modules.py` | `HypergraphBlock` |
 | Temporal Graph | `mtgs/networks/adaptor_modules.py` | `TemporalGraphBlock` |
 | DPT 히트맵 디코더 | `mtgs/networks/mtgs_net.py` | `ConditionalDPTDecoder` |
-| Social 디코더 (양 모드 공유) | `mtgs/networks/mtgs_net.py` | `LinearDecoderSocialGraph` |
-| InOut 디코더 (양 모드 공유) | `mtgs/networks/mtgs_net.py` | `InOutDecoder` |
+| Social 디코더 (Transformer/Graph 전용) | `mtgs/networks/mtgs_net.py` | `LinearDecoderSocialGraph` |
+| InOut 디코더 (전 모드 공유) | `mtgs/networks/mtgs_net.py` | `InOutDecoder` |
 
 ---
 
@@ -139,9 +188,11 @@ total_loss = (
   + 1000 * heatmap_loss   # 히트맵 MSE
   + 2   * inout_loss      # in/out BCE
   + 1   * lah_loss        # LAH BCE (pos_weight=3)
-  + 1   * laeo_loss       # LAEO BCE
+  + 1   * laeo_loss       # LAEO BCE (min-derive → gradient는 decoder_lah로 흐름)
   + 1   * coatt_loss      # SA BCE
 )
+# graph 모드 추가 (null 노드 활성 시):
+loss += lambda_null * (loss_null_out + loss_null_in)   # compute_dual_null_loss, lambda_null=0.5
 ```
 
 UCO-LAEO, VideoCoAtt 데이터에는 heatmap/angular 손실에 0.1 가중치 적용 (gaze GT 품질이 낮기 때문).
@@ -151,8 +202,9 @@ UCO-LAEO, VideoCoAtt 데이터에는 heatmap/angular 손실에 0.1 가중치 적
 ## 학습 최적화 세부사항
 
 - **옵티마이저**: AdamW (weight_decay=1e-3)
-- **학습률 (transformer 모드)**: 기본 1e-6, gaze_encoder_temporal/people_temporal/decoder_sa 3×
-- **학습률 (graph 모드)**: 기본 1e-6, social_graph_blocks 10×, temporal_graph_blocks 5×, gaze_encoder_temporal/decoder_lah/decoder_sa 3×
+- **학습률 (transformer 모드)**: 기본 1e-6, `gaze_encoder_temporal/people_temporal/decoder_sa` 3×
+- **학습률 (graph 모드, 5 param groups)**: 기본 1e-6, `gaze_encoder_temporal` 3×, `social_graph_blocks`+`sa_social_blocks` 10×, `temporal_graph_blocks`+`sa_temporal_blocks` 5×, `decoder_lah/decoder_laeo/decoder_sa/sa_projs`(+GWS시 `gaze_scene_proj/gaze_fusion`) 3×, 나머지 base. → `train_vsgaze.sh`의 SWA lr 5개와 정합.
+- **학습률 (hypergraph 모드, 4 param groups)**: 기본 1e-6, `gaze_encoder_temporal/temporal_graph_blocks/decoder_lah/decoder_laeo/decoder_sa`(+GWS) 3×, `hypergraph_blocks`는 base LR.
 - **스케줄러**: CosineAnnealingWarmRestarts (T_0=20 epochs, 4 epoch warmup)
 - **SWA**: epoch 12부터 시작, 6 epoch annealing
 - **정밀도**: bf16-mixed
