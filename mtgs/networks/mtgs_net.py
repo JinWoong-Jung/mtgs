@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import itertools
+import os
 from typing import List, Tuple, Union
 
 import math
@@ -16,7 +17,7 @@ import torch.nn.functional as F
 from torchvision import models
 import torchvision.transforms.functional as TF
 from mtgs.utils import pair, build_2d_sincos_posemb, spatial_argmax2d, spatial_softargmax2d
-from mtgs.networks.adaptor_modules import InteractionBlock, SocialGraphBlock, TemporalGraphBlock, UndirectedSocialGraphBlock, GazeGraphBlock
+from mtgs.networks.adaptor_modules import InteractionBlock, GazeGraphBlock
 
 import logging
 
@@ -49,21 +50,13 @@ class MTGS(nn.Module):
         temporal_context: int = 2,
         hm_size=(64, 64),  # width, height
         output="heatmap",
-        interaction_type: str = "transformer",
-        graph_num_layers: int = 2,
-        graph_aggr: str = "outgoing",
-        graph_use_null_node: bool = True,
-        graph_use_gaze_prior: bool = True,
-        graph_prior_weight: float = 0.5,
-        graph_use_sa_prior: bool = True,
-        graph_sa_prior_weight: float = 0.5,
         gaze_graph_num_layers: int = 2,
         gaze_graph_edge_dim: int = 128,
         gaze_graph_use_prior: bool = True,
         gaze_graph_prior_weight: float = 0.5,
-        gaze_graph_region_anchor: str = "gt_train",
-        interaction_order: str = "inject_first",
-        use_gws: bool = False,
+        gaze_graph_use_node_xattn: bool = True,
+        gaze_graph_laeo_derive: str = "decoder",
+        gaze_graph_use: bool = True,
     ):
         super().__init__()
 
@@ -118,7 +111,11 @@ class MTGS(nn.Module):
         #     drop_path_rate = encoder_drop_path_rate
         # )
         # scene encoder: DinoV2
-        self.encoder = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+        _dinov2_cache = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
+        if os.path.isdir(_dinov2_cache):
+            self.encoder = torch.hub.load(_dinov2_cache, "dinov2_vitb14", source="local")
+        else:
+            self.encoder = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
 
         # scene, person interaction
         self.interaction_indexes = [[0, 2], [3, 5], [6, 8], [9, 11]]
@@ -134,94 +131,54 @@ class MTGS(nn.Module):
             ]
         )
 
-        # ── Interaction mode ────────────────────────────────────────────
-        self.use_graph      = (interaction_type == "graph")
-        self.use_gaze_graph = (interaction_type == "gaze_graph")
-        assert interaction_order in ("inject_first", "extract_first"), \
-            f"Unknown interaction_order: {interaction_order!r}"
-        self.interaction_order = interaction_order
-        if self.use_graph:
-            # ── Directed graph: LAH / LAEO (softmax + dual-null aggregation) ──
-            # LAH directional prior only; SA gaze prior now belongs to the
-            # dedicated undirected SA graph below (see split rationale).
-            self.social_graph_blocks = nn.ModuleList([
-                SocialGraphBlock(
-                    token_dim=token_dim,
-                    num_layers=graph_num_layers,
-                    aggr=graph_aggr,
-                    use_null_node=graph_use_null_node,
-                    use_gaze_prior=graph_use_gaze_prior,
-                    prior_weight=graph_prior_weight,
-                    use_sa_prior=False,
-                    sa_prior_weight=graph_sa_prior_weight,
+        # ── Interaction module (fixed): ViT-Adaptor → people_interaction (spatial)
+        # + people_temporal. The social-prediction head is a standalone
+        # GazeGraphBlock attached after the loop. ──────────────────────────────
+        self.people_interaction = nn.Sequential(
+            *[
+                TransformerBlock(
+                    dim=token_dim,
+                    num_heads=encoder_num_heads,
+                    mlp_ratio=0.25,
+                    drop_path_rate=0.3,
                 )
                 for i in range(len(self.interaction_indexes))
-            ])
-            self.temporal_graph_blocks = nn.ModuleList([
-                TemporalGraphBlock(token_dim=token_dim)
-                for _ in range(len(self.interaction_indexes))
-            ])
-            self.decoder_laeo = LinearDecoderSocialGraph(
+            ]
+        )
+        # people temporal
+        self.people_temporal = nn.Sequential(
+            *[
+                TransformerBlock(
+                    dim=token_dim,
+                    num_heads=encoder_num_heads,
+                    mlp_ratio=0.25,
+                    drop_path_rate=0.3,
+                )
+                for i in range(len(self.interaction_indexes))
+            ]
+        )
+        # Social head: either the unified GazeGraphBlock (use=True) or the original
+        # per-pair social decoder operating directly on person token pairs (use=False).
+        self.gaze_graph_use = gaze_graph_use
+        if gaze_graph_use:
+            self.gaze_graph_block = GazeGraphBlock(
+                token_dim=proj_feature_dim * len(self.interaction_indexes),
+                edge_dim=gaze_graph_edge_dim,
+                num_layers=gaze_graph_num_layers,
+                use_prior=gaze_graph_use_prior,
+                prior_weight=gaze_graph_prior_weight,
+                use_node_xattn=gaze_graph_use_node_xattn,
+            )
+        else:
+            # Original social decoders: LAH (directed [h_i‖h_j]) + SA (symmetric
+            # [s_i+s_j‖|s_i−s_j|]). LAEO derived as min(LAH_ij, LAH_ji).
+            self.decoder_lah = LinearDecoderSocialGraph(
                 proj_feature_dim * len(self.interaction_indexes)
             )
-
-            # ── Undirected graph: Shared Attention (sigmoid gates) ────────────
-            # Parallel read-out branch: shares the per-block trunk input but does
-            # NOT feed back into the trunk; its own snapshots feed decoder_sa.
-            self.sa_social_blocks = nn.ModuleList([
-                UndirectedSocialGraphBlock(
-                    token_dim=token_dim,
-                    num_layers=graph_num_layers,
-                    use_sa_prior=graph_use_sa_prior,
-                    sa_prior_weight=graph_sa_prior_weight,
-                )
-                for _ in range(len(self.interaction_indexes))
-            ])
-            self.sa_temporal_blocks = nn.ModuleList([
-                TemporalGraphBlock(token_dim=token_dim)
-                for _ in range(len(self.interaction_indexes))
-            ])
-            # per-layer projection for the SA branch (mirrors self.gaze_projs)
-            self.sa_projs = nn.Sequential(*[
-                nn.Linear(token_dim, proj_feature_dim, bias=True)
-                for _ in range(len(self.interaction_indexes))
-            ])
-        else:
-            # transformer AND gaze_graph share the ORIGINAL interaction module
-            # (ViT-Adaptor → people_interaction (spatial) + people_temporal). For
-            # gaze_graph, only the social-prediction head changes: the pair-wise
-            # decoders are replaced by a standalone GazeGraphBlock after the loop.
-            self.people_interaction = nn.Sequential(
-                *[
-                    TransformerBlock(
-                        dim=token_dim,
-                        num_heads=encoder_num_heads,
-                        mlp_ratio=0.25,
-                        drop_path_rate=0.3,
-                    )
-                    for i in range(len(self.interaction_indexes))
-                ]
+            self.decoder_sa = LinearDecoderSocialGraph(
+                proj_feature_dim * len(self.interaction_indexes)
             )
-            # people temporal
-            self.people_temporal = nn.Sequential(
-                *[
-                    TransformerBlock(
-                        dim=token_dim,
-                        num_heads=encoder_num_heads,
-                        mlp_ratio=0.25,
-                        drop_path_rate=0.3,
-                    )
-                    for i in range(len(self.interaction_indexes))
-                ]
-            )
-            if self.use_gaze_graph:
-                self.gaze_graph_block = GazeGraphBlock(
-                    token_dim=proj_feature_dim * len(self.interaction_indexes),
-                    edge_dim=gaze_graph_edge_dim,
-                    num_layers=gaze_graph_num_layers,
-                    use_prior=gaze_graph_use_prior,
-                    prior_weight=gaze_graph_prior_weight,
-                )
+        self.gaze_graph_laeo_derive = gaze_graph_laeo_derive
 
         # pair indices cache keyed by n — avoids rebuilding itertools.permutations every forward
         self._pair_indices_cache: dict = {}
@@ -273,24 +230,7 @@ class MTGS(nn.Module):
         self.inout_decoder = InOutDecoder(
             proj_feature_dim * len(self.interaction_indexes)
         )
-
-        # gaze point, social gaze, inout decoders
-        self.decoder_lah = LinearDecoderSocialGraph(
-            proj_feature_dim * len(self.interaction_indexes)
-        )  # decoder for looking at heads
-        #         self.decoder_laeo = LinearDecoderSocialGraph(proj_feature_dim*len(self.interaction_indexes))    # decoder for laeo
-        self.decoder_sa = LinearDecoderSocialGraph(
-            proj_feature_dim * len(self.interaction_indexes)
-        )  # decoder for shared attention
-
-        # ── Gaze-Weighted Scene (GWS) token ─────────────────────────────────
-        self.use_gws = use_gws
-        if use_gws:
-            D_person = proj_feature_dim * len(self.interaction_indexes)
-            # projects scene token (D_vit) → person token dim
-            self.gaze_scene_proj = nn.Linear(token_dim, D_person)
-            # fuses [h_i || gs_i] back to D_person — keeps decoder interface unchanged
-            self.gaze_fusion = nn.Linear(D_person * 2, D_person)
+        # Social gaze (LAH/LAEO/SA) is predicted by GazeGraphBlock's own heads.
 
     def forward(self, x):
         # Expected x = {"image": image, "heads": heads, "head_bboxes": head_bboxes, "coatt_ids": coatt_ids}
@@ -331,86 +271,31 @@ class MTGS(nn.Module):
         )
 
         person_tokens = gaze_tokens.view(b * t, n, -1).clone()
-        num_valid = x["num_valid_people"].view(b * t).clamp(min=1)  # (b*t,)
+        num_valid_b   = x["num_valid_people"].view(b, t).max(dim=1).values.clamp(min=1)  # (b,) for gaze_graph
 
         # Apply ViT Adaptor =================================================
-        gaze_vec_bt    = gaze_vec.view(b * t, n, -1)              # (b*t, n, 2)
-        head_bboxes_bt = x["head_bboxes"].view(b * t, n, -1)      # (b*t, n, 4)
         img_layers = []
         gaze_layers = []
-        sa_layers = []          # SA branch snapshots (graph mode only)
-        alpha_null_in_list  = []
-        alpha_null_out_list = []
         for i, layer in enumerate(self.vit_adaptor):
             indexes = self.interaction_indexes[i]
             vit_blocks = self.encoder.blocks[indexes[0] : indexes[-1] + 1]
 
-            if self.interaction_order == "extract_first":
-                # 1. scene→people cross-attn (extractor only)
-                image_tokens, person_tokens = layer.forward_extract_only(
-                    image_tokens, person_tokens
-                )
-            else:
-                # inject_first (original): people→scene + ViT + scene→people
-                image_tokens, person_tokens = layer(
-                    image_tokens, person_tokens, vit_blocks, x["num_valid_people"],
-                )
+            image_tokens, person_tokens = layer(
+                image_tokens, person_tokens, vit_blocks, x["num_valid_people"],
+            )
 
-            # spatio-temporal social interaction
-            if self.use_graph:
-                # ── Directed trunk: LAH / LAEO (feeds heatmap, scene, LAH) ────
-                # SocialGraphBlock returns (tokens, alpha_null_in, alpha_null_out).
-                sa_in = person_tokens   # parallel SA branch reads the same input
-                person_tokens, a_null_in, a_null_out = self.social_graph_blocks[i](
-                    person_tokens, num_valid, gaze_vec_bt, head_bboxes_bt,
+            # spatio-temporal social interaction: original spatial + temporal
+            person_tokens = self.people_interaction[i](person_tokens)
+            if t > 1:
+                person_tokens = self.people_temporal[i](
+                    person_tokens.view(b, t, n, -1)
+                    .permute([0, 2, 1, 3])
+                    .reshape(b * n, t, -1)
                 )
-                if a_null_in is not None:
-                    alpha_null_in_list.append(a_null_in)
-                    alpha_null_out_list.append(a_null_out)
-                if t > 1:
-                    person_tokens = (
-                        self.temporal_graph_blocks[i](
-                            person_tokens.reshape(b, t, n, -1)
-                            .permute(0, 2, 1, 3)
-                            .reshape(b * n, t, -1)
-                        )
-                        .reshape(b, n, t, -1)
-                        .permute(0, 2, 1, 3)
-                        .reshape(b * t, n, -1)
-                    )
-                # ── Undirected SA branch (parallel, does not modify trunk) ────
-                sa_tok = self.sa_social_blocks[i](sa_in, num_valid, gaze_vec_bt)
-                if t > 1:
-                    sa_tok = (
-                        self.sa_temporal_blocks[i](
-                            sa_tok.reshape(b, t, n, -1)
-                            .permute(0, 2, 1, 3)
-                            .reshape(b * n, t, -1)
-                        )
-                        .reshape(b, n, t, -1)
-                        .permute(0, 2, 1, 3)
-                        .reshape(b * t, n, -1)
-                    )
-                sa_layers.append(sa_tok)
-            else:
-                # transformer AND gaze_graph: original spatial + temporal interaction
-                person_tokens = self.people_interaction[i](person_tokens)
-                if t > 1:
-                    person_tokens = self.people_temporal[i](
-                        person_tokens.view(b, t, n, -1)
-                        .permute([0, 2, 1, 3])
-                        .reshape(b * n, t, -1)
-                    )
-                    person_tokens = (
-                        person_tokens.view(b, n, t, -1)
-                        .permute([0, 2, 1, 3])
-                        .reshape(b * t, n, -1)
-                    )
-
-            if self.interaction_order == "extract_first":
-                # 3. people→scene cross-attn + ViT (injector + ViT blocks only)
-                image_tokens, person_tokens = layer.forward_inject_vit(
-                    image_tokens, person_tokens, vit_blocks
+                person_tokens = (
+                    person_tokens.view(b, n, t, -1)
+                    .permute([0, 2, 1, 3])
+                    .reshape(b * t, n, -1)
                 )
 
             # save intermediate outputs
@@ -449,38 +334,20 @@ class MTGS(nn.Module):
             self._rev_pair_cache[n] = pos[dst_idx, src_idx]   # (num_pairs,)
         rev_idx = self._rev_pair_cache[n]
 
-        # ── gaze_graph: 2N+1 directed graph (persons + regions + null) ──────────
-        if self.use_gaze_graph:
-            # Region anchor R_j = where person j looks.
-            # Use soft expected coordinates (differentiable weighted centroid) of
-            # the predicted heatmap for both train AND inference — eliminates the
-            # train-GT / test-argmax structural mismatch that degraded test metrics.
-            # Detached so social loss does not corrupt the heatmap decoder.
-            region_anchors = spatial_softargmax2d(
-                gaze_hm.reshape(b * t * n, hm_height, hm_width).detach()
-            ).reshape(b * t, n, 2).to(person_tokens.dtype)
-
-            lah_mat, sa_mat, null_vec, edge_valid = self.gaze_graph_block(
-                person_tokens, num_valid, region_anchors, gaze_vec_bt, head_bboxes_bt,
-                gaze_hm.reshape(b * t, n, hm_height, hm_width),
-            )
-
-            # Mask invalid (padding) edges BEFORE gather: their edge state is
-            # zeroed inside the block, so edge_head emits a constant bias logit.
-            # train/val drop these via lah_mask / ignore_index=-1, but the test
-            # per-target metric takes max over ALL incoming sources WITHOUT a
-            # validity filter, so the constant leaks in and collapses test AUC/AP.
-            # Force invalid edges to a large negative logit (sigmoid≈0) so they
-            # can never win the max. Valid edges (loss/metric) are untouched.
-            lah_mat = lah_mat.masked_fill(~edge_valid[:, :, :n],        -1e4)
-            sa_mat  = sa_mat.masked_fill(~edge_valid[:, :, n:2 * n],    -1e4)
-
-            # Per-edge logits (sigmoid + 1/0 BCE downstream, per PDF).
-            lah   = lah_mat[:, src_idx, dst_idx]                                  # (b*t, P)
-            # SA is symmetric: e_{i→R_j} and e_{j→R_i} both encode SA(i,j).
-            coatt = 0.5 * (sa_mat[:, src_idx, dst_idx] + sa_mat[:, dst_idx, src_idx])
-            laeo  = torch.minimum(lah, lah[:, rev_idx])                           # logit-AND
-
+        if not self.gaze_graph_use:
+            # ── Original social decoders (MTGS_origin) ─────────────────────────
+            # Both LAH and SA read the SAME asymmetric pair concat [h_i ‖ h_j];
+            # SA prediction is per-direction (not symmetrized). person_tokens is
+            # indexed by (src_idx, dst_idx) permutations, matching label order.
+            h_src = person_tokens[:, src_idx]   # (b*t, P, D)
+            h_dst = person_tokens[:, dst_idx]
+            person_token_pairs = torch.cat([h_src, h_dst], dim=-1).reshape(
+                b * t * num_pairs, -1
+            )                                   # (b*t*P, 2*D)
+            lah   = self.decoder_lah(person_token_pairs).view(b * t, num_pairs)
+            coatt = self.decoder_sa(person_token_pairs).view(b * t, num_pairs)
+            # LAEO ⟺ mutual looking = logit-space AND (min) of both LAH directions
+            laeo  = torch.minimum(lah, lah[:, rev_idx])
             return (
                 None,
                 gaze_vec,
@@ -489,99 +356,59 @@ class MTGS(nn.Module):
                 lah.view(b, t, num_pairs),
                 laeo.view(b, t, num_pairs),
                 coatt.view(b, t, num_pairs),
-                null_vec.view(b, t, n),   # null-edge logits (L_graph null term)
-                None,
+                None,   # null_in (gaze_graph 전용)
+                None,   # null_out (gaze_graph 전용)
             )
 
-        # ── GWS: fuse heatmap-weighted scene embedding into person tokens ────────
-        if self.use_gws and self.output == "heatmap":
-            # detach: GWS reads heatmap/scene as fixed signals so social decoder
-            # gradients don't corrupt heatmap training.
-            scene_tokens = img_layers[-1].detach()           # (b*t, P, D_vit)
-            P = scene_tokens.shape[1]
-            h_p = w_p = int(P ** 0.5)
-            hm_down = F.adaptive_avg_pool2d(
-                gaze_hm.detach().reshape(b * t * n, 1, hm_height, hm_width), (h_p, w_p)
-            ).view(b * t, n, P)
-            hm_attn = hm_down / (hm_down.sum(-1, keepdim=True) + 1e-6)
-            gaze_scene = torch.bmm(
-                hm_attn.reshape(b * t * n, 1, P),
-                scene_tokens.unsqueeze(1).expand(-1, n, -1, -1).reshape(b * t * n, P, -1),
-            ).view(b * t, n, -1)
-            gaze_scene = self.gaze_scene_proj(gaze_scene)         # (b*t, n, D_person)
-            person_tokens = self.gaze_fusion(
-                torch.cat([person_tokens, gaze_scene], dim=-1)
-            )                                                      # (b*t, n, D_person)
-
-        # ── Build pair features ────────────────────────────────────────────────
-        dec_lah  = self.decoder_lah
-        dec_sa   = self.decoder_sa
-
-        # LAH path tokens = directed trunk; SA path tokens = dedicated undirected
-        # branch (graph mode), else the same trunk tokens (transformer).
-        if self.use_graph:
-            sa_tokens = torch.cat(
-                [self.sa_projs[i](sa_layer) for i, sa_layer in enumerate(sa_layers)],
-                dim=-1,
-            )                                    # (b*t, n, D_person)
-        else:
-            sa_tokens = person_tokens
-
-        h_src = person_tokens[:, src_idx]   # (b*t, P, D)  — LAH (directed trunk)
-        h_dst = person_tokens[:, dst_idx]
-        s_src = sa_tokens[:, src_idx]       # (b*t, P, D)  — SA  (undirected branch)
-        s_dst = sa_tokens[:, dst_idx]
-
-        # Asymmetric [h_i ‖ h_j]: direction i→j matters (LAH)
-        pair_lah = torch.cat([h_src, h_dst], dim=-1).reshape(b * t * num_pairs, -1)
-
-        # Symmetric [s_i+s_j ‖ |s_i−s_j|]: order-invariant (SA)
-        pair_sym = torch.cat(
-            [s_src + s_dst, (s_src - s_dst).abs()], dim=-1
-        ).reshape(b * t * num_pairs, -1)
-
-        # ── Social prediction ───────────────────────────────────────────────────
-        # LAH is directional; SA is symmetric. LAEO ⟺ mutual looking, so we derive
-        # it as a logit-space AND (element-wise min) of the two LAH directions —
-        # the proven transformer formulation. The dedicated decoder_laeo previously
-        # used in graph mode discarded this structure and underperformed
-        # (LAEO AP 0.74-0.78 vs transformer 0.80), so it is no longer used for
-        # prediction (kept in __init__ only for checkpoint compatibility).
-        lah   = dec_lah(pair_lah).view(b * t, num_pairs)
-        coatt = dec_sa(pair_sym).view(b * t, num_pairs)
-
-        # reverse-pair lookup: for each pair (s,d) find the index of (d,s).
-        # cached per n; vectorized replacement for the old per-pair python loop.
-        if n not in self._rev_pair_cache:
-            pos = torch.full((n, n), -1, dtype=torch.long, device=indices.device)
-            pos[src_idx, dst_idx] = torch.arange(num_pairs, device=indices.device)
-            self._rev_pair_cache[n] = pos[dst_idx, src_idx]   # (num_pairs,)
-        rev_idx = self._rev_pair_cache[n]
-        laeo = torch.minimum(lah, lah[:, rev_idx])
-
-        # Aggregate dual-null alphas across layers (mean); None when not in graph mode.
-        if alpha_null_in_list:
-            alpha_null_in  = torch.stack(alpha_null_in_list,  dim=0).mean(0)  # (b*t, n)
-            alpha_null_out = torch.stack(alpha_null_out_list, dim=0).mean(0)  # (b*t, n)
-            alpha_null_in  = alpha_null_in.view(b, t, n)
-            alpha_null_out = alpha_null_out.view(b, t, n)
-        else:
-            alpha_null_in = alpha_null_out = None
-
-        if self.output == "heatmap":
-            return (
-                _,
-                gaze_vec,
-                gaze_hm,
-                inout.view(b, t, n),
-                lah.view(b, t, num_pairs),
-                laeo.view(b, t, num_pairs),
-                coatt.view(b, t, num_pairs),
-                alpha_null_in,
-                alpha_null_out,
+        # ── gaze_graph: unified directed graph (persons + null_in + null_out) ──
+        lah_mat, laeo_mat, sa_mat, null_in_mat, null_out_mat, edge_valid = (
+            self.gaze_graph_block(
+                person_tokens.view(b, t, n, -1),   # (B, T, N, D)
+                num_valid_b,                        # (B,)
+                gaze_vec.view(b, t, n, -1),        # (B, T, N, 2)
+                x["head_bboxes"].view(b, t, n, -1),# (B, T, N, 4)
+                gaze_hm,                           # (B, T, N, Hh, Ww)
+                inout.view(b, t, n),               # (B, T, N) — raw logit
             )
-        else: # only support for heatmap output for now
-            logger.info("Incorrect output type selected!!!")
+        )
+        # lah_mat, laeo_mat, sa_mat: (B, T, N, N)
+        # null_in_mat, null_out_mat: (B, T, N)
+        # edge_valid: (B, N, 2N+2)
+
+        # Mask invalid edges to large negative so they can't win per-target max
+        ev_lah = edge_valid[:, :, :n]                   # (B, N, N)
+        ev_sa  = edge_valid[:, :, n:2 * n]
+        lah_mat  = lah_mat.masked_fill(
+            ~ev_lah.unsqueeze(1).expand(b, t, n, n), -1e4
+        )
+        laeo_mat = laeo_mat.masked_fill(
+            ~ev_lah.unsqueeze(1).expand(b, t, n, n), -1e4
+        )
+        sa_mat   = sa_mat.masked_fill(
+            ~ev_sa.unsqueeze(1).expand(b, t, n, n), -1e4
+        )
+
+        # Gather directed pairs (b*t, P)
+        # Dataset convention: pair (a,b) label = "b looks at a" (TARGET, LOOKER).
+        # E[i→j] encodes "i looks at j", so lah_mat[b,a] = E[b→a] = "b looks at a" ✓
+        lah   = lah_mat.view(b * t, n, n)[:, dst_idx, src_idx]
+        if self.gaze_graph_laeo_derive == "lah_min":
+            laeo = torch.minimum(lah, lah[:, rev_idx])
+        else:
+            laeo = laeo_mat.view(b * t, n, n)[:, dst_idx, src_idx]
+        coatt = sa_mat.view(b * t, n, n)[:, src_idx, dst_idx]
+
+        return (
+            None,
+            gaze_vec,
+            gaze_hm,
+            inout.view(b, t, n),
+            lah.view(b, t, num_pairs),
+            laeo.view(b, t, num_pairs),
+            coatt.view(b, t, num_pairs),
+            torch.sigmoid(null_in_mat),   # (B, T, N)  — null_in probs
+            torch.sigmoid(null_out_mat),  # (B, T, N)  — null_out probs
+        )
 
 
 # ==================================================================================================================== #
@@ -716,19 +543,22 @@ class InOutDecoder(nn.Module):
 
 
 class LinearDecoderSocialGraph(nn.Module):
+    """Per-pair social decoder (LAH / SA) used when gaze_graph.use=False.
+
+    Operates directly on concatenated person-token pair features (2*token_dim)
+    and reads out a single logit.
+    """
+
     def __init__(self, token_dim):
         super().__init__()
         self.token_dim = token_dim
 
         scale = 4
         self.block1 = ResidualLinearBlock(2 * token_dim, scale=scale)
-        #         self.block2 = ResidualLinearBlock(2*token_dim // scale**2, scale=scale)    # removed for some experiments
         self.fc = nn.Linear(token_dim * 2 // scale**2, 1)
 
     def forward(self, edge_tokens):
         x = self.block1(edge_tokens)
-        #         x = self.block2(x)
-        # readout layer
         x = self.fc(x)
         return x
 

@@ -69,21 +69,13 @@ class MTGSModel(pl.LightningModule):
             decoder_use_bn=cfg.model.decoder_use_bn,
             temporal_context=cfg.data.temporal_context,
             output=cfg.model.output,
-            interaction_type=cfg.interaction.type,
-            graph_num_layers=cfg.interaction.num_layers,
-            graph_aggr=cfg.interaction.graph.aggr,
-            graph_use_null_node=cfg.interaction.graph.use_null_node,
-            graph_use_gaze_prior=cfg.interaction.graph.use_gaze_prior,
-            graph_prior_weight=cfg.interaction.graph.prior_weight,
-            graph_use_sa_prior=cfg.interaction.graph.use_sa_prior,
-            graph_sa_prior_weight=cfg.interaction.graph.sa_prior_weight,
-            gaze_graph_num_layers=cfg.interaction.num_layers,
-            gaze_graph_edge_dim=cfg.interaction.gaze_graph.edge_dim,
-            gaze_graph_use_prior=cfg.interaction.gaze_graph.use_prior,
-            gaze_graph_prior_weight=cfg.interaction.gaze_graph.prior_weight,
-            gaze_graph_region_anchor=cfg.interaction.gaze_graph.region_anchor,
-            interaction_order=cfg.interaction.order,
-            use_gws=cfg.interaction.use_gws,
+            gaze_graph_num_layers=cfg.gaze_graph.num_layers,
+            gaze_graph_edge_dim=cfg.gaze_graph.edge_dim,
+            gaze_graph_use_prior=cfg.gaze_graph.use_prior,
+            gaze_graph_prior_weight=cfg.gaze_graph.prior_weight,
+            gaze_graph_use_node_xattn=cfg.gaze_graph.use_node_xattn,
+            gaze_graph_laeo_derive=cfg.gaze_graph.laeo_derive,
+            gaze_graph_use=cfg.gaze_graph.use,
         )
 
         self.cfg = cfg
@@ -94,6 +86,7 @@ class MTGSModel(pl.LightningModule):
         )
         self._pred_file = None
         self._pred_write_count = 0
+        self._upper_tri_cache: dict = {}  # cache upper-triangle SA pair mask per n
 
         # Model weights paths
         self.model_weights = cfg.model.weights
@@ -191,7 +184,21 @@ class MTGSModel(pl.LightningModule):
                 ]
             )
             model_weights = self._remap_gaze_graph_weights(model_weights)
-            self.model.load_state_dict(model_weights, strict=False)
+            model_state = self.model.state_dict()
+            skipped = []
+            filtered_weights = OrderedDict()
+            for name, value in model_weights.items():
+                if name in model_state and model_state[name].shape != value.shape:
+                    skipped.append((name, tuple(value.shape), tuple(model_state[name].shape)))
+                    continue
+                filtered_weights[name] = value
+            if skipped:
+                logger.info(
+                    "Skipped %d checkpoint tensors with incompatible shapes: %s",
+                    len(skipped),
+                    skipped[:8],
+                )
+            self.model.load_state_dict(filtered_weights, strict=False)
             logger.info(
                 f"Successfully loaded pre-trained weights from {self.model_weights}"
             )
@@ -255,19 +262,29 @@ class MTGSModel(pl.LightningModule):
         for param in module.parameters():
             param.requires_grad = False
 
+    def _social_head_modules(self):
+        # Active social head: GazeGraphBlock (use=True) or the original per-pair
+        # decoders (use=False). Used by the frozen-trunk post-training recipe.
+        if self.cfg.gaze_graph.use:
+            return [self.model.gaze_graph_block]
+        return [self.model.decoder_lah, self.model.decoder_sa]
+
     def _freeze(self):
         # Post-training recipe: frozen transformer trunk as a visual extractor,
-        # train ONLY the gaze graph head. Overrides the per-module flags below.
-        if getattr(self.cfg.train.freeze, "all_but_gaze_graph", False):
-            assert self.model.use_gaze_graph, \
-                "freeze.all_but_gaze_graph requires interaction.type=gaze_graph"
+        # train ONLY the social head. Overrides the per-module flags below.
+        _freeze_gaze_graph = getattr(self.cfg.train.freeze, "all_but_gaze_graph", False) or (
+            getattr(self.cfg.gaze_graph, "frozen", False)
+        )
+        if _freeze_gaze_graph:
             self.freeze_module(self.model)
-            for p in self.model.gaze_graph_block.parameters():
-                p.requires_grad = True
+            for m in self._social_head_modules():
+                for p in m.parameters():
+                    p.requires_grad = True
             n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             n_total = sum(p.numel() for p in self.model.parameters())
+            head_name = "gaze_graph_block" if self.cfg.gaze_graph.use else "decoder_lah/decoder_sa"
             logger.info(
-                "Frozen trunk (extractor); training ONLY gaze_graph_block "
+                f"Frozen trunk (extractor); training ONLY {head_name} "
                 f"({n_train:,} / {n_total:,} params trainable)."
             )
             return
@@ -298,161 +315,61 @@ class MTGSModel(pl.LightningModule):
         return self.model(batch)
 
     def configure_optimizers(self):
-        if self.model.use_graph:
-            base_lr = self.cfg.optimizer.lr
-            high_lr_params = [
-                {
-                    "params": self.model.gaze_encoder_temporal.parameters(),
-                    "name": "gaze-encoder-temporal",
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
-                },
-                {
-                    # directed (LAH) + undirected (SA) social graph blocks
-                    "params": list(self.model.social_graph_blocks.parameters())
-                              + list(self.model.sa_social_blocks.parameters()),
-                    "name": "social-graph-blocks",
-                    "lr": base_lr * 10,
-                    "init_lr": base_lr * 10,
-                },
-                {
-                    "params": list(self.model.temporal_graph_blocks.parameters())
-                              + list(self.model.sa_temporal_blocks.parameters()),
-                    "name": "temporal-graph-blocks",
-                    "lr": base_lr * 5,
-                    "init_lr": base_lr * 5,
-                },
-                {
-                    "params": list(self.model.decoder_lah.parameters())
-                              + list(self.model.decoder_laeo.parameters())
-                              + list(self.model.decoder_sa.parameters())
-                              + list(self.model.sa_projs.parameters())
-                              + (list(self.model.gaze_scene_proj.parameters())
-                                 + list(self.model.gaze_fusion.parameters())
-                                 if self.model.use_gws else []),
-                    "name": "social-decoders",
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
-                },
-            ]
-            high_lr_prefixes = {
-                "gaze_encoder_temporal",
-                "social_graph_blocks",
-                "sa_social_blocks",
-                "temporal_graph_blocks",
-                "sa_temporal_blocks",
-                "decoder_lah",
-                "decoder_laeo",
-                "decoder_sa",
-                "sa_projs",
-                "gaze_scene_proj",
-                "gaze_fusion",
+        # Fixed interaction trunk (people_interaction + people_temporal); the social
+        # head is gaze_graph_block (highest LR). 4 param groups → 4-entry train.swa.lr.
+        base_lr = self.cfg.optimizer.lr
+        # Social head param group: GazeGraphBlock (use=True) or the original
+        # per-pair decoders (use=False). ×3 keeps the same 4-group structure/LR
+        # → original scheduler/LR + 4-entry train.swa.lr preserved.
+        if self.cfg.gaze_graph.use:
+            social_head_group = {
+                "params": self.model.gaze_graph_block.parameters(),
+                "name": "gaze-graph-block",
+                "lr": base_lr * 3,
+                "init_lr": base_lr * 3,
             }
-            other_params = [
-                v for k, v in self.model.named_parameters()
-                if not any(k.startswith(prefix) for prefix in high_lr_prefixes)
-            ]
-            other_params = [
-                {
-                    "params": other_params,
-                    "name": "base",
-                    "lr": base_lr,
-                    "init_lr": base_lr,
-                }
-            ]
-            params = high_lr_params + other_params
-        elif self.model.use_gaze_graph:
-            # Interaction module is identical to transformer mode (people_interaction
-            # + people_temporal); only the social head differs (gaze_graph_block,
-            # highest LR). 4 param groups → default 4-entry train.swa.lr. The unused
-            # decoder_lah/decoder_sa fall into "base" (no gradient).
-            base_lr = self.cfg.optimizer.lr
-            high_lr_params = [
-                {
-                    "params": self.model.gaze_encoder_temporal.parameters(),
-                    "name": "gaze-encoder-temporal",
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
-                },
-                {
-                    "params": self.model.people_temporal.parameters(),
-                    "name": "people-temporal",
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
-                },
-                {
-                    "params": self.model.gaze_graph_block.parameters(),
-                    "name": "gaze-graph-block",
-                    # ×3 to match the transformer social head (decoder_lah/sa). The
-                    # earlier ×10 amplified the CosineWarmRestarts LR spikes (T_0=4),
-                    # causing the epoch-8 collapse. ×3 = same param-group structure as
-                    # transformer → original scheduler/LR settings preserved.
-                    "lr": base_lr * 3,
-                    "init_lr": base_lr * 3,
-                },
-            ]
-            high_lr_prefixes = {
-                "gaze_encoder_temporal",
-                "people_temporal",
-                "gaze_graph_block",
-            }
-            other_params = [
-                v for k, v in self.model.named_parameters()
-                if not any(k.startswith(prefix) for prefix in high_lr_prefixes)
-            ]
-            other_params = [
-                {
-                    "params": other_params,
-                    "name": "base",
-                    "lr": base_lr,
-                    "init_lr": base_lr,
-                }
-            ]
-            params = high_lr_params + other_params
+            social_head_prefixes = {"gaze_graph_block"}
         else:
-            # separate params for temporal modelling and shared attention prediction
-            temporal_params = [
-                {
-                    "params": self.model.gaze_encoder_temporal.parameters(),
-                    "name": "gaze-encoder-temporal",
-                    "lr": self.cfg.optimizer.lr * 3,
-                    "init_lr": self.cfg.optimizer.lr * 3,
-                },
-                {
-                    "params": self.model.people_temporal.parameters(),
-                    "name": "people-temporal",
-                    "lr": self.cfg.optimizer.lr * 3,
-                    "init_lr": self.cfg.optimizer.lr * 3,
-                },
-                {
-                    "params": list(self.model.decoder_lah.parameters())
-                              + list(self.model.decoder_sa.parameters())
-                              + (list(self.model.gaze_scene_proj.parameters())
-                                 + list(self.model.gaze_fusion.parameters())
-                                 if self.model.use_gws else []),
-                    "name": "social-decoders",
-                    "lr": self.cfg.optimizer.lr * 3,
-                    "init_lr": self.cfg.optimizer.lr * 3,
-                },
-            ]
-
-            high_lr_prefixes = {"gaze_encoder_temporal", "people_temporal",
-                                 "decoder_lah", "decoder_sa",
-                                 "gaze_scene_proj", "gaze_fusion"}
-            other_params = []
-            for k, v in self.model.named_parameters():
-                if not any(k.startswith(p) for p in high_lr_prefixes):
-                    other_params.append(v)
-            other_params = [
-                {
-                    "params": other_params,
-                    "name": "base",
-                    "lr": self.cfg.optimizer.lr,
-                    "init_lr": self.cfg.optimizer.lr,
-                }
-            ]
-
-            params = temporal_params + other_params
+            social_head_group = {
+                "params": list(self.model.decoder_lah.parameters())
+                + list(self.model.decoder_sa.parameters()),
+                "name": "social-decoder",
+                "lr": base_lr * 3,
+                "init_lr": base_lr * 3,
+            }
+            social_head_prefixes = {"decoder_lah", "decoder_sa"}
+        high_lr_params = [
+            {
+                "params": self.model.gaze_encoder_temporal.parameters(),
+                "name": "gaze-encoder-temporal",
+                "lr": base_lr * 3,
+                "init_lr": base_lr * 3,
+            },
+            {
+                "params": self.model.people_temporal.parameters(),
+                "name": "people-temporal",
+                "lr": base_lr * 3,
+                "init_lr": base_lr * 3,
+            },
+            social_head_group,
+        ]
+        high_lr_prefixes = {
+            "gaze_encoder_temporal",
+            "people_temporal",
+        } | social_head_prefixes
+        other_params = [
+            v for k, v in self.model.named_parameters()
+            if not any(k.startswith(prefix) for prefix in high_lr_prefixes)
+        ]
+        other_params = [
+            {
+                "params": other_params,
+                "name": "base",
+                "lr": base_lr,
+                "init_lr": base_lr,
+            }
+        ]
+        params = high_lr_params + other_params
 
         optimizer = optim.AdamW(params, weight_decay=self.cfg.optimizer.weight_decay)
 
@@ -506,9 +423,13 @@ class MTGSModel(pl.LightningModule):
         # Post-training: keep the ENTIRE frozen trunk in eval mode so its BatchNorm
         # running stats stay fixed — otherwise heatmap/in-out drift from the original
         # checkpoint even with weights frozen. Only gaze_graph_block stays in train.
-        if getattr(self.cfg.train.freeze, "all_but_gaze_graph", False):
+        _freeze_gaze_graph = getattr(self.cfg.train.freeze, "all_but_gaze_graph", False) or (
+            getattr(self.cfg.gaze_graph, "frozen", False)
+        )
+        if _freeze_gaze_graph:
             self._set_batchnorm_eval(self.model)   # whole trunk → eval (BN stats fixed)
-            self.model.gaze_graph_block.train()    # trained head stays in train mode
+            for m in self._social_head_modules():  # trained head stays in train mode
+                m.train()
             return
 
         # Set BN layers to eval mode for frozen modules
@@ -579,6 +500,17 @@ class MTGSModel(pl.LightningModule):
         # Compute social gaze loss
         coatt_gt = batch["coatt_labels"].view(batch_size * t, -1)
         coatt_mask = coatt_gt != -1
+        # gaze_graph mode: SA is symmetric (sa_mat[i,j]=sa_mat[j,i]), so both (i,j)
+        # and (j,i) backprop through the same edge → 2× gradient. Restrict to
+        # upper-triangle pairs (src < dst) to prevent amplification. The original
+        # decoder (use=False) predicts each direction independently → supervise all.
+        if self.cfg.gaze_graph.use:
+            if n not in self._upper_tri_cache:
+                pairs = list(itertools.permutations(range(n), 2))
+                self._upper_tri_cache[n] = torch.tensor(
+                    [s < d for s, d in pairs], dtype=torch.bool
+                )
+            coatt_mask = coatt_mask & self._upper_tri_cache[n].to(coatt_mask.device)
         laeo_gt = batch["laeo_labels"].view(batch_size * t, -1)
         laeo_mask = laeo_gt != -1
         lah_gt = batch["lah_labels"].view(batch_size * t, -1)
@@ -594,12 +526,13 @@ class MTGSModel(pl.LightningModule):
             coatt_pred,
             coatt_gt,
             coatt_mask,
+            coatt_is_prob=False,
         )
         loss += loss_social
 
-        # Dual-null routing loss (graph mode only, when null nodes are enabled)
+        # Dual-null routing loss (gaze_graph null_in/null_out edge supervision)
         if alpha_null_in is not None and alpha_null_out is not None:
-            lam_null = self.cfg.interaction.graph.get("lambda_null", 0.5)
+            lam_null = getattr(self.cfg.gaze_graph, "lambda_null", 0.5)
             inout_gt_bt  = batch["inout"].view(batch_size * t, n)
             num_valid_bt = batch["num_valid_people"].view(batch_size * t)
             loss_null_out, loss_null_in = compute_dual_null_loss(
@@ -613,15 +546,6 @@ class MTGSModel(pl.LightningModule):
             loss = loss + loss_null
             self.log("loss/train/null_out", loss_null_out.item(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
             self.log("loss/train/null_in",  loss_null_in.item(),  batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
-        elif self.model.use_gaze_graph and alpha_null_in is not None:
-            # gaze_graph L_graph null-edge term: BCE(e_{i→Null}, inout==0).
-            # (LAH/SA edge BCE is already covered by compute_social_loss above.)
-            null_logit = alpha_null_in.view(batch_size * t, n)
-            io = batch["inout"].view(batch_size * t, n)
-            null_gt = (io == 0).float()
-            null_loss = social_loss(null_logit, null_gt, (io != -1), pos_weight=1.0)
-            loss = loss + null_loss
-            self.log("loss/train/null_edge", null_loss.item(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
 
         # Log Social Gaze Losses
         self.log(
@@ -819,6 +743,15 @@ class MTGSModel(pl.LightningModule):
         # Compute social gaze loss
         coatt_gt = batch["coatt_labels"][:, middle_frame_idx, :]
         coatt_mask = coatt_gt != -1
+        # gaze_graph mode only: SA symmetric → restrict to upper-triangle pairs
+        # (src < dst) to avoid 2× loss. Original decoder (use=False) → supervise all.
+        if self.cfg.gaze_graph.use:
+            if n not in self._upper_tri_cache:
+                pairs = list(itertools.permutations(range(n), 2))
+                self._upper_tri_cache[n] = torch.tensor(
+                    [s < d for s, d in pairs], dtype=torch.bool
+                )
+            coatt_mask = coatt_mask & self._upper_tri_cache[n].to(coatt_mask.device)
         laeo_gt = batch["laeo_labels"][:, middle_frame_idx, :]
         laeo_mask = laeo_gt != -1
         lah_gt = batch["lah_labels"][:, middle_frame_idx, :]
@@ -834,6 +767,7 @@ class MTGSModel(pl.LightningModule):
             coatt_pred,
             coatt_gt,
             coatt_mask,
+            coatt_is_prob=False,
         )
         loss += loss_social
 
@@ -967,6 +901,21 @@ class MTGSModel(pl.LightningModule):
             self.log(
                 "metric/val/social_ap",
                 torch.stack(aps).mean(),
+                prog_bar=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        aucs = []
+        for m in (self.val_lah_auc, self.val_laeo_auc, self.val_coatt_auc):
+            try:
+                aucs.append(m.compute())
+            except Exception:
+                pass
+        if aucs:
+            self.log(
+                "metric/val/social_auc",
+                torch.stack(aucs).mean(),
                 prog_bar=True,
                 on_epoch=True,
                 sync_dist=True,

@@ -18,10 +18,8 @@ cd "$SLURM_SUBMIT_DIR/scripts"
 
 CHECKPOINT="/home/jinwoongjung/MTGS/weights/mtgs-vsgaze.ckpt"
 
-INTERACTION_TYPE="transformer" # "graph" or "transformer"
-EXP_NAME="test_VSGaze_${INTERACTION_TYPE}"
+EXP_NAME="test_VSGaze_gaze_graph"
 
 python -s ./main.py experiment.task=test \
-    interaction.type=$INTERACTION_TYPE \
     test.checkpoint=$CHECKPOINT \
     "hydra.run.dir=\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}"

@@ -34,22 +34,26 @@ fi
 # gaze_graph 모드는 transformer interaction 모듈을 구조적으로 공유하므로
 # strict=False 로드 시 trunk 전부가 채워지고 gaze_graph_block만 random init된다.
 TASKS="train+test"
-WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-vsgaze.ckpt"
 
-INTERACTION_TYPE="gaze_graph"     # 고정: post-training은 gaze_graph 전용
-INTERACTION_ORDER="inject_first"  # "inject_first" (original) | "extract_first"
+# frozen=true : MTGS frozen, gaze_graph_block만 학습 (stage-2 VSGaze ckpt 사용 권장)
+# frozen=false: 전체 joint training (stage-1 GazeFollow ckpt 사용 권장)
+FROZEN=true
+
+if [ "$FROZEN" = "true" ]; then
+    WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-vsgaze.ckpt"
+    EXP_NAME="postgraph_frozen"
+else
+    WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-gazefollow.ckpt"
+    EXP_NAME="postgraph_joint"
+fi
 
 CHECKPOINTS_MONITOR="loss/val/social"
 CHECKPOINTS_MODE="min"
 
-EXP_NAME="postgraph"
-
 python -s ./main.py experiment.task=$TASKS \
     model.weights=$WEIGHTS \
     "experiment.name='${EXP_NAME}'" \
-    interaction.type=$INTERACTION_TYPE \
-    interaction.order=$INTERACTION_ORDER \
-    train.freeze.all_but_gaze_graph=true \
+    gaze_graph.frozen=$FROZEN \
     train.checkpoint_monitor="$CHECKPOINTS_MONITOR" \
     train.checkpoint_mode="$CHECKPOINTS_MODE" \
     "hydra.run.dir='\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}'"

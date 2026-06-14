@@ -350,8 +350,8 @@ class RandomCropSafeGaze(object):
             crop_xmin = 0.0
             logger.info("CAUGHT ERROR: xmin > xmax \n\n")
             logger.info(f"(img_w, img_h) = ({img_w}, {img_h})")
-            logger.info(f"head_bboxes = {head_bboxes}")
-            logger.info(f"gaze_pts = {gaze_pts}")
+            logger.info(f"head_bboxes = {head_bboxes.tolist() if hasattr(head_bboxes, 'tolist') else head_bboxes}")
+            logger.info(f"gaze_pts = {gaze_pts.tolist() if hasattr(gaze_pts, 'tolist') else gaze_pts}")
             logger.info(f"(xmin, ymin, xmax, ymax) = ({xmin}, {ymin}, {xmax}, {ymax})")
             logger.info(
                 f"(zone_xmin, zone_ymin, zone_xmax, zone_ymax) = ({zone_xmin}, {zone_ymin}, {zone_xmax}, {zone_ymax})"
@@ -365,8 +365,8 @@ class RandomCropSafeGaze(object):
             crop_ymin = 0.0
             logger.info("CAUGHT ERROR: ymin > ymax \n\n")
             logger.info(f"(img_w, img_h) = ({img_w}, {img_h})")
-            logger.info(f"head_bboxes = {head_bboxes}")
-            logger.info(f"gaze_pts = {gaze_pts}")
+            logger.info(f"head_bboxes = {head_bboxes.tolist() if hasattr(head_bboxes, 'tolist') else head_bboxes}")
+            logger.info(f"gaze_pts = {gaze_pts.tolist() if hasattr(gaze_pts, 'tolist') else gaze_pts}")
             logger.info(f"(xmin, ymin, xmax, ymax) = ({xmin}, {ymin}, {xmax}, {ymax})")
             logger.info(
                 f"(zone_xmin, zone_ymin, zone_xmax, zone_ymax) = ({zone_xmin}, {zone_ymin}, {zone_xmax}, {zone_ymax})"

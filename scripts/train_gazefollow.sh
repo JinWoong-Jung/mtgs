@@ -20,11 +20,7 @@ export XFORMERS_DISABLED=1
 
 cd "$SLURM_SUBMIT_DIR/scripts"
 
-# ── Interaction settings ──────────────────────────────────────────────────────
-INTERACTION_TYPE="gaze_graph"  # "transformer" | "graph" | "gaze_graph"
-INTERACTION_ORDER="inject_first"  # "inject_first" (original) | "extract_first"
-
-EXP_NAME="gf_${INTERACTION_TYPE}_fixed"
+EXP_NAME="gf_gaze_graph_fixed"
 
 # ── Dataset / training settings ───────────────────────────────────────────────
 TASKS="train+test"
@@ -45,8 +41,6 @@ python -s ./main.py experiment.task=$TASKS \
         experiment.dataset=$DATASET \
         data.num_samples=$NUM_SAMPLES \
         data.temporal_context=$TEMPORAL_CONTEXT \
-        interaction.type=$INTERACTION_TYPE \
-        interaction.order=$INTERACTION_ORDER \
         optimizer.lr=$OPTIMIZER_LR \
         scheduler.t_0_epochs=$TO_EPOCHS \
         train.epochs=$EPOCHS \

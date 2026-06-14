@@ -10,6 +10,36 @@ import torch
 import torch.nn.functional as F
 
 
+def focal_social_loss(social_pred, social_gt, mask, gamma=2.0, pos_weight=2.0, label_smoothing=0.05):
+    """Focal BCE for sparse social labels (e.g. LAEO mutual gaze).
+
+    Combines three stabilization mechanisms:
+    - Focal weighting (1-p_t)^gamma  — down-weights easy negatives that dominate LAEO batches
+    - pos_weight                      — upweights rare positives (LAEO ≪ LAH in frequency)
+    - label_smoothing                 — softens targets for noisy derived labels (LAEO=min(LAH_ij,LAH_ji))
+    """
+    social_gt = social_gt * mask
+    gt_f = social_gt.float()
+
+    # label smoothing: 0 → eps/2, 1 → 1 - eps/2
+    gt_smooth = gt_f * (1.0 - label_smoothing) + 0.5 * label_smoothing
+
+    with torch.no_grad():
+        p = torch.sigmoid(social_pred)
+        p_t = p * gt_f + (1.0 - p) * (1.0 - gt_f)
+        focal_w = (1.0 - p_t) ** gamma
+
+    loss = F.binary_cross_entropy_with_logits(
+        social_pred,
+        gt_smooth,
+        pos_weight=torch.tensor(pos_weight, device=social_gt.device),
+        reduction="none",
+    )
+    loss = focal_w * loss
+    num_instances = mask.sum()
+    return torch.mul(loss, mask).sum() / (num_instances + 1e-6)
+
+
 def social_loss(social_pred, social_gt, mask, pos_weight=2.0):
     """Compute a loss for coatt or laeo or lah. This implements a standard binary cross-entropy loss.
 
@@ -39,6 +69,19 @@ def social_loss(social_pred, social_gt, mask, pos_weight=2.0):
     return loss
 
 
+def social_loss_prob(social_pred, social_gt, mask):
+    """BCE loss for probability inputs in [0,1] (e.g. SA P@P^T output)."""
+    social_gt = social_gt * mask
+    num_instances = mask.sum()
+    with torch.amp.autocast("cuda", enabled=False):
+        loss = F.binary_cross_entropy(
+            social_pred.float().clamp(1e-6, 1 - 1e-6),
+            social_gt.float(),
+            reduction="none",
+        )
+    return torch.mul(loss, mask).sum() / (num_instances + 1e-6)
+
+
 def compute_social_loss(
     lah_pred,
     lah_gt,
@@ -49,10 +92,15 @@ def compute_social_loss(
     coatt_pred,
     coatt_gt,
     coatt_mask,
+    coatt_is_prob=False,
 ):
     lah_loss = social_loss(lah_pred, lah_gt, lah_mask, pos_weight=3.0)
-    laeo_loss = social_loss(laeo_pred, laeo_gt, laeo_mask)
-    coatt_loss = social_loss(coatt_pred, coatt_gt, coatt_mask)
+    laeo_loss = focal_social_loss(laeo_pred, laeo_gt, laeo_mask)
+    coatt_loss = (
+        social_loss_prob(coatt_pred, coatt_gt, coatt_mask)
+        if coatt_is_prob
+        else social_loss(coatt_pred, coatt_gt, coatt_mask)
+    )
 
     lah_coeff = 1
     laeo_coeff = 1
@@ -251,8 +299,10 @@ def compute_dual_null_loss(alpha_null_out, alpha_null_in, inout_gt, lah_gt, num_
                 in_probs.append(alpha_null_in[bt, g])
                 in_targets.append(1.0)
                 continue
+            # Dataset convention: pair (a,b) = label "b looks at a" (TARGET, LOOKER).
+            # "g looks at d" is stored at pair (d, g) → flat index d*(N-1)+(g if g<d else g-1)
             outgoing = [
-                g * (N - 1) + (d if d < g else d - 1)
+                d * (N - 1) + (g if g < d else g - 1)
                 for d in range(nv_start, N) if d != g
             ]
             lah_i = lah_gt[bt, outgoing]

@@ -29,25 +29,25 @@ fi
 
 # set arguments
 TASKS="train+test"
-WEIGHTS="/home/jinwoongjung/MTGS/experiments/2026-06-06/gf_gaze_graph_fixed/train/checkpoints/best.ckpt" # HuggingFace pretrained GazeFollow checkpoint
+WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # GazeFollow stage-1 gaze_graph ckpt
 
-INTERACTION_TYPE="gaze_graph"  # "transformer" | "graph" | "gaze_graph"
-INTERACTION_ORDER="inject_first"  # "inject_first" (original) | "extract_first"
+FROZEN=false
 
-EXP_NAME="vg_${INTERACTION_TYPE}_fixed"
+EXP_NAME="vg_gaze_graph_v4"
+SWA="False"
 
-# graph: 5 param groups. transformer/gaze_graph: 4 param groups.
-if [ "$INTERACTION_TYPE" = "graph" ]; then
-    SWA_LR_OVERRIDE="train.swa.lr=[1e-6,1e-6,1e-6,1e-6,3e-7]"
-else
-    SWA_LR_OVERRIDE=""
-fi
+CHECKPOINT_MONITOR="metric/val/social_ap"
+CHECKPOINT_MODE="max"
+
+LAEO_DERIVE="lah_min"
 
 python -s ./main.py experiment.task=$TASKS \
     model.weights=$WEIGHTS \
     "experiment.name='${EXP_NAME}'" \
-    interaction.type=$INTERACTION_TYPE \
-    interaction.order=$INTERACTION_ORDER \
-    ${SWA_LR_OVERRIDE} \
+    gaze_graph.laeo_derive=$LAEO_DERIVE \
+    gaze_graph.frozen=$FROZEN \
+    train.checkpoint_monitor=$CHECKPOINT_MONITOR \
+    train.checkpoint_mode=$CHECKPOINT_MODE \
+    train.swa.use=$SWA \
     "hydra.run.dir='\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}'"
     

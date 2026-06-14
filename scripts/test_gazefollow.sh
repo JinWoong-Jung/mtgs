@@ -19,16 +19,12 @@ export XFORMERS_DISABLED=1
 
 cd "$SLURM_SUBMIT_DIR/scripts"
 
-# ── Interaction settings (must match the checkpoint's training run) ───────────
-INTERACTION_TYPE="gaze_graph"
-INTERACTION_ORDER="inject_first"
-
 # Most recent GazeFollow gaze_graph checkpoint (the run that produced
 # test/lah_auc=0.59 in gazefollow_graph_2042.out). Re-test with the
 # invalid-edge masking fix in mtgs_net.py applied.
 CHECKPOINT="/home/jinwoongjung/MTGS/experiments/2026-06-05/GazeFollow_gaze_graph/train/checkpoints/best.ckpt"
 
-EXP_NAME="test_GazeFollow_${INTERACTION_TYPE}"
+EXP_NAME="test_GazeFollow_gaze_graph"
 
 DATASET="gazefollow"
 TEMPORAL_CONTEXT=0
@@ -38,7 +34,5 @@ python -s ./main.py experiment.task=test \
         model.weights=False \
         experiment.dataset=$DATASET \
         data.temporal_context=$TEMPORAL_CONTEXT \
-        interaction.type=$INTERACTION_TYPE \
-        interaction.order=$INTERACTION_ORDER \
         test.checkpoint=$CHECKPOINT \
         "hydra.run.dir=\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}"

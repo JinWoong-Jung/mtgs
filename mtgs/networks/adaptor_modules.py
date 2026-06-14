@@ -227,551 +227,214 @@ class InteractionBlock(nn.Module):
         return x, c
 
 
-class SocialGraphBlock(nn.Module):
+def _compute_bbox_overlap(
+    hm_norm: torch.Tensor, bboxes: torch.Tensor
+) -> torch.Tensor:
+    """Integral of hm_i inside bbox_j for all (source i, target j) pairs.
+
+    Args:
+        hm_norm: (BT, N, H, W)  relu-normalised heatmap (pixels sum to 1 per person)
+        bboxes:  (BT, N, 4)     [x1, y1, x2, y2] in normalised [0, 1] image coords
+
+    Returns:
+        overlap: (BT, N, N)     overlap[b, i, j] = fraction of hm_i mass inside bbox_j
     """
-    Social interaction graph block replacing I^b_pp (Social Encoder).
+    BT, N, H, W = hm_norm.shape
+    device = hm_norm.device
+    dtype  = hm_norm.dtype
 
-    Supports three aggregation modes (controlled by `aggr`):
+    # Pixel-centre coordinates normalised to [0, 1]
+    yy = (torch.arange(H, device=device).float() + 0.5) / H   # (H,)
+    xx = (torch.arange(W, device=device).float() + 0.5) / W   # (W,)
 
-      "outgoing" (default):
-          msg_i = Σ_{i→j} α[i→j] · W_msg(h_j)  +  α_null[i] · W_msg(null_node)
-          softmax over destinations j (dim=-1).
-          i collects info from nodes it is looking at.
-          Null node: "i looks at no person" → null feature absorbed into msg_i.
+    x1 = bboxes[:, :, 0].unsqueeze(-1).unsqueeze(-1)  # (BT, N, 1, 1)
+    y1 = bboxes[:, :, 1].unsqueeze(-1).unsqueeze(-1)
+    x2 = bboxes[:, :, 2].unsqueeze(-1).unsqueeze(-1)
+    y2 = bboxes[:, :, 3].unsqueeze(-1).unsqueeze(-1)
 
-      "ingoing":
-          msg_i = Σ_{j→i} α[j→i] · W_msg(h_j)
-          softmax over sources j (dim=1).
-          i collects info from nodes looking at it.
-          Null node disabled (null has no meaningful gaze direction as a source).
+    # Binary spatial mask per target bbox: (BT, N_tgt, H, W)
+    mask = (
+        (xx.view(1, 1, 1, W) >= x1) & (xx.view(1, 1, 1, W) <= x2) &
+        (yy.view(1, 1, H, 1) >= y1) & (yy.view(1, 1, H, 1) <= y2)
+    ).to(dtype)
+    area = mask.sum((-2, -1)).clamp(min=1.0)  # (BT, N_tgt)
 
-      "both":
-          msg_i = W_out(msg_out_i) + W_in(msg_in_i)
-          outgoing part includes null; ingoing part does not.
-
-    Geometric LAH cosine prior is injected into attention weights on iteration 0 only.
-    Social prediction (LAH/SA) is handled by the shared pair-wise decoder downstream.
-    """
-
-    def __init__(
-        self,
-        token_dim: int,
-        hidden_channels: int = 96,
-        heads: int = 8,           # unused; kept for API compatibility
-        num_layers: int = 2,      # internal message-passing iterations
-        use_null_node: bool = True,
-        use_gaze_prior: bool = True,
-        prior_weight: float = 0.5,
-        layer_idx: int = 0,       # unused; kept for API compatibility
-        aggr: str = "outgoing",   # "outgoing" | "ingoing" | "both"
-        use_sa_prior: bool = True,
-        sa_prior_weight: float = 0.5,
-    ):
-        super().__init__()
-        assert aggr in ("outgoing", "ingoing", "both"), f"Unknown aggr: {aggr!r}"
-        self.num_layers     = num_layers
-        self.use_gaze_prior = use_gaze_prior
-        self.aggr           = aggr
-
-        # Null node is only meaningful in outgoing direction.
-        self.use_null_node = use_null_node and (aggr in ("outgoing", "both"))
-
-        # Learnable prior weight for attention routing only (single scalar).
-        self.prior_w_attn = nn.Parameter(torch.tensor(prior_weight))
-        # Per-iteration decay weights for gaze prior injection (softmax over num_layers)
-        self.prior_decay_logits = nn.Parameter(torch.zeros(num_layers))
-
-        # SA prior: gaze direction cosine similarity (symmetric).
-        self.use_sa_prior = use_sa_prior and use_gaze_prior
-        if self.use_sa_prior:
-            self.prior_w_sa = nn.Parameter(torch.tensor(sa_prior_weight))
-
-        # ── Attention scoring MLP (directed edge i→j) ───────────────────────
-        self.mlp_dir = MLP(token_dim * 2, hidden_channels, 1)
-        if self.use_null_node:
-            # Null_in : in-frame non-person targets (looks at scene object)
-            # Null_out: out-of-frame gaze (supervised by inout label)
-            self.null_in_node  = nn.Parameter(torch.zeros(token_dim))
-            self.null_out_node = nn.Parameter(torch.zeros(token_dim))
-            self.mlp_null_in   = MLP(token_dim * 2, hidden_channels, 1)
-            self.mlp_null_out  = MLP(token_dim * 2, hidden_channels, 1)
-
-        # ── Message passing & node update ────────────────────────────────────
-        self.W_msg       = nn.Linear(token_dim, token_dim, bias=False)
-        if aggr == "both":
-            # separate projections to combine outgoing and ingoing messages
-            self.W_combine_out = nn.Linear(token_dim, token_dim, bias=False)
-            self.W_combine_in  = nn.Linear(token_dim, token_dim, bias=False)
-        self.update_proj = nn.Linear(token_dim * 2, token_dim)
-        self.W_gate      = nn.Linear(token_dim, token_dim)
-        self.norm        = nn.LayerNorm(token_dim)
-
-        self._edge_cache: dict = {}
-
-    @staticmethod
-    def _build_edges(nv: int, device: torch.device):
-        """Directed edges in GT label order: [(s,d) for s in range(nv) for d in range(nv) if s!=d]."""
-        src = torch.tensor(
-            [s for s in range(nv) for d in range(nv) if s != d],
-            dtype=torch.long, device=device,
-        )
-        dst = torch.tensor(
-            [d for s in range(nv) for d in range(nv) if s != d],
-            dtype=torch.long, device=device,
-        )
-        return src, dst
-
-    def _get_edge_cache(self, N: int, device: torch.device) -> dict:
-        if N not in self._edge_cache:
-            src_N, dst_N = self._build_edges(N, device)
-            self._edge_cache[N] = {"src_N": src_N, "dst_N": dst_N}
-        return self._edge_cache[N]
-
-    def forward(
-        self,
-        person_tokens,
-        num_valid_people,
-        gaze_vecs=None,
-        head_bboxes=None,
-        readout=False,   # unused; kept for call-site compatibility
-    ):
-        """
-        Args:
-            person_tokens:    (B, N, D)
-            num_valid_people: (B,) int
-            gaze_vecs:        (B, N, 2) unit gaze direction
-            head_bboxes:      (B, N, 4) normalized [x1,y1,x2,y2]
-
-        Returns:
-            tokens_out:     (B, N, D) updated node features.
-            alpha_null_in:  (B, N) or None — attention weight to Null_in (last iter).
-            alpha_null_out: (B, N) or None — attention weight to Null_out (last iter).
-        """
-        B, N, D = person_tokens.shape
-        device  = person_tokens.device
-        dtype   = person_tokens.dtype
-
-        cache  = self._get_edge_cache(N, device)
-        src_N  = cache["src_N"]   # (E,)  E = N*(N-1)
-        dst_N  = cache["dst_N"]   # (E,)
-
-        # Valid nodes occupy the BACK slots [N-nv .. N-1]; front slots are padding.
-        node_valid = (
-            torch.arange(N, device=device).unsqueeze(0) >= (N - num_valid_people.unsqueeze(1))
-        )  # (B, N)
-        pair_valid = node_valid.unsqueeze(2) & node_valid.unsqueeze(1)   # (B, N, N)
-        diag_mask  = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
-
-        # ── Pre-compute LAH cosine prior (iteration-independent) ─────────────
-        lah_prior = None
-        if self.use_gaze_prior and gaze_vecs is not None and head_bboxes is not None:
-            centers = (head_bboxes[..., :2] + head_bboxes[..., 2:]) / 2   # (B, N, 2)
-            dir_ij    = F.normalize(centers[:, dst_N] - centers[:, src_N], dim=-1)
-            lah_prior = (gaze_vecs[:, src_N] * dir_ij).sum(-1)            # (B, E)
-
-        # ── Pre-compute SA gaze cosine prior (gaze_i · gaze_j, symmetric) ──
-        sa_prior = None
-        if self.use_sa_prior and gaze_vecs is not None:
-            sa_prior = (gaze_vecs[:, src_N] * gaze_vecs[:, dst_N]).sum(-1)  # (B, E)
-
-        # Pre-build prior matrices (iteration-independent) and per-iteration decay weights
-        lah_prior_mat = None
-        if self.use_gaze_prior and lah_prior is not None:
-            lah_prior_mat = torch.zeros(B, N, N, device=device, dtype=dtype)
-            lah_prior_mat[:, src_N, dst_N] = lah_prior.to(dtype)
-        sa_prior_mat = None
-        if self.use_sa_prior and sa_prior is not None:
-            sa_prior_mat = torch.zeros(B, N, N, device=device, dtype=dtype)
-            sa_prior_mat[:, src_N, dst_N] = sa_prior.to(dtype)
-        decay_w = torch.softmax(self.prior_decay_logits, dim=0)  # (num_layers,)
-
-        h = person_tokens.clone()
-        _alpha_null_in  = None
-        _alpha_null_out = None
-
-        for iter_idx in range(self.num_layers):
-            # ── Directed edge attention scores ───────────────────────────────
-            h_i = h.unsqueeze(2).expand(B, N, N, D)
-            h_j = h.unsqueeze(1).expand(B, N, N, D)
-
-            e_dir_mat = self.mlp_dir(
-                torch.cat([h_i, h_j], dim=-1).reshape(B * N * N, 2 * D)
-            ).reshape(B, N, N)
-            e_dir_mat = e_dir_mat.masked_fill(diag_mask,   float("-inf"))
-            e_dir_mat = e_dir_mat.masked_fill(~pair_valid, float("-inf"))
-
-            if lah_prior_mat is not None:
-                e_dir_mat = e_dir_mat + self.prior_w_attn * decay_w[iter_idx] * lah_prior_mat
-            if sa_prior_mat is not None:
-                e_dir_mat = e_dir_mat + self.prior_w_sa * decay_w[iter_idx] * sa_prior_mat
-
-            W_msg_h = self.W_msg(h)   # (B, N, D)
-
-            # ── Outgoing aggregation: i collects from nodes it looks at ──────
-            # α_out[i,j]: softmax over destinations j (dim=-1)
-            # msg_out_i = Σ_j α_out[i→j] · W_msg(h_j)  +  α_in[i] · W_msg(null_in)  +  α_out[i] · W_msg(null_out)
-            if self.aggr in ("outgoing", "both"):
-                if self.use_null_node:
-                    # Node-dependent null scores: e_{i->null} = MLP_null([h_i; v_null])
-                    v_in  = self.null_in_node.expand(B, N, -1)   # (B, N, D)
-                    v_out = self.null_out_node.expand(B, N, -1)  # (B, N, D)
-                    e_null_in  = self.mlp_null_in(
-                        torch.cat([h, v_in],  dim=-1).reshape(B * N, 2 * D)
-                    ).reshape(B, N)
-                    e_null_out = self.mlp_null_out(
-                        torch.cat([h, v_out], dim=-1).reshape(B * N, 2 * D)
-                    ).reshape(B, N)
-                    e_null_in  = e_null_in.masked_fill(~node_valid, float("-inf"))
-                    e_null_out = e_null_out.masked_fill(~node_valid, float("-inf"))
-                    # (B, N, N+2): last two cols are null_in and null_out scores
-                    e_aug_out = torch.cat(
-                        [e_dir_mat, e_null_in.unsqueeze(-1), e_null_out.unsqueeze(-1)], dim=-1
-                    )
-                else:
-                    e_aug_out = e_dir_mat
-                all_inf_out = e_aug_out.isinf().all(dim=-1, keepdim=True)
-                e_aug_out   = e_aug_out.masked_fill(all_inf_out, 0.0)
-                alpha_out   = torch.softmax(e_aug_out, dim=-1)   # (B, N, N[+2])
-                msg_out = torch.einsum("bij,bjd->bid", alpha_out[:, :, :N], W_msg_h)
-                if self.use_null_node:
-                    _alpha_null_in  = alpha_out[:, :, N]      # (B, N)
-                    _alpha_null_out = alpha_out[:, :, N + 1]  # (B, N)
-                    msg_out = (
-                        msg_out
-                        + _alpha_null_in.unsqueeze(-1)  * self.W_msg(self.null_in_node).to(dtype)
-                        + _alpha_null_out.unsqueeze(-1) * self.W_msg(self.null_out_node).to(dtype)
-                    )
-
-            # ── Ingoing aggregation: i collects from nodes looking at it ─────
-            # α_in[i,j]: softmax over sources j (dim=1), treating e_dir_mat[j,i] as score of j→i
-            # msg_in_i = Σ_j α_in[j→i] · W_msg(h_j)
-            if self.aggr in ("ingoing", "both"):
-                # mask invalid pairs before softmax (same pair_valid, diag already -inf)
-                e_in = e_dir_mat.masked_fill(e_dir_mat.isinf().all(dim=1, keepdim=True), 0.0)
-                alpha_in = torch.softmax(e_in, dim=1)   # (B, N, N): softmax over source dim
-                # alpha_in[b, j, i] = how much j contributes to i
-                msg_in = torch.einsum("bji,bjd->bid", alpha_in, W_msg_h)
-
-            # ── Combine ───────────────────────────────────────────────────────
-            if self.aggr == "outgoing":
-                msg = msg_out
-            elif self.aggr == "ingoing":
-                msg = msg_in
-            else:  # both
-                msg = self.W_combine_out(msg_out) + self.W_combine_in(msg_in)
-
-            # ── Node update ──────────────────────────────────────────────────
-            gate  = torch.sigmoid(self.W_gate(h))  # (B, N, D)
-            delta = self.update_proj(torch.cat([h, msg], dim=-1))
-            h_new = self.norm(h + gate * delta).to(dtype)
-            h = torch.where(node_valid.unsqueeze(-1), h_new, h)
-
-        return h.float(), _alpha_null_in, _alpha_null_out
+    # overlap[b, i, j] = Σ_{hw} hm[b,i,h,w] * mask[b,j,h,w]
+    #   hm_norm  (BT, N_src, H, W) → unsqueeze N_tgt → (BT, N_src, 1, H, W)
+    #   mask     (BT, N_tgt, H, W) → unsqueeze N_src → (BT, 1, N_tgt, H, W)
+    overlap = (hm_norm.unsqueeze(2) * mask.unsqueeze(1)).sum((-2, -1))  # (BT, N_src, N_tgt)
+    return overlap.to(dtype)  # already in [0,1]: hm_norm sums to 1
 
 
-class UndirectedSocialGraphBlock(nn.Module):
-    """
-    Undirected social graph for Shared-Attention (SA / co-attention).
+class _UnifiedRefiner(nn.Module):
+    """Per-frame spatial edge refinement with row + col attention.
 
-    SA is symmetric ("do i and j look at the same thing?") and non-exclusive
-    (a person can co-attend with several others at once). So, unlike the
-    directed LAH block — which uses softmax+null aggregation to encode an
-    "attend to ~one target" prior — this block uses INDEPENDENT sigmoid edge
-    gates and aggregates a gated MEAN over valid neighbours. Mean (rather than
-    sum) normalisation keeps the message scale invariant to the number of
-    people N.
-
-    Edge scores are order-invariant by construction (built from the symmetric
-    pair feature [h_i+h_j ; |h_i-h_j|]), so gate(i,j) == gate(j,i): a true
-    undirected graph. The SA gaze prior (gaze_i · gaze_j) is symmetric too and
-    injected with a learnable per-iteration decay, mirroring SocialGraphBlock.
-    """
-
-    def __init__(
-        self,
-        token_dim: int,
-        num_layers: int = 2,
-        hidden_channels: int = 96,
-        use_sa_prior: bool = True,
-        sa_prior_weight: float = 0.5,
-    ):
-        super().__init__()
-        self.num_layers   = num_layers
-        self.use_sa_prior = use_sa_prior
-
-        # Symmetric edge scorer: [h_i+h_j ; |h_i-h_j|] -> scalar logit
-        self.mlp_edge    = MLP(token_dim * 2, hidden_channels, 1)
-        self.W_msg       = nn.Linear(token_dim, token_dim, bias=False)
-        self.update_proj = nn.Linear(token_dim * 2, token_dim)
-        self.W_gate      = nn.Linear(token_dim, token_dim)
-        self.norm        = nn.LayerNorm(token_dim)
-
-        if use_sa_prior:
-            self.prior_w_sa = nn.Parameter(torch.tensor(sa_prior_weight))
-        self.prior_decay_logits = nn.Parameter(torch.zeros(num_layers))
-
-        self._edge_cache: dict = {}
-
-    @staticmethod
-    def _build_edges(N: int, device: torch.device):
-        src = torch.tensor([s for s in range(N) for d in range(N) if s != d],
-                           dtype=torch.long, device=device)
-        dst = torch.tensor([d for s in range(N) for d in range(N) if s != d],
-                           dtype=torch.long, device=device)
-        return src, dst
-
-    def _get_edge_cache(self, N: int, device: torch.device):
-        if N not in self._edge_cache:
-            self._edge_cache[N] = dict(zip(("src", "dst"), self._build_edges(N, device)))
-        return self._edge_cache[N]
-
-    def forward(self, person_tokens, num_valid_people, gaze_vecs=None):
-        """
-        Args:
-            person_tokens:    (B, N, D)
-            num_valid_people: (B,) int — valid nodes occupy back slots [N-nv .. N-1]
-            gaze_vecs:        (B, N, 2) unit gaze direction (optional, for SA prior)
-
-        Returns:
-            tokens_out: (B, N, D) SA-tailored node features.
-        """
-        B, N, D = person_tokens.shape
-        device  = person_tokens.device
-        dtype   = person_tokens.dtype
-
-        node_valid = (
-            torch.arange(N, device=device).unsqueeze(0) >= (N - num_valid_people.unsqueeze(1))
-        )  # (B, N)
-        pair_valid = node_valid.unsqueeze(2) & node_valid.unsqueeze(1)              # (B, N, N)
-        diag       = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
-        edge_ok    = pair_valid & ~diag                                            # (B, N, N)
-        # valid neighbour count per node (>=1) for N-invariant mean aggregation
-        deg = edge_ok.sum(-1).clamp(min=1).to(dtype)                               # (B, N)
-
-        # ── SA gaze prior (symmetric, iteration-independent) ──────────────────
-        sa_prior_mat = None
-        if self.use_sa_prior and gaze_vecs is not None:
-            cache        = self._get_edge_cache(N, device)
-            src_N, dst_N = cache["src"], cache["dst"]
-            sa_prior = (gaze_vecs[:, src_N] * gaze_vecs[:, dst_N]).sum(-1)          # (B, E)
-            sa_prior_mat = torch.zeros(B, N, N, device=device, dtype=dtype)
-            sa_prior_mat[:, src_N, dst_N] = sa_prior.to(dtype)
-
-        decay_w = torch.softmax(self.prior_decay_logits, dim=0)                     # (num_layers,)
-
-        h = person_tokens.clone()
-        for it in range(self.num_layers):
-            h_i = h.unsqueeze(2).expand(B, N, N, D)
-            h_j = h.unsqueeze(1).expand(B, N, N, D)
-            # symmetric pair feature -> symmetric edge logit (gate(i,j)==gate(j,i))
-            sym_feat = torch.cat([h_i + h_j, (h_i - h_j).abs()], dim=-1).reshape(B * N * N, 2 * D)
-            e = self.mlp_edge(sym_feat).reshape(B, N, N)
-            if sa_prior_mat is not None:
-                e = e + self.prior_w_sa * decay_w[it] * sa_prior_mat
-
-            # independent sigmoid gates, zeroed on invalid / self edges
-            gate = torch.sigmoid(e) * edge_ok.to(dtype)                            # (B, N, N)
-
-            # gated mean aggregation (N-invariant)
-            msg = torch.einsum("bij,bjd->bid", gate, self.W_msg(h)) / deg.unsqueeze(-1)
-
-            g     = torch.sigmoid(self.W_gate(h))
-            delta = self.update_proj(torch.cat([h, msg], dim=-1))
-            h_new = self.norm(h + g * delta).to(dtype)
-            h     = torch.where(node_valid.unsqueeze(-1), h_new, h)
-
-        return h.float()
-
-
-class TemporalGraphBlock(nn.Module):
-    """
-    Temporal attention over t frames per person using nn.MultiheadAttention.
-
-    Expects input (M, t, D) where M = B * N (caller reshapes before calling).
-    For a fully-connected temporal graph, MHA is equivalent to GAT and avoids
-    PyG sparse kernel overhead for small t (e.g. t=3).
-    """
-
-    def __init__(self, token_dim: int, hidden_channels: int = 96, heads: int = 8):
-        super().__init__()
-        # hidden_channels kept for API compatibility but unused; MHA uses token_dim directly.
-        self.attn = nn.MultiheadAttention(
-            embed_dim=token_dim,
-            num_heads=heads,
-            batch_first=True,
-        )
-        self.norm1 = nn.LayerNorm(token_dim)
-        self.norm2 = nn.LayerNorm(token_dim)
-        self.ffn = MLP(token_dim, token_dim, token_dim)
-
-    def forward(self, person_tokens_t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            person_tokens_t: (M, t, D)  where M = B * N
-
-        Returns:
-            (M, t, D)
-        """
-        if person_tokens_t.shape[1] <= 1:
-            return person_tokens_t
-
-        attn_out, _ = self.attn(
-            person_tokens_t, person_tokens_t, person_tokens_t,
-            need_weights=False,
-        )
-        dtype = person_tokens_t.dtype
-        h = self.norm1(person_tokens_t + attn_out).to(dtype)
-        h = self.norm2(h + self.ffn(h)).to(dtype)
-        return h
-
-
-class _FusedGazeRefiner(nn.Module):
-    """Asymmetric dual-role refinement with a SHARED person node (×L).
-
-    Per iteration:
-      • LAH path: row-wise OUTGOING attention over [P_1..P_N, O] targets → msg_out_i
-      • SA  path: column-wise INCOMING attention over sources → msg_in_k (region k)
-      • shared person node fused from BOTH directions via cross-attention:
-            v_i ← LN( v_i + CrossAttn(q=v_i, kv=MLP([msg_out_i ‖ sg(msg_in_i)])) )
-        (msg_in stop-gradient'd into the fusion, per request)
-      • null / region target nodes updated from their incoming pools
-      • LAH / SA edges refreshed from the updated nodes
-    LAH logits read the outgoing (person/null) edges, SA logits the incoming
-    (region) edges; the person node is the single point where the two roles meet.
-
-    NOTE: only the fusion's msg_in is detached. The SA edge refresh still reads the
-    shared node, so SA gradient can still reach LAH through it — intentional (full
-    isolation deferred; revisit if LAEO degrades).
+    E shape throughout: (B, T, N, Tl, De)   where Tl = N + 2.
+    Column attention covers only the first N+1 targets (null_out excluded).
+    Frames are processed independently; temporal context is already carried by
+    the upstream person tokens.
     """
 
     def __init__(self, edge_dim: int, num_layers: int, heads: int):
         super().__init__()
-        De = edge_dim
-        self.De = De
+        De = self.De = edge_dim
         self.num_layers = num_layers
-        enc = lambda: nn.TransformerEncoderLayer(
+
+        _enc = lambda: nn.TransformerEncoderLayer(
             d_model=De, nhead=heads, dim_feedforward=2 * De,
             dropout=0.0, batch_first=True, activation="gelu",
         )
-        self.row = enc()   # LAH: outgoing (same-source targets attend)
-        self.col = enc()   # SA : incoming (same-target sources attend)
+        self.row      = _enc()
+        self.col      = _enc()
 
-        # shared person-node fusion: cross-attn(q=v, kv=MLP([msg_out ‖ sg(msg_in)]))
-        self.fuse_kv    = MLP(2 * De, De, De)
-        self.fuse_xattn = CrossAttention(De, num_heads=heads)
-        self.norm_v     = nn.LayerNorm(De)
+        self.refresh  = MLP(3 * De, De, De)
+        self.norm_e   = nn.LayerNorm(De)
+        self.pool_out = nn.Linear(De, 1)
+        self.pool_in  = nn.Linear(De, 1)
 
-        # target-side node updates (null, region) from their incoming pools
-        self.upd_null = MLP(2 * De, De, De)
-        self.norm_null = nn.LayerNorm(De)
-        self.upd_reg  = MLP(2 * De, De, De)
-        self.norm_reg = nn.LayerNorm(De)
+        # Source and target roles are updated from their own edge direction.
+        self.upd_src     = MLP(2 * De, De, De)
+        self.norm_src    = nn.LayerNorm(De)
+        self.upd_tgt     = MLP(2 * De, De, De)
+        self.norm_tgt    = nn.LayerNorm(De)
+        # null_in: only incoming (no outgoing edges)
+        self.upd_nullin  = MLP(2 * De, De, De)
+        self.norm_nullin = nn.LayerNorm(De)
+        # null_out: no update (idea.md §3)
 
-        # per-path edge refresh from updated incident nodes
-        self.refresh_lah = MLP(3 * De, De, De)
-        self.norm_lah    = nn.LayerNorm(De)
-        self.refresh_sa  = MLP(3 * De, De, De)
-        self.norm_sa     = nn.LayerNorm(De)
+        self.inject   = MLP(3 * De, De, De)
+        self.norm_inj = nn.LayerNorm(De)
 
-    def forward(self, E_lah, E_sa, v, v_null, v_reg,
-                ev_lah, ev_sa, row_kpm, col_kpm, deg_out, deg_in, deg_null):
-        # E_lah: (B, N, N+1, De)  targets [P_1..P_N, O];  E_sa: (B, N, N, De)  targets [R_k]
-        B, N, Tl, De = E_lah.shape
+    @staticmethod
+    def _safe_kpm(kpm: torch.Tensor) -> torch.Tensor:
+        # Fully-masked sequences cause NaN in TransformerEncoderLayer.
+        # Unmask them; their output is discarded by multiplying with ev.
+        return kpm & ~kpm.all(dim=1, keepdim=True)
+
+    def forward(self, E, ev, row_kpm, col_kpm, v_src, v_tgt, deg_out, deg_in):
+        """
+        E:       (B, T, N, Tl, De)
+        ev:      (B, T, N, Tl, 1)    float 0/1 validity mask
+        row_kpm: (B*T*N, Tl)
+        col_kpm: (B*T*(N+1), N)      null_out column excluded
+        v_src:   (B, T, N, De)
+        v_tgt:   (B, T, Tl, De)
+        deg_out: (B, T, N, 1)
+        deg_in:  (B, T, Tl, 1)
+        """
+        B, T, N, Tl, De = E.shape
+        ev_sq = ev.squeeze(-1)  # (B, T, N, Tl) float; constant across layers
+
         for _ in range(self.num_layers):
-            # LAH: row-wise outgoing (each source's targets attend)
-            E_lah = self.row(
-                E_lah.reshape(B * N, Tl, De), src_key_padding_mask=row_kpm
-            ).reshape(B, N, Tl, De) * ev_lah
-            # SA: column-wise incoming (each region's sources attend)
-            E_sa = self.col(
-                E_sa.permute(0, 2, 1, 3).reshape(B * N, N, De), src_key_padding_mask=col_kpm
-            ).reshape(B, N, N, De).permute(0, 2, 1, 3) * ev_sa
+            # ── ① Row: source i attends over all Tl targets ───────────────────
+            row_context = self.row(
+                E.reshape(B * T * N, Tl, De), src_key_padding_mask=row_kpm
+            ).reshape(B, T, N, Tl, De) * ev
+            E = row_context
 
-            # directional messages
-            msg_out = E_lah[:, :, :N].sum(2) / deg_out       # (B, N, De)  source i over person targets
-            msg_in  = E_sa.sum(1) / deg_in                   # (B, N, De)  region k over sources
+            # ── ② Col: target k (person + null_in) attends over N sources ─────
+            #    null_out excluded; its col_context slot retains row_context so the
+            #    refresh always has a well-defined 3-way concat for every edge.
+            E_col_in = E[:, :, :, :N + 1, :]
+            E_col_out_N1 = self.col(
+                E_col_in.permute(0, 1, 3, 2, 4).reshape(B * T * (N + 1), N, De),
+                src_key_padding_mask=col_kpm,
+            ).reshape(B, T, N + 1, N, De).permute(0, 1, 3, 2, 4)  # (B, T, N, N+1, De)
+            col_context = torch.cat(
+                [E_col_out_N1, row_context[:, :, :, N + 1:, :]], dim=3
+            ) * ev
+            E = col_context
 
-            # shared person node fusion: cross-attn(q=v, kv=MLP([msg_out ‖ sg(msg_in)]))
-            kv = self.fuse_kv(torch.cat([msg_out, msg_in.detach()], -1))   # (B, N, De)
-            fused = self.fuse_xattn(
-                v.reshape(B * N, 1, De), kv.reshape(B * N, 1, De)
-            ).reshape(B, N, De)
-            v = self.norm_v(v + fused)
+            # ── ③ Edge refresh: refine each frame's edge graph independently ──
+            #    edge = LN(edge + MLP(concat(edge, row_context, col_context)))
+            E = self.norm_e(
+                E + self.refresh(torch.cat([E, row_context, col_context], dim=-1))
+            ) * ev
 
-            # target-side nodes: incoming pools
-            null_pool = E_lah[:, :, N].sum(1, keepdim=True) / deg_null     # (B, 1, De)
-            v_null = self.norm_null(v_null + self.upd_null(torch.cat([v_null, null_pool], -1)))
-            v_reg = self.norm_reg(v_reg + self.upd_reg(torch.cat([v_reg, msg_in], -1)))
+            # ── ④ Node update: learned attention pooling (idea.md §7) ────────
+            # out_agg: source i attends over all Tl outgoing edges
+            scores_out = self.pool_out(E).squeeze(-1)              # (B, T, N, Tl)
+            scores_out = scores_out.masked_fill(ev_sq == 0, float('-inf'))
+            safe_out   = scores_out.isinf().all(dim=-1, keepdim=True)
+            scores_out = scores_out.masked_fill(safe_out, 0.0)
+            alpha_out  = F.softmax(scores_out, dim=-1) * ev_sq    # (B, T, N, Tl)
+            out_agg    = (alpha_out.unsqueeze(-1) * E).sum(3)     # (B, T, N, De)
 
-            # edge refresh from updated incident nodes
-            tgt_lah = torch.cat([v, v_null], dim=1)                        # (B, N+1, De)
-            E_lah = self.norm_lah(E_lah + self.refresh_lah(torch.cat(
-                [E_lah,
-                 v.unsqueeze(2).expand(B, N, Tl, De),
-                 tgt_lah.unsqueeze(1).expand(B, N, Tl, De)], -1))) * ev_lah
-            E_sa = self.norm_sa(E_sa + self.refresh_sa(torch.cat(
-                [E_sa,
-                 v.unsqueeze(2).expand(B, N, N, De),
-                 v_reg.unsqueeze(1).expand(B, N, N, De)], -1))) * ev_sa
-        return E_lah, E_sa
+            # in_agg: target k (person/null_in) attends over N incoming sources
+            scores_in   = self.pool_in(E[:, :, :, :N + 1, :]).squeeze(-1)  # (B, T, N, N+1)
+            scores_in_t = scores_in.permute(0, 1, 3, 2)                    # (B, T, N+1, N)
+            ev_in_t     = ev_sq[:, :, :, :N + 1].permute(0, 1, 3, 2)      # (B, T, N+1, N)
+            scores_in_t = scores_in_t.masked_fill(ev_in_t == 0, float('-inf'))
+            safe_in     = scores_in_t.isinf().all(dim=-1, keepdim=True)
+            scores_in_t = scores_in_t.masked_fill(safe_in, 0.0)
+            alpha_in    = F.softmax(scores_in_t, dim=-1) * ev_in_t         # (B, T, N+1, N)
+            E_src_col   = E[:, :, :, :N + 1, :].permute(0, 1, 3, 2, 4)   # (B, T, N+1, N, De)
+            in_agg_full = (alpha_in.unsqueeze(-1) * E_src_col).sum(3)      # (B, T, N+1, De)
+            in_agg_p    = in_agg_full[:, :, :N, :]                         # (B, T, N, De)
+            in_agg_ni   = in_agg_full[:, :, N:N + 1, :]                    # (B, T, 1, De)
+
+            v_src = self.norm_src(
+                v_src + self.upd_src(torch.cat([v_src, out_agg], dim=-1))
+            )
+            v_tgt_p = self.norm_tgt(
+                v_tgt[:, :, :N, :] + self.upd_tgt(
+                    torch.cat([v_tgt[:, :, :N, :], in_agg_p], dim=-1)
+                )
+            )  # (B, T, N, De)
+
+            v_ni = self.norm_nullin(
+                v_tgt[:, :, N:N + 1, :] + self.upd_nullin(
+                    torch.cat([v_tgt[:, :, N:N + 1, :], in_agg_ni], dim=-1)
+                )
+            )  # (B, T, 1, De)
+
+            v_tgt = torch.cat([v_tgt_p, v_ni, v_tgt[:, :, N + 1:, :]], dim=2)
+
+            # ── ⑤ Re-inject updated nodes into edges ──────────────────────────
+            src_exp = v_src.unsqueeze(3).expand(B, T, N, Tl, De)
+            tgt_exp = v_tgt.unsqueeze(2).expand(B, T, N, Tl, De)
+            E = self.norm_inj(
+                E + self.inject(torch.cat([E, src_exp, tgt_exp], dim=-1))
+            ) * ev
+
+        return E, v_src, v_tgt
 
 
 class _SocialReadoutHead(nn.Module):
-    """ResidualLinearBlock(scale=4) + fc — mirrors LinearDecoderSocialGraph in mtgs_net.py."""
+    """Small residual MLP head for per-edge logit.
+    LayerNorm instead of BatchNorm1d: independent of batch size and zero-padding ratio."""
     def __init__(self, dim: int, scale: int = 4):
         super().__init__()
         self.fc1    = nn.Linear(dim, dim // scale, bias=False)
-        self.bn1    = nn.BatchNorm1d(dim // scale)
+        self.ln1    = nn.LayerNorm(dim // scale)
         self.fc2    = nn.Linear(dim // scale, dim // scale ** 2, bias=False)
-        self.bn2    = nn.BatchNorm1d(dim // scale ** 2)
+        self.ln2    = nn.LayerNorm(dim // scale ** 2)
         self.res_fc = nn.Linear(dim, dim // scale ** 2)
         self.fc_out = nn.Linear(dim // scale ** 2, 1)
 
     def forward(self, x):
-        z = torch.relu(self.bn1(self.fc1(x)))
-        h = torch.relu(self.bn2(self.fc2(z)) + self.res_fc(x))
+        z = torch.relu(self.ln1(self.fc1(x)))
+        h = torch.relu(self.ln2(self.fc2(z)) + self.res_fc(x))
         return self.fc_out(h)
 
 
 class GazeGraphBlock(nn.Module):
-    """
-    Standalone directed gaze graph + dual-role edge refinement
-    (interaction.type="gaze_graph").
+    """Unified directed gaze graph following idea.md design.
 
-    Runs ONCE after the ViT-Adaptor has produced per-person evidence tokens, so
-    it does NOT feed the heatmap / inout decoders (those stay on the trunk). It
-    exists only to produce socially-contextualised gaze-relation edge evidence.
+    Edge tensor E: (B, T, N, Tl, De)   Tl = N+2
+      [0..N-1]  person targets
+      [N]       null_in  — in-frame, looking at scene object
+      [N+1]     null_out — out-of-frame
 
-    Nodes (per frame):
-      Person  P_1..P_N  — source AND target (features = projected person tokens, dim D)
-      Region  R_1..R_N  — target only       (R_j = "where person j looks"; feature =
-                                              positional embedding of j's gaze target)
-      Null    O         — target only       (single learnable node; out-of-frame gaze)
+    Per refinement layer (×L):
+      row-attn → col-attn (null_out excluded) → edge-refresh → node-update
 
-    Edge-state matrix E[i, t]  (source person i → target t ∈ {P_*, R_*, O}):
-      e^0_{i→t} = MLP_init([ p_i ; node_t ; w·[s_hm, align]_{i→t} ])
-        align = gaze-direction · dir(center_i → target-location) cosine
-        s_hm  = source i's gaze heatmap H_i sampled (bilinear) at the target
-                location (heatmap–target overlap)
-        target location = head center for person targets, gaze anchor for region
-        targets; both evidence channels are 0 for the null target.
-
-    Asymmetric dual-role refinement (_FusedGazeRefiner), repeated L (= num_layers)
-    times, with a SHARED person node where the two roles meet:
-      LAH = outgoing role : persons [0:N] + null [2N]  → (B, N, N+1)
-      SA  = incoming role : regions [N:2N]             → (B, N, N)
-    Per iteration: LAH row-wise (outgoing) → msg_out; SA column-wise (incoming) →
-    msg_in; person node fused via cross-attn(q=v, kv=MLP([msg_out ‖ sg(msg_in)]));
-    null/region target nodes updated from incoming pools; LAH/SA edges refreshed
-    from the updated nodes. LAEO is derived downstream as min(LAH_ij, LAH_ji).
-
-    Read-out — PER-TYPE heads map each refined edge to a logit
-    ℓ_{i→t} = head_*(ê_{i→t}) ("does i look at t?", 1/0 BCE):
-      lah_mat[i,j] = head_lah (ê_{i→P_j})   (LAH: i looks at j's head)
-      sa_mat[i,j]  = head_sa  (ê_{i→R_j})   (SA / co-attention: i looks where j looks)
-      null_vec[i]  = head_null(ê_{i→O})     (out-of-frame)
-    Diagonal person/region targets (i→P_i, i→R_i) are masked everywhere; valid
-    people occupy the BACK slots [N-nv .. N-1] (padding convention).
+    Readout (all T frames → (B,T,N,N) / (B,T,N) outputs):
+      LAH    : head_lah(E[:,:,:,:N])
+      LAEO   : head_laeo(cat(E[i,j], E[j,i]))       — learned MLP
+      SA     : head_sa(cat(E[i→null_in], E[j→null_in], |diff|, E[i→j], E[j→i]))
+      null_in : head_null_in(E[:,:,:,N])
+      null_out: head_null_out(E[:,:,:,N+1])
     """
 
     def __init__(
@@ -782,211 +445,276 @@ class GazeGraphBlock(nn.Module):
         heads: int = 4,
         use_prior: bool = True,
         prior_weight: float = 0.5,
+        use_node_xattn: bool = True,
     ):
         super().__init__()
         D, De = token_dim, edge_dim
-        self.De         = De
-        self.num_layers = num_layers
-        self.use_prior  = use_prior
+        self.De             = De
+        self.use_prior      = use_prior
+        self.use_node_xattn = use_node_xattn
 
-        # Region node = positional embedding of a gaze-target (x, y) in [0, 1],
-        # then fused with the corresponding person j via cross-attention so R_j
-        # carries BOTH "where j looks" (position) and "who j is" (appearance) —
-        # restores the R_j ↔ P_j link the position-only node was missing.
-        self.region_pos_mlp  = MLP(2, De, D)
-        self.region_xattn    = CrossAttention(D, num_heads=heads)
-        self.region_xattn_norm = nn.LayerNorm(D)
-        self.null_node       = nn.Parameter(torch.zeros(D))
+        # ── Null node parameters (one per null type) ──────────────────────────
+        self.null_in_node  = nn.Parameter(torch.zeros(D))
+        self.null_out_node = nn.Parameter(torch.zeros(D))
 
-        # Heatmap encoding: pool to fixed grid, project to D.
+        # ── Target type embedding: person=0, null_in=1, null_out=2 ────────────
+        self.type_emb = nn.Embedding(3, De)
+
+        # ── Source node: heatmap cross-attention (kept from prior design) ─────
         hm_grid = 8
         self.hm_grid = hm_grid
         self.hm_pool = nn.AdaptiveAvgPool2d(hm_grid)
-        self.hm_proj = nn.Linear(1, D)
-        self.hm_pos_emb = nn.Parameter(torch.randn(hm_grid * hm_grid, D) * 0.02)
+        if use_node_xattn:
+            self.hm_proj        = nn.Linear(1, D)
+            self.hm_pos_emb     = nn.Parameter(torch.randn(hm_grid * hm_grid, D) * 0.02)
+            self.src_xattn      = CrossAttention(D, num_heads=heads)
+            self.src_xattn_norm = nn.LayerNorm(D)
+        else:
+            self.hm_proj = self.hm_pos_emb = self.src_xattn = self.src_xattn_norm = None
 
-        # Cross-attention for edge init: Pi'=xattn(Pi, hm_i), Pj'=xattn(Pj, hm_j)
-        self.src_xattn = CrossAttention(D, num_heads=heads)
-        self.tgt_xattn = CrossAttention(D, num_heads=heads)
-        self.src_xattn_norm = nn.LayerNorm(D)
-        self.tgt_xattn_norm = nn.LayerNorm(D)
+        # ── Node projections ──────────────────────────────────────────────────
+        self.node_src_proj = nn.Linear(D, De)   # source (XAttn-enriched)
+        self.node_tgt_proj = nn.Linear(D, De)   # all targets (persons + nulls)
 
-        # Edge init: [Pi' ; Pj' ; s_hm ; align] -> De
-        #   cross-attn appearance features + geometric prior (heatmap-target
-        #   overlap, gaze-target alignment) per PDF.
-        self.mlp_init = MLP(2 * D + 2, De, De)
+        # ── Target node: incoming gaze message from people looking at this bbox ─
+        self.tgt_msg_mlp  = MLP(2 * D, D, D)
+        self.tgt_msg_norm = nn.LayerNorm(D)
+        nn.init.zeros_(self.tgt_msg_mlp.fc2.weight)
+        nn.init.zeros_(self.tgt_msg_mlp.fc2.bias)
+
+        # ── Edge scalar prior projection (1-D → De) ─────────────────────────
+        self.linear_edge = nn.Linear(1, De)
         if use_prior:
             self.prior_w = nn.Parameter(torch.tensor(prior_weight))
 
-        # Node states live in edge space (De).
-        self.node_src_proj = nn.Linear(D, De)
-        self.node_tgt_proj = nn.Linear(D, De)
+        # ── Edge init MLP: cat(src_De, tgt_De, edge_De, type_De) → De ────────
+        self.mlp_init = MLP(4 * De, De, De)
 
-        # Asymmetric refinement with a SHARED person node:
-        #   LAH = outgoing role (person + null targets), SA = incoming role (regions),
-        #   fused at the person node via cross-attn(q=v, kv=MLP([msg_out ‖ sg(msg_in)])).
-        self.refiner = _FusedGazeRefiner(De, num_layers, heads)
+        # ── Unified refiner ───────────────────────────────────────────────────
+        self.refiner = _UnifiedRefiner(De, num_layers, heads)
 
-        # Per-type read-out heads (one logit per refined edge, 1/0 BCE). Separate
-        # heads keep SA's gradient off the LAH/null mapping; the shared single head
-        # (previous version) let SA dominate and eroded LAH precision.
-        self.head_lah  = _SocialReadoutHead(De)   # ê_{i→P_j}  → LAH
-        self.head_null = _SocialReadoutHead(De)   # ê_{i→O}    → out-of-frame
-        self.head_sa   = _SocialReadoutHead(De)   # ê_{i→R_j}  → SA / co-attention
+        # ── Readout heads ─────────────────────────────────────────────────────
+        # LAH: E[i→j] || LN(E[i→j] + XAttn(E[i→j], hm_feat[i]))
+        if use_node_xattn:
+            self.lah_hm_proj  = nn.Linear(D, De)
+            self.lah_hm_xattn = CrossAttention(De, num_heads=heads)
+            self.lah_hm_norm  = nn.LayerNorm(De)
+            self.head_lah     = _SocialReadoutHead(2 * De)
+        else:
+            self.lah_hm_proj = self.lah_hm_xattn = self.lah_hm_norm = None
+            self.head_lah    = _SocialReadoutHead(De)
+        self.head_laeo     = _SocialReadoutHead(2 * De)   # cat(E[i→j], E[j→i])
+        self.head_sa       = _SocialReadoutHead(5 * De)   # cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
+        self.head_null_in  = _SocialReadoutHead(De)
+        self.head_null_out = _SocialReadoutHead(De)
 
     @staticmethod
     def _safe_kpm(kpm: torch.Tensor) -> torch.Tensor:
-        # nn.TransformerEncoderLayer emits NaN for fully-masked sequences; unmask
-        # those rows (their outputs are discarded downstream via edge_valid).
         return kpm & ~kpm.all(dim=1, keepdim=True)
 
-    def forward(self, person_tokens, num_valid_people, region_anchors,
-                gaze_vecs, head_bboxes, gaze_heatmaps):
+    def forward(
+        self,
+        person_tokens,    # (B, T, N, D)
+        num_valid_people, # (B,)
+        gaze_vecs,        # (B, T, N, 2)
+        head_bboxes,      # (B, T, N, 4)
+        gaze_heatmaps,    # (B, T, N, Hh, Ww)
+        inout_logits,     # (B, T, N)   raw logit from inout_decoder
+    ):
         """
-        Args:
-            person_tokens:    (B, N, D)      B = b*t
-            num_valid_people: (B,)           valid people at BACK slots [N-nv .. N-1]
-            region_anchors:   (B, N, 2)      normalized (x, y) gaze-target of each person
-            gaze_vecs:        (B, N, 2)      unit gaze direction
-            head_bboxes:      (B, N, 4)      normalized [x1, y1, x2, y2]
-            gaze_heatmaps:    (B, N, Hh, Ww) per-person gaze heatmap
-
-        Targets (T = 2N+1):
-            P_1..P_N  person nodes  → LAH edges e_{i→P_j}
-            R_1..R_N  region nodes  → SA edges  e_{i→R_j}
-            O         null node     → out-of-frame edge e_{i→O}
-
         Returns:
-            lah_mat:   (B, N, N)  logits e_{i→P_j}
-            sa_mat:    (B, N, N)  logits e_{i→R_j}
-            null_vec:  (B, N)     logits e_{i→O}
-            edge_valid:(B, N, T)  validity mask
+            lah_mat:    (B, T, N, N)   LAH logits for all T frames
+            laeo_mat:   (B, T, N, N)   LAEO logits (learned MLP)
+            sa_mat:     (B, T, N, N)   SA logits  (symmetric, all T frames)
+            null_in:    (B, T, N)
+            null_out:   (B, T, N)
+            edge_valid: (B, N, 2N+2)   [0:N]=LAH, [N:2N]=SA-proxy,
+                                        [2N]=null_in, [2N+1]=null_out
         """
-        B, N, D = person_tokens.shape
+        B, T, N, D = person_tokens.shape
+        Hh, Ww = gaze_heatmaps.shape[-2:]
         device, dtype = person_tokens.device, person_tokens.dtype
         De = self.De
-        T  = 2 * N + 1
+        Tl = N + 2
 
+        # ── Validity mask (frame-independent) ────────────────────────────────
         node_valid = (
-            torch.arange(N, device=device).unsqueeze(0)
-            >= (N - num_valid_people.unsqueeze(1))
+            torch.arange(N, device=device).view(1, N)
+            >= (N - num_valid_people.view(B, 1))
         )  # (B, N)
+        eye = torch.eye(N, device=device, dtype=torch.bool)
 
-        # ── Target node features: [persons (updated below) | regions | null] ───
-        region_nodes = self.region_pos_mlp(region_anchors.to(dtype))           # (B, N, D)
-        # Inject person j's content into region node R_j (1:1 index-aligned xattn):
-        # R_j' = LN(R_j + CrossAttn(R_j, P_j)).
-        r_q  = region_nodes.reshape(B * N, 1, D)
-        p_kv = person_tokens.reshape(B * N, 1, D)
-        region_nodes = self.region_xattn_norm(
-            r_q + self.region_xattn(r_q, p_kv)
-        ).reshape(B, N, D)                                                      # (B, N, D)
-        null_node    = self.null_node.to(dtype).view(1, 1, D).expand(B, 1, D)
+        # person-to-person: valid src AND valid tgt AND no self-loop
+        p2p_valid = node_valid.unsqueeze(2) & node_valid.unsqueeze(1) & ~eye.unsqueeze(0)
+        # null_in / null_out: any valid source
+        null_valid = node_valid.unsqueeze(2)  # (B, N, 1)
 
-        # ── Validity / self-edge masks over targets ──────────────────────────
-        tgt_valid = torch.cat(
-            [node_valid, node_valid,
-             torch.ones(B, 1, dtype=torch.bool, device=device)], dim=1,
-        )                                                                      # (B, T)
-        eye       = torch.eye(N, device=device, dtype=torch.bool)
-        self_mask = torch.zeros(N, T, dtype=torch.bool, device=device)        # (N, T)
-        self_mask[:, :N]      = eye    # i → P_i
-        self_mask[:, N:2 * N] = eye    # i → R_i
-        edge_valid = (
-            node_valid.unsqueeze(2) & tgt_valid.unsqueeze(1) & ~self_mask.unsqueeze(0)
-        )                                                                      # (B, N, T)
-        ev = edge_valid.unsqueeze(-1).to(dtype)                                # (B, N, T, 1)
+        ev_bool = torch.cat([
+            p2p_valid,                           # (B, N, N)   person targets
+            null_valid.expand(B, N, 1),          # null_in
+            null_valid.expand(B, N, 1),          # null_out
+        ], dim=2)  # (B, N, Tl)
 
-        # ── Heatmap features: pool to P×P grid, project to D ────────────────
-        Hh, Ww = gaze_heatmaps.shape[-2:]
-        P = self.hm_grid ** 2
-        # detach: graph reads the heatmap as a fixed evidence signal so social
-        # loss gradients don't corrupt heatmap decoder training.
-        hm_small = self.hm_pool(gaze_heatmaps.reshape(B * N, 1, Hh, Ww).detach())  # (B*N, 1, g, g)
-        hm_feat  = (
-            self.hm_proj(hm_small.reshape(B * N, P, 1).to(dtype))
-            + self.hm_pos_emb.to(dtype)
-        )                                                                      # (B*N, P, D)
+        # expand over T
+        ev_bool_T = ev_bool.unsqueeze(1).expand(B, T, N, Tl)  # (B, T, N, Tl)
+        ev = ev_bool_T.unsqueeze(-1).to(dtype)                 # (B, T, N, Tl, 1)
 
-        # ── Source cross-attention: Pi' = LN(Pi + CrossAttn(Pi, hm_i)) ──────
-        src_q   = person_tokens.reshape(B * N, 1, D)                          # (B*N, 1, D)
-        src_prime = self.src_xattn_norm(
-            src_q + self.src_xattn(src_q, hm_feat)
-        ).reshape(B, N, D)                                                    # (B, N, D)
+        # ── Source node init: Pi' = LN(Pi + XAttn(Pi, hm_i)) ─────────────────
+        hm_flat  = gaze_heatmaps.reshape(B * T * N, 1, Hh, Ww).detach()
+        P_hm     = self.hm_grid ** 2
+        hm_small = self.hm_pool(hm_flat)                        # (B*T*N, 1, g, g)
+        if self.use_node_xattn:
+            hm_feat = (
+                self.hm_proj(hm_small.reshape(B * T * N, P_hm, 1).to(dtype))
+                + self.hm_pos_emb.to(dtype)
+            )                                                    # (B*T*N, P_hm, D)
+            src_q     = person_tokens.reshape(B * T * N, 1, D)
+            src_prime = self.src_xattn_norm(
+                src_q + self.src_xattn(src_q, hm_feat)
+            ).reshape(B, T, N, D)
+        else:
+            src_prime = person_tokens   # (B, T, N, D)
+            hm_feat = None
 
-        # ── Target cross-attention for person nodes: Pj' = LN(Pj + CrossAttn(Pj, hm_j))
-        # Region/null targets keep their existing features unchanged.
-        tgt_q  = person_tokens.reshape(B * N, 1, D)                           # (B*N, 1, D)
-        tgt_prime_persons = self.tgt_xattn_norm(
-            tgt_q + self.tgt_xattn(tgt_q, hm_feat)
-        ).reshape(B, N, D)                                                    # (B, N, D)
+        # ── Heatmap normalisation for overlap prior ───────────────────────────
+        hm_norm = hm_flat.squeeze(1).reshape(B * T, N, Hh, Ww).float()
+        hm_norm = torch.relu(hm_norm)
+        hm_norm = hm_norm / (hm_norm.sum((-2, -1), keepdim=True) + 1e-6)
 
-        tgt_nodes = torch.cat([tgt_prime_persons, region_nodes, null_node], 1)  # (B, T, D)
+        # ── Geometric edge features ───────────────────────────────────────────
+        bboxes_bt = head_bboxes.reshape(B * T, N, 4).float()
+        overlap   = _compute_bbox_overlap(hm_norm, bboxes_bt)           # (BT, N, N)
+        overlap   = overlap.to(dtype).reshape(B, T, N, N)
 
-        # ── Edge evidence [s_hm, align] (geometric prior, per PDF) ────────────
-        evidence = torch.zeros(B, N, T, 2, device=device, dtype=dtype)
+        in_prob          = torch.sigmoid(inout_logits)                  # (B, T, N)
+        person_bbox_mass = overlap.sum(-1).clamp(max=1.0)              # (B, T, N)
+        null_in_prior    = 1.0 - person_bbox_mass
+        null_out_prior   = 1.0 - in_prob
+
+        # 1D scalar prior per edge — all derived as "high = this edge likely active",
+        # all in [0,1], forming a 2-level soft distribution:
+        #   Level 1 (in/out): in_prob ↔ null_out = 1 - in_prob
+        #   Level 2 (in-frame): overlap(H_i, b_j) per person ↔ null_in = 1 - Σ_j overlap
+        # p2p=i's heatmap mass on j's bbox, null_in=in-frame mass not on anyone,
+        # null_out=out-of-frame probability from the in/out head.
+        feat_p2p = overlap.unsqueeze(-1)                              # (B, T, N, N, 1)
+        feat_ni  = null_in_prior.unsqueeze(3).unsqueeze(-1)
+        feat_no  = null_out_prior.unsqueeze(3).unsqueeze(-1)
+        feat_all = torch.cat([feat_p2p, feat_ni, feat_no], dim=3)  # (B, T, N, Tl, 1)
+
+        # ── Node projections ──────────────────────────────────────────────────
+        v_src = self.node_src_proj(src_prime)   # (B, T, N, De)
+
+        # Target person update: for target j, aggregate source tokens whose
+        # heatmaps overlap bbox_j, then inject the incoming-looking message.
+        tgt_scores = overlap.masked_fill(~p2p_valid.unsqueeze(1), float("-inf"))
+        no_incoming = torch.isinf(tgt_scores).all(dim=2, keepdim=True)
+        tgt_scores = tgt_scores.masked_fill(no_incoming, 0.0)
+        tgt_w = F.softmax(tgt_scores, dim=2).masked_fill(no_incoming, 0.0)
+        tgt_msg = torch.einsum("btij,btid->btjd", tgt_w, person_tokens)
+        tgt_gate = overlap.masked_fill(~p2p_valid.unsqueeze(1), 0.0).amax(dim=2)
+        tgt_delta = self.tgt_msg_norm(
+            self.tgt_msg_mlp(torch.cat([person_tokens, tgt_msg], dim=-1))
+        )
+        tgt_person_tokens = (
+            person_tokens + tgt_gate.unsqueeze(-1).to(dtype) * tgt_delta
+        ).to(dtype)
+
+        null_in_t  = self.null_in_node.to(dtype).view(1, 1, 1, D).expand(B, T, 1, D)
+        null_out_t = self.null_out_node.to(dtype).view(1, 1, 1, D).expand(B, T, 1, D)
+        tgt_tokens = torch.cat([tgt_person_tokens, null_in_t, null_out_t], dim=2)  # (B, T, Tl, D)
+        v_tgt = self.node_tgt_proj(tgt_tokens)  # (B, T, Tl, De)
+
+        # ── Type embeddings ───────────────────────────────────────────────────
+        type_ids = torch.cat([
+            torch.zeros(N, dtype=torch.long, device=device),
+            torch.ones(1,  dtype=torch.long, device=device),
+            torch.full((1,), 2, dtype=torch.long, device=device),
+        ])  # (Tl,)
+        type_e = self.type_emb(type_ids).view(1, 1, 1, Tl, De)  # broadcast
+
+        # ── Edge initialisation ───────────────────────────────────────────────
+        src_proj     = v_src.unsqueeze(3).expand(B, T, N, Tl, De)
+        tgt_proj     = v_tgt.unsqueeze(2).expand(B, T, N, Tl, De)
         if self.use_prior:
-            centers = (head_bboxes[..., :2] + head_bboxes[..., 2:]) / 2        # (B, N, 2)
-            # target locations: person → head center, region → gaze anchor (2N pts)
-            tgt_loc = torch.cat([centers, region_anchors], dim=1)             # (B, 2N, 2)
+            edge_feat_e = self.prior_w * self.linear_edge(
+                feat_all.reshape(B * T * N * Tl, 1)
+            ).reshape(B, T, N, Tl, De)
+        else:
+            edge_feat_e = torch.zeros(B, T, N, Tl, De, device=device, dtype=dtype)
+        type_exp = type_e.expand(B, T, N, Tl, De)
 
-            # ① gaze-target alignment: gaze_i · dir(center_i → loc_t)
-            dir_t = F.normalize(tgt_loc.unsqueeze(1) - centers.unsqueeze(2), dim=-1)
-            align = (gaze_vecs.unsqueeze(2) * dir_t).sum(-1)                   # (B, N, 2N)
-
-            # ② heatmap-target overlap: H_i (detached) sampled at loc_t (bilinear)
-            heat = gaze_heatmaps.reshape(B * N, 1, Hh, Ww).detach().float()
-            grid = (2.0 * tgt_loc - 1.0).unsqueeze(1).expand(B, N, 2 * N, 2)
-            grid = grid.reshape(B * N, 2 * N, 1, 2).float()
-            s_hm = F.grid_sample(
-                heat, grid, mode="bilinear", padding_mode="zeros", align_corners=False
-            ).reshape(B, N, 2 * N).to(dtype)                                   # (B, N, 2N)
-
-            evidence[:, :, :2 * N, 0] = s_hm
-            evidence[:, :, :2 * N, 1] = align
-            evidence = self.prior_w * evidence
-
-        # ── Edge initialisation: e^0 = MLP([Pi' ; Pj' ; s_hm ; align]) ────────
-        src_e = src_prime.unsqueeze(2).expand(B, N, T, D)
-        tgt_e = tgt_nodes.unsqueeze(1).expand(B, N, T, D)
         E = self.mlp_init(
-            torch.cat([src_e, tgt_e, evidence], dim=-1).reshape(B * N * T, -1)
-        ).reshape(B, N, T, De) * ev
+            torch.cat([src_proj, tgt_proj, edge_feat_e, type_exp], dim=-1)
+            .reshape(B * T * N * Tl, 4 * De)
+        ).reshape(B, T, N, Tl, De) * ev
 
-        node_src = self.node_src_proj(src_prime)   # (B, N, De)  shared person node v init
-        node_tgt = self.node_tgt_proj(tgt_nodes)   # (B, T, De)  target-node init
-
-        # ── Asymmetric paths over disjoint target subsets, fused at v ────────
-        #   LAH (outgoing): persons [0:N] + null [2N]   → (B, N, N+1)
-        #   SA  (incoming): regions [N:2N]              → (B, N, N)
-        null_col = slice(2 * N, 2 * N + 1)
-        gather_lah = lambda x: torch.cat([x[:, :, :N], x[:, :, null_col]], dim=2)
-
-        E_lah  = gather_lah(E)                      # (B, N, N+1, De)
-        E_sa   = E[:, :, N:2 * N]                   # (B, N, N,   De)
-        ev_lah = gather_lah(ev)                     # (B, N, N+1, 1)
-        ev_sa  = ev[:, :, N:2 * N]                  # (B, N, N,   1)
-
-        v      = node_src                           # (B, N,   De)  shared person node
-        v_null = node_tgt[:, null_col]              # (B, 1,   De)
-        v_reg  = node_tgt[:, N:2 * N]               # (B, N,   De)
-
-        valid_lah = gather_lah(edge_valid.unsqueeze(-1)).squeeze(-1)           # (B, N, N+1)
-        valid_sa  = edge_valid[:, :, N:2 * N]                                  # (B, N, N)
-
-        row_kpm = self._safe_kpm((~valid_lah).reshape(B * N, N + 1))           # LAH: over targets
-        col_kpm = self._safe_kpm((~valid_sa).permute(0, 2, 1).reshape(B * N, N))  # SA: over sources
-        deg_out = valid_lah[:, :, :N].sum(2, keepdim=True).clamp(min=1).to(dtype)  # (B, N, 1)
-        deg_in  = valid_sa.sum(1).clamp(min=1).to(dtype).unsqueeze(-1)         # (B, N, 1) per region
-        deg_null = valid_lah[:, :, N].sum(1, keepdim=True).clamp(min=1).to(dtype).unsqueeze(-1)  # (B,1,1)
-
-        E_lah, E_sa = self.refiner(
-            E_lah, E_sa, v, v_null, v_reg,
-            ev_lah, ev_sa, row_kpm, col_kpm, deg_out, deg_in, deg_null,
+        # ── KPMs ─────────────────────────────────────────────────────────────
+        row_kpm = self._safe_kpm((~ev_bool_T).reshape(B * T * N, Tl))
+        col_ev  = ev_bool_T[:, :, :, :N + 1]
+        col_kpm = self._safe_kpm(
+            (~col_ev).permute(0, 1, 3, 2).reshape(B * T * (N + 1), N)
         )
 
-        # ── Per-type read-out (one logit per refined edge, 1/0 BCE) ──────────
-        lah_mat  = self.head_lah(E_lah[:, :, :N].reshape(B * N * N, De)).reshape(B, N, N)
-        null_vec = self.head_null(E_lah[:, :, N].reshape(B * N, De)).reshape(B, N)
-        sa_mat   = self.head_sa(E_sa.reshape(B * N * N, De)).reshape(B, N, N)
-        return lah_mat.float(), sa_mat.float(), null_vec.float(), edge_valid
+        deg_out = ev_bool_T[:, :, :, :N].sum(3).clamp(min=1).to(dtype).unsqueeze(-1)
+        deg_in  = ev_bool_T.sum(2).clamp(min=1).to(dtype).unsqueeze(-1)
+
+        # ── Refinement ────────────────────────────────────────────────────────
+        E, v_src, v_tgt = self.refiner(E, ev, row_kpm, col_kpm, v_src, v_tgt, deg_out, deg_in)
+
+        # ── Readout (all T frames) ────────────────────────────────────────────
+        E_pp = E[:, :, :, :N, :]   # person-to-person edges (B, T, N, N, De)
+
+        # LAH: E[i→j] || LN(E[i→j] + XAttn(E[i→j], hm_feat[i]))
+        if self.use_node_xattn:
+            hm_kv  = self.lah_hm_proj(hm_feat.to(dtype))   # (B*T*N, P_hm, De)
+            E_pp_q = E_pp.reshape(B * T * N, N, De)
+            hm_ctx = self.lah_hm_norm(
+                E_pp_q + self.lah_hm_xattn(E_pp_q, hm_kv)
+            )                                                 # (B*T*N, N, De)
+            lah_mat = self.head_lah(
+                torch.cat([E_pp_q, hm_ctx], dim=-1)
+                .reshape(B * T * N * N, 2 * De)
+            ).reshape(B, T, N, N)
+        else:
+            lah_mat = self.head_lah(
+                E_pp.reshape(B * T * N * N, De)
+            ).reshape(B, T, N, N)
+
+        # LAEO: MLP(cat(E[i→j], E[j→i])) — average both orderings for exact symmetry
+        laeo_mat = self.head_laeo(
+            torch.cat([E_pp, E_pp.transpose(2, 3)], dim=-1)
+            .reshape(B * T * N * N, 2 * De)
+        ).reshape(B, T, N, N)
+        laeo_mat = (laeo_mat + laeo_mat.transpose(2, 3)) * 0.5
+
+        # SA: cat(ni_i, ni_j, |ni_i-ni_j|, E[i→j], E[j→i]) — null_in 응시 패턴 기반
+        ni     = E[:, :, :, N, :]                          # E[i→null_in] (B, T, N, De)
+        ni_i   = ni.unsqueeze(3).expand(B, T, N, N, De)    # i의 장면 응시 패턴
+        ni_j   = ni.unsqueeze(2).expand(B, T, N, N, De)    # j의 장면 응시 패턴
+        ni_dif = (ni_i - ni_j).abs()                       # 두 패턴 차이 크기
+        sa_mat = self.head_sa(
+            torch.cat([ni_i, ni_j, ni_dif, E_pp, E_pp.transpose(2, 3)], dim=-1)
+            .reshape(B * T * N * N, 5 * De)
+        ).reshape(B, T, N, N)
+        sa_mat = (sa_mat + sa_mat.transpose(2, 3)) * 0.5
+
+        # null_in / null_out
+        null_in_out  = self.head_null_in(
+            E[:, :, :, N, :].reshape(B * T * N, De)
+        ).reshape(B, T, N)
+        null_out_out = self.head_null_out(
+            E[:, :, :, N + 1, :].reshape(B * T * N, De)
+        ).reshape(B, T, N)
+
+        # edge_valid: (B, N, 2N+2) — frame-independent
+        edge_valid = torch.cat([
+            ev_bool[:, :, :N],   # [0:N]   LAH person targets
+            ev_bool[:, :, :N],   # [N:2N]  SA proxy (same p2p mask)
+            ev_bool[:, :, N:],   # [2N:2N+2] null_in + null_out
+        ], dim=2)
+
+        return (
+            lah_mat.float(), laeo_mat.float(), sa_mat.float(),
+            null_in_out.float(), null_out_out.float(), edge_valid,
+        )

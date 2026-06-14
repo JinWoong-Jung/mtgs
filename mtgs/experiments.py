@@ -51,9 +51,7 @@ class Experiment:
         self.model = MTGSModel(self.cfg)
 
         # Create training logger using wandb
-        self.train_logger = False
-        if "train" in self.tasks:
-            self.train_logger = create_train_logger(self.cfg)
+        self.train_logger = create_train_logger(self.cfg)
 
         # Initialize callbacks (for training)
         self.callbacks = None
@@ -116,6 +114,13 @@ class Experiment:
         """Test the trained MTGS model"""
         ckpt = self.cfg.test.checkpoint if ("train" not in self.tasks) else "best"
         logger.info(f"Testing model from: {ckpt}")
+
+        # When test follows training, advance the internal batch counter by 1 so that
+        # test metrics are logged at a strictly higher wandb step than the final
+        # training/validation metrics (prevents step collision that hides them in wandb).
+        if "train" in self.tasks:
+            self.trainer.fit_loop.epoch_loop._batches_that_stepped += 1
+
         self.trainer.test(self.model, self.data, ckpt_path=ckpt, verbose=True)
 
     def run(self) -> None:
