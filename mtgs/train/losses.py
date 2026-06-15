@@ -95,7 +95,7 @@ def compute_social_loss(
     coatt_is_prob=False,
 ):
     lah_loss = social_loss(lah_pred, lah_gt, lah_mask, pos_weight=3.0)
-    laeo_loss = focal_social_loss(laeo_pred, laeo_gt, laeo_mask)
+    laeo_loss = social_loss(laeo_pred, laeo_gt, laeo_mask)
     coatt_loss = (
         social_loss_prob(coatt_pred, coatt_gt, coatt_mask)
         if coatt_is_prob
