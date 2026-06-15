@@ -494,17 +494,10 @@ class GazeGraphBlock(nn.Module):
         self.refiner = _UnifiedRefiner(De, num_layers, heads)
 
         # ── Readout heads ─────────────────────────────────────────────────────
-        # LAH: E[i→j] || LN(E[i→j] + XAttn(E[i→j], hm_feat[i]))
-        if use_node_xattn:
-            self.lah_hm_proj  = nn.Linear(D, De)
-            self.lah_hm_xattn = CrossAttention(De, num_heads=heads)
-            self.lah_hm_norm  = nn.LayerNorm(De)
-            self.head_lah     = _SocialReadoutHead(2 * De)
-        else:
-            self.lah_hm_proj = self.lah_hm_xattn = self.lah_hm_norm = None
-            self.head_lah    = _SocialReadoutHead(De)
+        # SA:   ni_i   || ni_j          || |ni_i - ni_j|   (pure scene-gaze comparison)
+        self.head_lah      = _SocialReadoutHead(De)
         self.head_laeo     = _SocialReadoutHead(2 * De)   # cat(E[i→j], E[j→i])
-        self.head_sa       = _SocialReadoutHead(5 * De)   # cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
+        self.head_sa       = _SocialReadoutHead(5 * De)   # cat(ni_i, no_j, |ni_i-ni_j|, E[i→j], E[j→i])
         self.head_null_in  = _SocialReadoutHead(De)
         self.head_null_out = _SocialReadoutHead(De)
 
@@ -591,16 +584,17 @@ class GazeGraphBlock(nn.Module):
         null_in_prior    = 1.0 - person_bbox_mass
         null_out_prior   = 1.0 - in_prob
 
-        # 1D scalar prior per edge — all derived as "high = this edge likely active",
-        # all in [0,1], forming a 2-level soft distribution:
-        #   Level 1 (in/out): in_prob ↔ null_out = 1 - in_prob
-        #   Level 2 (in-frame): overlap(H_i, b_j) per person ↔ null_in = 1 - Σ_j overlap
-        # p2p=i's heatmap mass on j's bbox, null_in=in-frame mass not on anyone,
-        # null_out=out-of-frame probability from the in/out head.
-        feat_p2p = overlap.unsqueeze(-1)                              # (B, T, N, N, 1)
+        # p2p prior: cos(gaze_vec[i], normalize(center[j] - center[i]))
+        centers  = (head_bboxes[..., :2] + head_bboxes[..., 2:]) * 0.5  # (B, T, N, 2)
+        dir_ij   = F.normalize(
+            centers.unsqueeze(3) - centers.unsqueeze(2), dim=-1
+        )                                                                 # (B, T, N, N, 2)
+        align    = (gaze_vecs.unsqueeze(3) * dir_ij).sum(-1)             # (B, T, N, N) ∈ [-1,1]
+
+        feat_p2p = align.unsqueeze(-1)                                   # (B, T, N, N, 1)
         feat_ni  = null_in_prior.unsqueeze(3).unsqueeze(-1)
         feat_no  = null_out_prior.unsqueeze(3).unsqueeze(-1)
-        feat_all = torch.cat([feat_p2p, feat_ni, feat_no], dim=3)  # (B, T, N, Tl, 1)
+        feat_all = torch.cat([feat_p2p, feat_ni, feat_no], dim=3)       # (B, T, N, Tl, 1)
 
         # ── Node projections ──────────────────────────────────────────────────
         v_src = self.node_src_proj(src_prime)   # (B, T, N, De)
@@ -665,21 +659,9 @@ class GazeGraphBlock(nn.Module):
         # ── Readout (all T frames) ────────────────────────────────────────────
         E_pp = E[:, :, :, :N, :]   # person-to-person edges (B, T, N, N, De)
 
-        # LAH: E[i→j] || LN(E[i→j] + XAttn(E[i→j], hm_feat[i]))
-        if self.use_node_xattn:
-            hm_kv  = self.lah_hm_proj(hm_feat.to(dtype))   # (B*T*N, P_hm, De)
-            E_pp_q = E_pp.reshape(B * T * N, N, De)
-            hm_ctx = self.lah_hm_norm(
-                E_pp_q + self.lah_hm_xattn(E_pp_q, hm_kv)
-            )                                                 # (B*T*N, N, De)
-            lah_mat = self.head_lah(
-                torch.cat([E_pp_q, hm_ctx], dim=-1)
-                .reshape(B * T * N * N, 2 * De)
-            ).reshape(B, T, N, N)
-        else:
-            lah_mat = self.head_lah(
-                E_pp.reshape(B * T * N * N, De)
-            ).reshape(B, T, N, N)
+        lah_mat = self.head_lah(
+            E_pp.reshape(B * T * N * N, De)
+        ).reshape(B, T, N, N)
 
         # LAEO: MLP(cat(E[i→j], E[j→i])) — average both orderings for exact symmetry
         laeo_mat = self.head_laeo(
@@ -688,13 +670,15 @@ class GazeGraphBlock(nn.Module):
         ).reshape(B, T, N, N)
         laeo_mat = (laeo_mat + laeo_mat.transpose(2, 3)) * 0.5
 
-        # SA: cat(ni_i, ni_j, |ni_i-ni_j|, E[i→j], E[j→i]) — null_in 응시 패턴 기반
-        ni     = E[:, :, :, N, :]                          # E[i→null_in] (B, T, N, De)
-        ni_i   = ni.unsqueeze(3).expand(B, T, N, N, De)    # i의 장면 응시 패턴
-        ni_j   = ni.unsqueeze(2).expand(B, T, N, N, De)    # j의 장면 응시 패턴
-        ni_dif = (ni_i - ni_j).abs()                       # 두 패턴 차이 크기
+        # SA: ni_i || no_j || |ni_i - ni_j| || E[i→j] || E[j→i]
+        ni     = E[:, :, :, N,     :]   # E[i→null_in]  (B, T, N, De)
+        no     = E[:, :, :, N + 1, :]   # E[i→null_out] (B, T, N, De)
+        ni_i   = ni.unsqueeze(3).expand(B, T, N, N, De)   # i's null_in, broadcast over j
+        no_j   = no.unsqueeze(2).expand(B, T, N, N, De)   # j's null_out, broadcast over i
+        ni_j   = ni.unsqueeze(2).expand(B, T, N, N, De)   # j's null_in (for diff only)
+        ni_dif = (ni_i - ni_j).abs()
         sa_mat = self.head_sa(
-            torch.cat([ni_i, ni_j, ni_dif, E_pp, E_pp.transpose(2, 3)], dim=-1)
+            torch.cat([ni_i, no_j, ni_dif, E_pp, E_pp.transpose(2, 3)], dim=-1)
             .reshape(B * T * N * N, 5 * De)
         ).reshape(B, T, N, N)
         sa_mat = (sa_mat + sa_mat.transpose(2, 3)) * 0.5
