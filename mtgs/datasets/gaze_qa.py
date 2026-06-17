@@ -53,7 +53,10 @@ class GazeQACollator:
 
         all_pairs: List[QAPair] = []
         for b in range(B):
-            nv = int(batch["num_valid_people"][b, 0].item())
+            nv_all = batch["num_valid_people"]
+            nv_idx = t_c if nv_all.shape[1] > t_c else 0
+            nv_t = nv_all[b, nv_idx]
+            nv = int(nv_t.reshape(-1)[0].item())
             valid_start = N_padded - nv
             valid = range(valid_start, N_padded)
 

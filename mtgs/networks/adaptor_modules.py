@@ -432,7 +432,7 @@ class GazeGraphBlock(nn.Module):
     Readout (all T frames → (B,T,N,N) / (B,T,N) outputs):
       LAH    : head_lah(E[:,:,:,:N])
       LAEO   : head_laeo(cat(E[i,j], E[j,i]))       — learned MLP
-      SA     : head_sa(cat(E[i→null_in], E[j→null_in], |diff|, E[i→j], E[j→i]))
+      SA     : head_sa(cat(E[i→null_in], E[j→null_in], |E[i→null_in]-E[j→null_in]|, E[i→j], E[j→i]))
       null_in : head_null_in(E[:,:,:,N])
       null_out: head_null_out(E[:,:,:,N+1])
     """
@@ -670,15 +670,13 @@ class GazeGraphBlock(nn.Module):
         ).reshape(B, T, N, N)
         laeo_mat = (laeo_mat + laeo_mat.transpose(2, 3)) * 0.5
 
-        # SA: ni_i || no_j || |ni_i - ni_j| || E[i→j] || E[j→i]
-        ni     = E[:, :, :, N,     :]   # E[i→null_in]  (B, T, N, De)
-        no     = E[:, :, :, N + 1, :]   # E[i→null_out] (B, T, N, De)
-        ni_i   = ni.unsqueeze(3).expand(B, T, N, N, De)   # i's null_in, broadcast over j
-        no_j   = no.unsqueeze(2).expand(B, T, N, N, De)   # j's null_out, broadcast over i
-        ni_j   = ni.unsqueeze(2).expand(B, T, N, N, De)   # j's null_in (for diff only)
+        # SA: ni_i || ni_j || |ni_i - ni_j| || E[i→j] || E[j→i]
+        ni     = E[:, :, :, N, :]                                          # E[i→null_in] (B, T, N, De)
+        ni_i   = ni.unsqueeze(3).expand(B, T, N, N, De)
+        ni_j   = ni.unsqueeze(2).expand(B, T, N, N, De)
         ni_dif = (ni_i - ni_j).abs()
         sa_mat = self.head_sa(
-            torch.cat([ni_i, no_j, ni_dif, E_pp, E_pp.transpose(2, 3)], dim=-1)
+            torch.cat([ni_i, ni_j, ni_dif, E_pp, E_pp.transpose(2, 3)], dim=-1)
             .reshape(B * T * N * N, 5 * De)
         ).reshape(B, T, N, N)
         sa_mat = (sa_mat + sa_mat.transpose(2, 3)) * 0.5

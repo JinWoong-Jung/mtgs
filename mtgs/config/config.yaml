@@ -52,11 +52,12 @@ gaze_graph:
 
 # ── VLM Reasoner (Stage B: frozen MTGS + trainable cross-attn) ──────────────
 vlm:
-  backbone: "Qwen/Qwen3-VL-8B-Instruct"    # HF repo or local path
+  backbone: "/home/jinwoongjung/QWEN_GazeEstimation/model/Qwen3-VL-4B-Instruct"    # HF repo or local path
+  visual_encoder: false                      # true: prepend scene visual tokens; false: text+graph only
   load_dtype: "bf16"
   memory_tokens_m: 32                       # G_VLM token count M
   tokenizer_depth: 1                        # set-to-token MHA depth
-  # Qwen3-VL-8B: 36 layers, full_attention_interval=4 → Full Attention at [3,7,...,35]
+  # Qwen3-VL-4B/8B: 36 layers, full_attention_interval=4 → Full Attention at [3,7,...,35]
   cross_attn_layer_indices: [3,7,11,15,19,23,27,31,35]
   gate_init: 0.0                            # g_ℓ 0-init (identity at warmup start)
   tasks: ["lah", "laeo", "sa"]
@@ -64,7 +65,7 @@ vlm:
 
   # Precomputed center-frame graph features (offline extraction → skip MTGS at train).
   feature_cache:
-    use: false                              # true: train from cache (no MTGS backbone)
+    use: true                              # true: train from cache (no MTGS backbone)
     dir: /home/jinwoongjung/MTGS/data/vlm_feature_cache  # holds train.h5 / val.h5
 
   optimizer:
@@ -72,9 +73,9 @@ vlm:
     weight_decay: 0.01
 
   scheduler:
-    type: cosine        # "cosine" | null
-    warmup_epochs: 2
-    t_max_epochs: 20    # should match train.epochs
+    type: CosineAnnealingLR        # "cosine" | null
+    warmup_epochs: 0
+    t_max_epochs: 5    # should match train.epochs
 
   # Prompt templates: {src_bbox} and {dst_bbox} are substituted at runtime.
   # Remove the bbox placeholders for no-grounding ablation.

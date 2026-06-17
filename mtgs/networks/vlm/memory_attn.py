@@ -21,7 +21,8 @@ class MemoryCrossAttn(nn.Module):
         # h: (B, seq_len, d_model)
         # G: (B, M, d_model)
         delta, _ = self.attn(h, G, G)
-        return h + self.gate * self.norm(delta)
+        update = (self.gate * self.norm(delta)).to(h.dtype)  # preserve hidden-state dtype
+        return h + update
 
 
 class MemoryAugmentedLayer(nn.Module):
@@ -41,8 +42,12 @@ class MemoryAugmentedLayer(nn.Module):
 
     def forward(self, *args, **kwargs):
         out = self.layer(*args, **kwargs)
-        if self._G_LLM is not None:
-            h = out[0]                              # hidden states are first element
-            h = self.cross_attn(h, self._G_LLM)
-            out = (h,) + out[1:]
-        return out
+        if self._G_LLM is None:
+            return out
+        # Qwen3-VL decoder layers return a bare hidden-state tensor; older HF
+        # decoder layers return a tuple (hidden_states, ...). Support both so the
+        # wrapper never changes the layer's output contract.
+        if isinstance(out, tuple):
+            h = self.cross_attn(out[0], self._G_LLM)
+            return (h,) + out[1:]
+        return self.cross_attn(out, self._G_LLM)

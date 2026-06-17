@@ -99,6 +99,11 @@ def _process_laeo_pp(res):
 # ── Main compute function ──────────────────────────────────────────────────
 
 def compute(results, dataset=None, shuffle=False, thr=0.5):
+    """Compute all VSGaze metrics and return a dict of scalar values.
+
+    Returns keys: lah_ap, lah_auc, laeo_ap, laeo_auc, coatt_ap, coatt_auc,
+    social_ap, and optionally dist, ap_io, f1_lah_pp, f1_laeo_pp.
+    """
     gf_metrics = GFTestDistance()
     logger.info("Computing metrics...")
     if shuffle:
@@ -119,19 +124,20 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
         if dataset is not None and batch["dataset"][0] != dataset:
             continue
 
-        # ── Distance ──────────────────────────────────────────────────────
-        if batch["dataset"][0] == "gazefollow":
-            test_dist_to_avg, _, test_min_dist = gf_metrics(
-                batch["gp_pred"].cpu(), batch["gp_gt"].cpu()
-            )
-            avg_distances.append(test_dist_to_avg.unsqueeze(0))
-            distances.append(test_min_dist.unsqueeze(0))
-        else:
-            dist = (batch["gp_pred"] - batch["gp_gt"]).norm(2, dim=-1)
-            distances.append(dist[batch["inout_gt"] == 1].cpu())
+        # ── Distance (N/A for VLM-only test_predictions.p) ───────────────
+        if "gp_pred" in batch:
+            if batch["dataset"][0] == "gazefollow":
+                test_dist_to_avg, _, test_min_dist = gf_metrics(
+                    batch["gp_pred"].cpu(), batch["gp_gt"].cpu()
+                )
+                avg_distances.append(test_dist_to_avg.unsqueeze(0))
+                distances.append(test_min_dist.unsqueeze(0))
+            else:
+                dist = (batch["gp_pred"] - batch["gp_gt"]).norm(2, dim=-1)
+                distances.append(dist[batch["inout_gt"] == 1].cpu())
 
-        # ── In-out ────────────────────────────────────────────────────────
-        if batch["dataset"][0] in ["videoattentiontarget", "childplay"]:
+        # ── In-out (N/A for VLM-only test_predictions.p) ─────────────────
+        if "inout_pred" in batch and batch["dataset"][0] in ["videoattentiontarget", "childplay"]:
             mask = batch["inout_gt"] != -1
             inout_gt_all.append(batch["inout_gt"][mask].cpu())
             inout_pred_all.append(batch["inout_pred"][mask].cpu())
@@ -208,14 +214,24 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
             coatt_gt_all.append(batch_coatt_gt.cpu())
             coatt_pred_all.append(batch_coatt_pred.float().cpu())
 
-        # ── PP (geometric) ────────────────────────────────────────────────
-        sq = {k: v.squeeze(0) if hasattr(v, "squeeze") else v
-              for k, v in batch.items()}
-        g, p = _process_lah_pp(sq)
-        lah_pp_gt_all.extend(g); lah_pp_pred_all.extend(p)
+        # ── PP geometric (N/A for VLM-only test_predictions.p) ───────────
+        if "gp_pred" in batch:
+            sq = {k: v.squeeze(0) if hasattr(v, "squeeze") else v
+                  for k, v in batch.items()}
+            g, p = _process_lah_pp(sq)
+            lah_pp_gt_all.extend(g); lah_pp_pred_all.extend(p)
 
-        g, p = _process_laeo_pp(sq)
-        laeo_pp_gt_all.extend(g); laeo_pp_pred_all.extend(p)
+            g, p = _process_laeo_pp(sq)
+            laeo_pp_gt_all.extend(g); laeo_pp_pred_all.extend(p)
+
+    import numpy as np
+    lah_pp_gt   = np.array(lah_pp_gt_all)
+    lah_pp_pred = np.array(lah_pp_pred_all)
+    pp_mask     = lah_pp_gt != -1
+    laeo_pp_gt   = np.array(laeo_pp_gt_all)
+    laeo_pp_pred = np.array(laeo_pp_pred_all)
+
+    ret = {}   # collected scalar values to return
 
     # ══════════════════════════════════════════════════════════════════════
     # Block 1: README 지표 (Dist / AP_IO / F1_LAH PP / F1_LAEO PP / AP_SA)
@@ -225,45 +241,39 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
     logger.info("  PRIMARY METRICS  (VSGaze test set — README table)")
     logger.info("=" * 60)
 
-    # Dist
     if distances:
         dist_val = torch.cat(distances).mean().item()
         logger.info("Dist        : %.4f", dist_val)
+        ret["dist"] = dist_val
     if avg_distances:
         logger.info("Avg Dist    : %.4f", torch.cat(avg_distances).mean().item())
 
-    # AP_IO
     if inout_gt_all:
         ap_io = average_precision_score(
             torch.cat(inout_gt_all).float().numpy(),
             torch.cat(inout_pred_all).float().numpy(),
         )
         logger.info("AP_IO       : %.4f", ap_io)
+        ret["ap_io"] = ap_io
 
-    # F1_LAH (PP)
-    import numpy as np
-    lah_pp_gt = np.array(lah_pp_gt_all)
-    lah_pp_pred = np.array(lah_pp_pred_all)
-    pp_mask = lah_pp_gt != -1
-    if pp_mask.sum() > 0:
+    if lah_pp_gt_all and pp_mask.sum() > 0:
         f1_lah_pp = f1_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask])
         logger.info("F1_LAH (PP) : %.4f", f1_lah_pp)
+        ret["f1_lah_pp"] = f1_lah_pp
 
-    # F1_LAEO (PP)
-    laeo_pp_gt = np.array(laeo_pp_gt_all)
-    laeo_pp_pred = np.array(laeo_pp_pred_all)
-    if len(laeo_pp_gt) > 0 and laeo_pp_gt.sum() > 0 and laeo_pp_pred.sum() > 0:
+    if laeo_pp_gt_all and len(laeo_pp_gt) > 0 and laeo_pp_gt.sum() > 0 and laeo_pp_pred.sum() > 0:
         f1_laeo_pp = f1_score(laeo_pp_gt, laeo_pp_pred)
         logger.info("F1_LAEO(PP) : %.4f", f1_laeo_pp)
-    else:
+        ret["f1_laeo_pp"] = f1_laeo_pp
+    elif laeo_pp_gt_all:
         logger.info("F1_LAEO(PP) : N/A (no positive predictions)")
 
-    # AP_SA (CoAtt = Shared Attention)
     if coatt_gt_all:
-        coatt_gt_cat = torch.cat(coatt_gt_all)
+        coatt_gt_cat   = torch.cat(coatt_gt_all)
         coatt_pred_cat = torch.cat(coatt_pred_all)
         ap_sa = average_precision_score(coatt_gt_cat.numpy(), coatt_pred_cat.numpy())
         logger.info("AP_SA       : %.4f", ap_sa)
+        ret["coatt_ap"] = ap_sa
 
     # ══════════════════════════════════════════════════════════════════════
     # Block 2: 세부 지표 (AUC / AP / Prec / Recall / F1 per task)
@@ -276,15 +286,19 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
     # LAEO
     logger.info("----- LAEO -----")
     if laeo_gt_all:
-        laeo_gt_cat = torch.cat(laeo_gt_all)
+        laeo_gt_cat   = torch.cat(laeo_gt_all)
         laeo_pred_cat = torch.cat(laeo_pred_all)
-        logger.info("AP    : %.4f", average_precision_score(laeo_gt_cat, laeo_pred_cat))
-        logger.info("AUC   : %.4f", roc_auc_score(laeo_gt_cat, laeo_pred_cat))
+        laeo_ap  = average_precision_score(laeo_gt_cat, laeo_pred_cat)
+        laeo_auc = roc_auc_score(laeo_gt_cat, laeo_pred_cat)
+        logger.info("AP    : %.4f", laeo_ap)
+        logger.info("AUC   : %.4f", laeo_auc)
         laeo_thr = laeo_pred_cat > thr
         logger.info("Prec  : %.4f", precision_score(laeo_gt_cat, laeo_thr))
         logger.info("Recall: %.4f", recall_score(laeo_gt_cat, laeo_thr))
         logger.info("F1    : %.4f  (thr=%.1f)", f1_score(laeo_gt_cat, laeo_thr), thr)
-        if len(laeo_pp_gt) > 0 and laeo_pp_gt.sum() > 0 and laeo_pp_pred.sum() > 0:
+        ret["laeo_ap"]  = laeo_ap
+        ret["laeo_auc"] = laeo_auc
+        if laeo_pp_gt_all and len(laeo_pp_gt) > 0 and laeo_pp_gt.sum() > 0 and laeo_pp_pred.sum() > 0:
             logger.info("F1 PP : %.4f  (geometric)", f1_laeo_pp)
             logger.info("  Prec PP : %.4f", precision_score(laeo_pp_gt, laeo_pp_pred))
             logger.info("  Rec  PP : %.4f", recall_score(laeo_pp_gt, laeo_pp_pred))
@@ -292,19 +306,23 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
     # LAH
     logger.info("----- LAH -----")
     if lah_gt_all:
-        lah_gt_cat = torch.cat(lah_gt_all)
+        lah_gt_cat   = torch.cat(lah_gt_all)
         lah_pred_cat = torch.cat(lah_pred_all)
-        mask_cat = torch.cat(mask_all)
-        lah_gt_cat = lah_gt_cat[mask_cat]
+        mask_cat     = torch.cat(mask_all)
+        lah_gt_cat   = lah_gt_cat[mask_cat]
         lah_pred_cat = lah_pred_cat[mask_cat]
         if lah_gt_cat.sum() < len(lah_gt_cat):
-            logger.info("AP    : %.4f", average_precision_score(lah_gt_cat, lah_pred_cat))
-            logger.info("AUC   : %.4f", roc_auc_score(lah_gt_cat, lah_pred_cat))
+            lah_ap  = average_precision_score(lah_gt_cat, lah_pred_cat)
+            lah_auc = roc_auc_score(lah_gt_cat, lah_pred_cat)
+            logger.info("AP    : %.4f", lah_ap)
+            logger.info("AUC   : %.4f", lah_auc)
+            ret["lah_ap"]  = lah_ap
+            ret["lah_auc"] = lah_auc
         lah_thr = lah_pred_cat > thr
         logger.info("Prec  : %.4f", precision_score(lah_gt_cat, lah_thr))
         logger.info("Recall: %.4f", recall_score(lah_gt_cat, lah_thr))
         logger.info("F1    : %.4f  (thr=%.1f)", f1_score(lah_gt_cat, lah_thr), thr)
-        if pp_mask.sum() > 0:
+        if lah_pp_gt_all and pp_mask.sum() > 0:
             logger.info("F1 PP : %.4f  (geometric)", f1_lah_pp)
             logger.info("  Prec PP : %.4f", precision_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask]))
             logger.info("  Rec  PP : %.4f", recall_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask]))
@@ -312,12 +330,21 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
     # CoAtt / SA
     logger.info("----- CoAtt (SA) -----")
     if coatt_gt_all:
+        coatt_auc = roc_auc_score(coatt_gt_cat, coatt_pred_cat)
         logger.info("AP    : %.4f", ap_sa)
-        logger.info("AUC   : %.4f", roc_auc_score(coatt_gt_cat, coatt_pred_cat))
+        logger.info("AUC   : %.4f", coatt_auc)
         coatt_thr = coatt_pred_cat > thr
         logger.info("Prec  : %.4f", precision_score(coatt_gt_cat, coatt_thr))
         logger.info("Recall: %.4f", recall_score(coatt_gt_cat, coatt_thr))
         logger.info("F1    : %.4f  (thr=%.1f)", f1_score(coatt_gt_cat, coatt_thr), thr)
+        ret["coatt_auc"] = coatt_auc
+
+    # social_ap = mean(lah_ap, laeo_ap, coatt_ap)
+    ap_vals = [ret[k] for k in ("lah_ap", "laeo_ap", "coatt_ap") if k in ret]
+    if ap_vals:
+        ret["social_ap"] = sum(ap_vals) / len(ap_vals)
+
+    return ret
 
 
 if __name__ == "__main__":
