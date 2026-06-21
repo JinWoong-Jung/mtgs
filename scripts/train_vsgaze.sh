@@ -33,7 +33,7 @@ WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # GazeFol
 
 FROZEN=false
 
-EXP_NAME="vg_gaze_graph_v6"
+EXP_NAME="V6(restored)+d=256"
 SWA="False"
 
 CHECKPOINT_MONITOR="metric/val/social_ap"
