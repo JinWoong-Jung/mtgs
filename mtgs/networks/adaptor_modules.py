@@ -25,7 +25,7 @@ class CrossAttention(nn.Module):
         self.q = nn.Linear(dim, dim, bias=use_q_bias)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, gaze_token, img_tokens):
+    def forward(self, gaze_token, img_tokens, key_padding_mask=None):
         B, N, C = img_tokens.shape
         _, NP, _ = gaze_token.shape
 
@@ -44,6 +44,11 @@ class CrossAttention(nn.Module):
         )
 
         attn = (q @ k.transpose(-2, -1)) * self.scale  # (b, nh, np, n)
+        if key_padding_mask is not None:
+            # key_padding_mask: (b, n) bool, True = exclude key
+            attn = attn.masked_fill(
+                key_padding_mask[:, None, None, :], float("-inf")
+            )
         attn = attn.softmax(dim=-1)
 
         o = (attn @ v).transpose(1, 2).reshape(B, NP, C)  # (b, np, d)
@@ -266,19 +271,18 @@ def _compute_bbox_overlap(
     return overlap.to(dtype)  # already in [0,1]: hm_norm sums to 1
 
 
-class _UnifiedRefiner(nn.Module):
-    """Per-frame spatial edge refinement with row + col attention.
+class _RefinerLayer(nn.Module):
+    """One dual-role edge-refinement layer with its OWN weights (no cross-layer
+    sharing). Steps: row-attn → col-attn → edge-refresh → node-update →
+    re-inject → temporal-edge-attn (only when T > 1).
 
     E shape throughout: (B, T, N, Tl, De)   where Tl = N + 2.
     Column attention covers only the first N+1 targets (null_out excluded).
-    Frames are processed independently; temporal context is already carried by
-    the upstream person tokens.
     """
 
-    def __init__(self, edge_dim: int, num_layers: int, heads: int):
+    def __init__(self, edge_dim: int, heads: int):
         super().__init__()
-        De = self.De = edge_dim
-        self.num_layers = num_layers
+        De = edge_dim
 
         _enc = lambda: nn.TransformerEncoderLayer(
             d_model=De, nhead=heads, dim_feedforward=2 * De,
@@ -286,8 +290,9 @@ class _UnifiedRefiner(nn.Module):
         )
         self.row      = _enc()
         self.col      = _enc()
+        self.temporal = _enc()   # edge temporal consistency (2-D)
 
-        self.refresh  = MLP(3 * De, De, De)
+        self.refresh  = MLP(2 * De, De, De)
         self.norm_e   = nn.LayerNorm(De)
         self.pool_out = nn.Linear(De, 1)
         self.pool_in  = nn.Linear(De, 1)
@@ -305,13 +310,110 @@ class _UnifiedRefiner(nn.Module):
         self.inject   = MLP(3 * De, De, De)
         self.norm_inj = nn.LayerNorm(De)
 
+    def forward(self, E, ev, ev_sq, row_kpm, col_kpm, v_src, v_tgt):
+        B, T, N, Tl, De = E.shape
+        E_in = E   # edge state before this layer's row/col attention
+
+        # ── ① Row: source i attends over all Tl targets ───────────────────
+        row_context = self.row(
+            E_in.reshape(B * T * N, Tl, De), src_key_padding_mask=row_kpm
+        ).reshape(B, T, N, Tl, De) * ev
+
+        # ── ② Col: target k (person + null_in) attends over N sources ─────
+        #    Parallel to row: col also reads from E_in (not row_context).
+        #    null_out excluded; its slot is filled with E_in so refresh has
+        #    a well-defined 2-way concat for every edge position.
+        E_col_in = E_in[:, :, :, :N + 1, :]
+        E_col_out_N1 = self.col(
+            E_col_in.permute(0, 1, 3, 2, 4).reshape(B * T * (N + 1), N, De),
+            src_key_padding_mask=col_kpm,
+        ).reshape(B, T, N + 1, N, De).permute(0, 1, 3, 2, 4)  # (B, T, N, N+1, De)
+        col_context = torch.cat(
+            [E_col_out_N1, E_in[:, :, :, N + 1:, :]], dim=3
+        ) * ev
+
+        # ── ③ Edge refresh: parallel row+col context, E_in as residual base ──
+        #    edge = LN(E_in + MLP(concat(row_context, col_context)))
+        E = self.norm_e(
+            E_in + self.refresh(torch.cat([row_context, col_context], dim=-1))
+        ) * ev
+
+        # ── ④ Node update: learned attention pooling ──────────────────────
+        # out_agg: source i attends over all Tl outgoing edges
+        scores_out = self.pool_out(E).squeeze(-1)                      # (B, T, N, Tl)
+        scores_out = scores_out.masked_fill(ev_sq == 0, float('-inf'))
+        safe_out   = scores_out.isinf().all(dim=-1, keepdim=True)
+        scores_out = scores_out.masked_fill(safe_out, 0.0)
+        alpha_out  = F.softmax(scores_out, dim=-1) * ev_sq            # (B, T, N, Tl)
+        out_agg    = (alpha_out.unsqueeze(-1) * E).sum(3)             # (B, T, N, De)
+
+        # in_agg: target k (person/null_in) attends over N incoming sources
+        E_col       = E[:, :, :, :N + 1, :].permute(0, 1, 3, 2, 4)  # (B, T, N+1, N, De)
+        scores_in_t = self.pool_in(E_col).squeeze(-1)                  # (B, T, N+1, N)
+        ev_in_t     = ev_sq[:, :, :, :N + 1].permute(0, 1, 3, 2)        # (B, T, N+1, N)
+        scores_in_t = scores_in_t.masked_fill(ev_in_t == 0, float('-inf'))
+        safe_in     = scores_in_t.isinf().all(dim=-1, keepdim=True)
+        scores_in_t = scores_in_t.masked_fill(safe_in, 0.0)
+        alpha_in    = F.softmax(scores_in_t, dim=-1) * ev_in_t          # (B, T, N+1, N)
+        in_agg_full = (alpha_in.unsqueeze(-1) * E_col).sum(3)           # (B, T, N+1, De)
+        in_agg_p    = in_agg_full[:, :, :N, :]                         # (B, T, N, De)
+        in_agg_ni   = in_agg_full[:, :, N:N + 1, :]                    # (B, T, 1, De)
+
+        v_src = self.norm_src(
+            v_src + self.upd_src(torch.cat([v_src, out_agg], dim=-1))
+        )
+        v_tgt_p = self.norm_tgt(
+            v_tgt[:, :, :N, :] + self.upd_tgt(
+                torch.cat([v_tgt[:, :, :N, :], in_agg_p], dim=-1)
+            )
+        )  # (B, T, N, De)
+
+        v_ni = self.norm_nullin(
+            v_tgt[:, :, N:N + 1, :] + self.upd_nullin(
+                torch.cat([v_tgt[:, :, N:N + 1, :], in_agg_ni], dim=-1)
+            )
+        )  # (B, T, 1, De)
+
+        v_tgt = torch.cat([v_tgt_p, v_ni, v_tgt[:, :, N + 1:, :]], dim=2)
+
+        # ── ⑤ Re-inject updated nodes into edges ──────────────────────────
+        src_exp = v_src.unsqueeze(3).expand(B, T, N, Tl, De)
+        tgt_exp = v_tgt.unsqueeze(2).expand(B, T, N, Tl, De)
+        E = self.norm_inj(
+            E + self.inject(torch.cat([E, src_exp, tgt_exp], dim=-1))
+        ) * ev
+
+        # ── ⑥ Temporal edge attention: each edge attends over its T frames ──
+        #    Edge validity is frame-independent, so no temporal kpm is needed;
+        #    globally-invalid edges are re-zeroed by * ev afterwards.
+        if T > 1:
+            E_t = E.permute(0, 2, 3, 1, 4).reshape(B * N * Tl, T, De)
+            E_t = self.temporal(E_t)
+            E = E_t.reshape(B, N, Tl, T, De).permute(0, 3, 1, 2, 4) * ev
+
+        return E, v_src, v_tgt
+
+
+class _UnifiedRefiner(nn.Module):
+    """Stack of dual-role edge-refinement layers, each with independent weights
+    (2-E) and per-layer temporal edge attention (2-D).
+
+    E shape throughout: (B, T, N, Tl, De)   where Tl = N + 2.
+    """
+
+    def __init__(self, edge_dim: int, num_layers: int, heads: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_RefinerLayer(edge_dim, heads) for _ in range(num_layers)]
+        )
+
     @staticmethod
     def _safe_kpm(kpm: torch.Tensor) -> torch.Tensor:
         # Fully-masked sequences cause NaN in TransformerEncoderLayer.
         # Unmask them; their output is discarded by multiplying with ev.
         return kpm & ~kpm.all(dim=1, keepdim=True)
 
-    def forward(self, E, ev, row_kpm, col_kpm, v_src, v_tgt, deg_out, deg_in):
+    def forward(self, E, ev, row_kpm, col_kpm, v_src, v_tgt):
         """
         E:       (B, T, N, Tl, De)
         ev:      (B, T, N, Tl, 1)    float 0/1 validity mask
@@ -319,84 +421,10 @@ class _UnifiedRefiner(nn.Module):
         col_kpm: (B*T*(N+1), N)      null_out column excluded
         v_src:   (B, T, N, De)
         v_tgt:   (B, T, Tl, De)
-        deg_out: (B, T, N, 1)
-        deg_in:  (B, T, Tl, 1)
         """
-        B, T, N, Tl, De = E.shape
         ev_sq = ev.squeeze(-1)  # (B, T, N, Tl) float; constant across layers
-
-        for _ in range(self.num_layers):
-            # ── ① Row: source i attends over all Tl targets ───────────────────
-            row_context = self.row(
-                E.reshape(B * T * N, Tl, De), src_key_padding_mask=row_kpm
-            ).reshape(B, T, N, Tl, De) * ev
-            E = row_context
-
-            # ── ② Col: target k (person + null_in) attends over N sources ─────
-            #    null_out excluded; its col_context slot retains row_context so the
-            #    refresh always has a well-defined 3-way concat for every edge.
-            E_col_in = E[:, :, :, :N + 1, :]
-            E_col_out_N1 = self.col(
-                E_col_in.permute(0, 1, 3, 2, 4).reshape(B * T * (N + 1), N, De),
-                src_key_padding_mask=col_kpm,
-            ).reshape(B, T, N + 1, N, De).permute(0, 1, 3, 2, 4)  # (B, T, N, N+1, De)
-            col_context = torch.cat(
-                [E_col_out_N1, row_context[:, :, :, N + 1:, :]], dim=3
-            ) * ev
-            E = col_context
-
-            # ── ③ Edge refresh: refine each frame's edge graph independently ──
-            #    edge = LN(edge + MLP(concat(edge, row_context, col_context)))
-            E = self.norm_e(
-                E + self.refresh(torch.cat([E, row_context, col_context], dim=-1))
-            ) * ev
-
-            # ── ④ Node update: learned attention pooling (idea.md §7) ────────
-            # out_agg: source i attends over all Tl outgoing edges
-            scores_out = self.pool_out(E).squeeze(-1)              # (B, T, N, Tl)
-            scores_out = scores_out.masked_fill(ev_sq == 0, float('-inf'))
-            safe_out   = scores_out.isinf().all(dim=-1, keepdim=True)
-            scores_out = scores_out.masked_fill(safe_out, 0.0)
-            alpha_out  = F.softmax(scores_out, dim=-1) * ev_sq    # (B, T, N, Tl)
-            out_agg    = (alpha_out.unsqueeze(-1) * E).sum(3)     # (B, T, N, De)
-
-            # in_agg: target k (person/null_in) attends over N incoming sources
-            scores_in   = self.pool_in(E[:, :, :, :N + 1, :]).squeeze(-1)  # (B, T, N, N+1)
-            scores_in_t = scores_in.permute(0, 1, 3, 2)                    # (B, T, N+1, N)
-            ev_in_t     = ev_sq[:, :, :, :N + 1].permute(0, 1, 3, 2)      # (B, T, N+1, N)
-            scores_in_t = scores_in_t.masked_fill(ev_in_t == 0, float('-inf'))
-            safe_in     = scores_in_t.isinf().all(dim=-1, keepdim=True)
-            scores_in_t = scores_in_t.masked_fill(safe_in, 0.0)
-            alpha_in    = F.softmax(scores_in_t, dim=-1) * ev_in_t         # (B, T, N+1, N)
-            E_src_col   = E[:, :, :, :N + 1, :].permute(0, 1, 3, 2, 4)   # (B, T, N+1, N, De)
-            in_agg_full = (alpha_in.unsqueeze(-1) * E_src_col).sum(3)      # (B, T, N+1, De)
-            in_agg_p    = in_agg_full[:, :, :N, :]                         # (B, T, N, De)
-            in_agg_ni   = in_agg_full[:, :, N:N + 1, :]                    # (B, T, 1, De)
-
-            v_src = self.norm_src(
-                v_src + self.upd_src(torch.cat([v_src, out_agg], dim=-1))
-            )
-            v_tgt_p = self.norm_tgt(
-                v_tgt[:, :, :N, :] + self.upd_tgt(
-                    torch.cat([v_tgt[:, :, :N, :], in_agg_p], dim=-1)
-                )
-            )  # (B, T, N, De)
-
-            v_ni = self.norm_nullin(
-                v_tgt[:, :, N:N + 1, :] + self.upd_nullin(
-                    torch.cat([v_tgt[:, :, N:N + 1, :], in_agg_ni], dim=-1)
-                )
-            )  # (B, T, 1, De)
-
-            v_tgt = torch.cat([v_tgt_p, v_ni, v_tgt[:, :, N + 1:, :]], dim=2)
-
-            # ── ⑤ Re-inject updated nodes into edges ──────────────────────────
-            src_exp = v_src.unsqueeze(3).expand(B, T, N, Tl, De)
-            tgt_exp = v_tgt.unsqueeze(2).expand(B, T, N, Tl, De)
-            E = self.norm_inj(
-                E + self.inject(torch.cat([E, src_exp, tgt_exp], dim=-1))
-            ) * ev
-
+        for layer in self.layers:
+            E, v_src, v_tgt = layer(E, ev, ev_sq, row_kpm, col_kpm, v_src, v_tgt)
         return E, v_src, v_tgt
 
 
@@ -432,7 +460,7 @@ class GazeGraphBlock(nn.Module):
     Readout (all T frames → (B,T,N,N) / (B,T,N) outputs):
       LAH    : head_lah(E[:,:,:,:N])
       LAEO   : head_laeo(cat(E[i,j], E[j,i]))       — learned MLP
-      SA     : head_sa(cat(E[i→null_in], E[j→null_in], |E[i→null_in]-E[j→null_in]|, E[i→j], E[j→i]))
+      SA     : head_sa(cat(ni_i, ni_j, |diff|, E[i→j], E[j→i]))  — edge+null_in based
       null_in : head_null_in(E[:,:,:,N])
       null_out: head_null_out(E[:,:,:,N+1])
     """
@@ -445,13 +473,13 @@ class GazeGraphBlock(nn.Module):
         heads: int = 4,
         use_prior: bool = True,
         prior_weight: float = 0.5,
-        use_node_xattn: bool = True,
+        use_node_xattn: bool = True,   # deprecated (V14): node init no longer uses heatmap XAttn
+        face_dim: int = 768,           # raw GazeEncoder token dim (pre-adaptor facial feature)
     ):
         super().__init__()
         D, De = token_dim, edge_dim
         self.De             = De
         self.use_prior      = use_prior
-        self.use_node_xattn = use_node_xattn
 
         # ── Null node parameters (one per null type) ──────────────────────────
         self.null_in_node  = nn.Parameter(torch.zeros(D))
@@ -460,30 +488,29 @@ class GazeGraphBlock(nn.Module):
         # ── Target type embedding: person=0, null_in=1, null_out=2 ────────────
         self.type_emb = nn.Embedding(3, De)
 
-        # ── Source node: heatmap cross-attention (kept from prior design) ─────
-        hm_grid = 8
-        self.hm_grid = hm_grid
-        self.hm_pool = nn.AdaptiveAvgPool2d(hm_grid)
-        if use_node_xattn:
-            self.hm_proj        = nn.Linear(1, D)
-            self.hm_pos_emb     = nn.Parameter(torch.randn(hm_grid * hm_grid, D) * 0.02)
-            self.src_xattn      = CrossAttention(D, num_heads=heads)
-            self.src_xattn_norm = nn.LayerNorm(D)
-        else:
-            self.hm_proj = self.hm_pos_emb = self.src_xattn = self.src_xattn_norm = None
+        # ── Unified node init (V14): node = LN(person_token + Linear_face(gaze)) + geom
+        #    scene context is already carried by person_token (ViT-Adaptor mixed);
+        #    facial detail is re-injected from detached raw GazeEncoder tokens.
+        #    src and tgt persons share this single init (roles diverge only in refiner).
+        self.face_proj = nn.Linear(face_dim, D)
+        nn.init.zeros_(self.face_proj.weight)   # start as no-op (safe A/B)
+        nn.init.zeros_(self.face_proj.bias)
+        self.node_in_norm = nn.LayerNorm(D)
 
-        # ── Node projections ──────────────────────────────────────────────────
-        self.node_src_proj = nn.Linear(D, De)   # source (XAttn-enriched)
-        self.node_tgt_proj = nn.Linear(D, De)   # all targets (persons + nulls)
+        # ── Node geometry encoding (2-C): [cx, cy, w, h, gaze_vec] → D ────────
+        #    zero-init last layer so it starts as a no-op.
+        self.node_geom_mlp = MLP(6, D, D)
+        nn.init.zeros_(self.node_geom_mlp.fc2.weight)
+        nn.init.zeros_(self.node_geom_mlp.fc2.bias)
 
-        # ── Target node: incoming gaze message from people looking at this bbox ─
-        self.tgt_msg_mlp  = MLP(2 * D, D, D)
-        self.tgt_msg_norm = nn.LayerNorm(D)
-        nn.init.zeros_(self.tgt_msg_mlp.fc2.weight)
-        nn.init.zeros_(self.tgt_msg_mlp.fc2.bias)
+        # ── Single node projection shared by source & target roles (V14) ──────
+        self.node_proj = nn.Linear(D, De)
 
-        # ── Edge scalar prior projection (1-D → De) ─────────────────────────
-        self.linear_edge = nn.Linear(1, De)
+        # ── Edge scalar prior projection (4 channels → De) ───────────────────
+        #    channel 0: primary prior (p2p=cosine, null_in/out=routing prior)
+        #    channel 1: heatmap overlap[i→j] (LAH grounding, 2-B); 0 for nulls
+        #    channel 2-3: rel_pos = normalize(center_j - center_i) (V13); 0 for nulls
+        self.linear_edge = nn.Linear(4, De)
         if use_prior:
             self.prior_w = nn.Parameter(torch.tensor(prior_weight))
 
@@ -494,10 +521,10 @@ class GazeGraphBlock(nn.Module):
         self.refiner = _UnifiedRefiner(De, num_layers, heads)
 
         # ── Readout heads ─────────────────────────────────────────────────────
-        # SA:   ni_i   || ni_j          || |ni_i - ni_j|   (pure scene-gaze comparison)
         self.head_lah      = _SocialReadoutHead(De)
         self.head_laeo     = _SocialReadoutHead(2 * De)   # cat(E[i→j], E[j→i])
-        self.head_sa       = _SocialReadoutHead(5 * De)   # cat(ni_i, no_j, |ni_i-ni_j|, E[i→j], E[j→i])
+        # SA: edge-based, cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
+        self.head_sa       = _SocialReadoutHead(5 * De)
         self.head_null_in  = _SocialReadoutHead(De)
         self.head_null_out = _SocialReadoutHead(De)
 
@@ -507,18 +534,19 @@ class GazeGraphBlock(nn.Module):
 
     def forward(
         self,
-        person_tokens,    # (B, T, N, D)
+        person_tokens,    # (B, T, N, D)   scene-contextualised (ViT-Adaptor output)
         num_valid_people, # (B,)
         gaze_vecs,        # (B, T, N, 2)
         head_bboxes,      # (B, T, N, 4)
         gaze_heatmaps,    # (B, T, N, Hh, Ww)
         inout_logits,     # (B, T, N)   raw logit from inout_decoder
+        gaze_feat,        # (B, T, N, face_dim)  raw GazeEncoder tokens (pre-adaptor face)
     ):
         """
         Returns:
             lah_mat:    (B, T, N, N)   LAH logits for all T frames
             laeo_mat:   (B, T, N, N)   LAEO logits (learned MLP)
-            sa_mat:     (B, T, N, N)   SA logits  (symmetric, all T frames)
+            sa_mat:     (B, T, N, N)   SA logits  (node-based, asymmetric)
             null_in:    (B, T, N)
             null_out:   (B, T, N)
             edge_valid: (B, N, 2N+2)   [0:N]=LAH, [N:2N]=SA-proxy,
@@ -552,22 +580,8 @@ class GazeGraphBlock(nn.Module):
         ev_bool_T = ev_bool.unsqueeze(1).expand(B, T, N, Tl)  # (B, T, N, Tl)
         ev = ev_bool_T.unsqueeze(-1).to(dtype)                 # (B, T, N, Tl, 1)
 
-        # ── Source node init: Pi' = LN(Pi + XAttn(Pi, hm_i)) ─────────────────
+        # ── Heatmap (detached) — used only for the edge overlap prior now (V14) ─
         hm_flat  = gaze_heatmaps.reshape(B * T * N, 1, Hh, Ww).detach()
-        P_hm     = self.hm_grid ** 2
-        hm_small = self.hm_pool(hm_flat)                        # (B*T*N, 1, g, g)
-        if self.use_node_xattn:
-            hm_feat = (
-                self.hm_proj(hm_small.reshape(B * T * N, P_hm, 1).to(dtype))
-                + self.hm_pos_emb.to(dtype)
-            )                                                    # (B*T*N, P_hm, D)
-            src_q     = person_tokens.reshape(B * T * N, 1, D)
-            src_prime = self.src_xattn_norm(
-                src_q + self.src_xattn(src_q, hm_feat)
-            ).reshape(B, T, N, D)
-        else:
-            src_prime = person_tokens   # (B, T, N, D)
-            hm_feat = None
 
         # ── Heatmap normalisation for overlap prior ───────────────────────────
         hm_norm = hm_flat.squeeze(1).reshape(B * T, N, Hh, Ww).float()
@@ -586,38 +600,43 @@ class GazeGraphBlock(nn.Module):
 
         # p2p prior: cos(gaze_vec[i], normalize(center[j] - center[i]))
         centers  = (head_bboxes[..., :2] + head_bboxes[..., 2:]) * 0.5  # (B, T, N, 2)
+        wh       = (head_bboxes[..., 2:] - head_bboxes[..., :2])        # (B, T, N, 2)
         dir_ij   = F.normalize(
             centers.unsqueeze(3) - centers.unsqueeze(2), dim=-1
         )                                                                 # (B, T, N, N, 2)
         align    = (gaze_vecs.unsqueeze(3) * dir_ij).sum(-1)             # (B, T, N, N) ∈ [-1,1]
 
-        feat_p2p = align.unsqueeze(-1)                                   # (B, T, N, N, 1)
-        feat_ni  = null_in_prior.unsqueeze(3).unsqueeze(-1)
-        feat_no  = null_out_prior.unsqueeze(3).unsqueeze(-1)
-        feat_all = torch.cat([feat_p2p, feat_ni, feat_no], dim=3)       # (B, T, N, Tl, 1)
+        # Edge prior, 4 channels: [primary, heatmap-overlap, rel_pos_dx, rel_pos_dy].
+        #   (2-B) overlap + (V13) rel_pos = dir_ij = normalize(center_j - center_i).
+        zeros_ch = torch.zeros_like(null_in_prior)                      # (B, T, N)
+        rel_pos  = dir_ij.to(dtype)                                     # (B, T, N, N, 2)
+        zeros2   = torch.zeros(B, T, N, 1, 2, device=device, dtype=dtype)
+        feat_p2p = torch.cat(
+            [align.unsqueeze(-1), overlap.unsqueeze(-1), rel_pos], dim=-1
+        )                                                               # (B, T, N, N, 4)
+        feat_ni  = torch.cat(
+            [torch.stack([null_in_prior, zeros_ch], dim=-1).unsqueeze(3), zeros2],
+            dim=-1,
+        )                                                               # (B, T, N, 1, 4)
+        feat_no  = torch.cat(
+            [torch.stack([null_out_prior, zeros_ch], dim=-1).unsqueeze(3), zeros2],
+            dim=-1,
+        )                                                               # (B, T, N, 1, 4)
+        feat_all = torch.cat([feat_p2p, feat_ni, feat_no], dim=3)       # (B, T, N, Tl, 4)
 
-        # ── Node projections ──────────────────────────────────────────────────
-        v_src = self.node_src_proj(src_prime)   # (B, T, N, De)
+        # ── Unified node init (V14): node = LN(person_token + face) + geom ─────
+        #    person_token = scene context; face = detached raw GazeEncoder token.
+        geom     = torch.cat([centers, wh, gaze_vecs], dim=-1).to(dtype)  # (B, T, N, 6)
+        geom_emb = self.node_geom_mlp(geom)                              # (B, T, N, D)
+        face     = self.face_proj(gaze_feat.detach().to(dtype))         # (B, T, N, D)
+        node     = self.node_in_norm(person_tokens + face) + geom_emb   # (B, T, N, D)
 
-        # Target person update: for target j, aggregate source tokens whose
-        # heatmaps overlap bbox_j, then inject the incoming-looking message.
-        tgt_scores = overlap.masked_fill(~p2p_valid.unsqueeze(1), float("-inf"))
-        no_incoming = torch.isinf(tgt_scores).all(dim=2, keepdim=True)
-        tgt_scores = tgt_scores.masked_fill(no_incoming, 0.0)
-        tgt_w = F.softmax(tgt_scores, dim=2).masked_fill(no_incoming, 0.0)
-        tgt_msg = torch.einsum("btij,btid->btjd", tgt_w, person_tokens)
-        tgt_gate = overlap.masked_fill(~p2p_valid.unsqueeze(1), 0.0).amax(dim=2)
-        tgt_delta = self.tgt_msg_norm(
-            self.tgt_msg_mlp(torch.cat([person_tokens, tgt_msg], dim=-1))
-        )
-        tgt_person_tokens = (
-            person_tokens + tgt_gate.unsqueeze(-1).to(dtype) * tgt_delta
-        ).to(dtype)
-
+        # src and tgt persons share the same node feature; nulls are target-only.
         null_in_t  = self.null_in_node.to(dtype).view(1, 1, 1, D).expand(B, T, 1, D)
         null_out_t = self.null_out_node.to(dtype).view(1, 1, 1, D).expand(B, T, 1, D)
-        tgt_tokens = torch.cat([tgt_person_tokens, null_in_t, null_out_t], dim=2)  # (B, T, Tl, D)
-        v_tgt = self.node_tgt_proj(tgt_tokens)  # (B, T, Tl, De)
+        tgt_tokens = torch.cat([node, null_in_t, null_out_t], dim=2)    # (B, T, Tl, D)
+        v_tgt = self.node_proj(tgt_tokens)                             # (B, T, Tl, De)
+        v_src = v_tgt[:, :, :N, :]                                     # persons as sources
 
         # ── Type embeddings ───────────────────────────────────────────────────
         type_ids = torch.cat([
@@ -632,7 +651,7 @@ class GazeGraphBlock(nn.Module):
         tgt_proj     = v_tgt.unsqueeze(2).expand(B, T, N, Tl, De)
         if self.use_prior:
             edge_feat_e = self.prior_w * self.linear_edge(
-                feat_all.reshape(B * T * N * Tl, 1)
+                feat_all.reshape(B * T * N * Tl, 4)
             ).reshape(B, T, N, Tl, De)
         else:
             edge_feat_e = torch.zeros(B, T, N, Tl, De, device=device, dtype=dtype)
@@ -650,11 +669,8 @@ class GazeGraphBlock(nn.Module):
             (~col_ev).permute(0, 1, 3, 2).reshape(B * T * (N + 1), N)
         )
 
-        deg_out = ev_bool_T[:, :, :, :N].sum(3).clamp(min=1).to(dtype).unsqueeze(-1)
-        deg_in  = ev_bool_T.sum(2).clamp(min=1).to(dtype).unsqueeze(-1)
-
         # ── Refinement ────────────────────────────────────────────────────────
-        E, v_src, v_tgt = self.refiner(E, ev, row_kpm, col_kpm, v_src, v_tgt, deg_out, deg_in)
+        E, v_src, v_tgt = self.refiner(E, ev, row_kpm, col_kpm, v_src, v_tgt)
 
         # ── Readout (all T frames) ────────────────────────────────────────────
         E_pp = E[:, :, :, :N, :]   # person-to-person edges (B, T, N, N, De)
@@ -670,13 +686,13 @@ class GazeGraphBlock(nn.Module):
         ).reshape(B, T, N, N)
         laeo_mat = (laeo_mat + laeo_mat.transpose(2, 3)) * 0.5
 
-        # SA: ni_i || ni_j || |ni_i - ni_j| || E[i→j] || E[j→i]
-        ni     = E[:, :, :, N, :]                                          # E[i→null_in] (B, T, N, De)
+        # SA: edge-based, cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
+        ni     = E[:, :, :, N, :]                                          # (B,T,N,De) null_in edge per person
         ni_i   = ni.unsqueeze(3).expand(B, T, N, N, De)
         ni_j   = ni.unsqueeze(2).expand(B, T, N, N, De)
-        ni_dif = (ni_i - ni_j).abs()
+        E_ji   = E_pp.transpose(2, 3)
         sa_mat = self.head_sa(
-            torch.cat([ni_i, ni_j, ni_dif, E_pp, E_pp.transpose(2, 3)], dim=-1)
+            torch.cat([ni_i, ni_j, (ni_i - ni_j).abs(), E_pp, E_ji], dim=-1)
             .reshape(B * T * N * N, 5 * De)
         ).reshape(B, T, N, N)
         sa_mat = (sa_mat + sa_mat.transpose(2, 3)) * 0.5

@@ -362,7 +362,7 @@ class VSGazeDataModule(pl.LightningDataModule):
         dataloader = DataLoader(
             val_dataset,
             batch_size=self.batch_size[Stage.VAL],
-            shuffle=False,
+            shuffle=True,
             num_workers=6,
             pin_memory=True,
             persistent_workers=True,

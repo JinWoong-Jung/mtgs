@@ -26,15 +26,15 @@ MTGS/
 ├── mtgs/
 │   ├── config/               # Hydra 설정 (config.yaml)
 │   ├── datasets/             # 각 데이터셋 DataModule
-│   │   └── vsgaze.py         # _filter_by_max_people(), pad_collate_fn 연결
+│   │   └── vsgaze.py
 │   ├── networks/
 │   │   ├── mtgs_net.py       # MTGS 모델 아키텍처 (핵심)
 │   │   ├── models.py         # PyTorch Lightning MTGSModel (학습/평가 루프)
 │   │   │                     # 모든 social 메트릭 .cpu() 누적으로 변경
 │   │   └── adaptor_modules.py
 │   ├── train/
-│   │   ├── dataset.py        # build_dataset() — max_people 파라미터 추가
-│   │   ├── collate.py        # pad_collate_fn (가변 N 배치 패딩)
+│   │   ├── dataset.py        # build_dataset()
+│   │   ├── collate.py        # pad_collate_fn (VLM 파이프라인 전용)
 │   │   ├── losses.py
 │   │   ├── trainer.py
 │   │   ├── callbacks.py
@@ -119,7 +119,6 @@ MTGS/
 
 ### VSGaze test 사람 수 분포
 - 전체 43,581 샘플, 평균 N=5.2, 최대 N=39
-- N≤8: 91.1%, N≤11: 95.3% (현재 max_people=11로 설정)
 
 ---
 
@@ -142,21 +141,12 @@ sbatch scripts/test_gazefollow.sh
 
 ---
 
-## Test 시 가변 인원 처리 (커스텀 구현)
+## Test 시 가변 인원 처리
 
-train은 `num_people=4` 고정, test는 `num_people="all"`(가변) — 이로 인해 batch collation 문제 발생.
+train은 `num_people=4` 고정, test는 `num_people="all"`(가변). test `batch_size=1`이므로 cross-sample collation 문제는 없음.
 
-**현재 구현된 해결책:**
-
-1. **`mtgs/train/collate.py`의 `pad_collate_fn`**  
-   batch 내 max_N으로 N-dim 텐서 zero-padding, pair label은 -1로 padding (ignore_index).
-
-2. **`vsgaze.py`의 `_filter_by_max_people()`**  
-   `test.max_people` 이상인 샘플은 DataLoader 구성 전에 스킵.  
-   현재 설정: `max_people=11` (전체의 ~4.7% 스킵, 95.3% 커버).
-
-3. **`models.py` 메트릭 `.cpu()` 누적**  
-   AUROC, AveragePrecision 6개 모두 CPU에 누적 → GPU 메모리 점진적 증가 방지.
+**적용된 사항:**
+- **`models.py` 메트릭 `.cpu()` 누적** — AUROC, AveragePrecision 6개 모두 CPU 텐서로 업데이트 → GPU 메모리 점진적 증가 방지.
 
 ---
 
@@ -180,8 +170,7 @@ vlm:                        # LLM alignment stage (별도 파이프라인)
   ...
 
 test:
-  batch_size: 4
-  max_people: 11   # null=제한 없음, 정수=초과 샘플 스킵
+  batch_size: 1
 ```
 
 **`train_postgraph.sh` 전용:**

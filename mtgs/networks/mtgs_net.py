@@ -168,6 +168,7 @@ class MTGS(nn.Module):
                 use_prior=gaze_graph_use_prior,
                 prior_weight=gaze_graph_prior_weight,
                 use_node_xattn=gaze_graph_use_node_xattn,
+                face_dim=token_dim,   # raw GazeEncoder token dim (pre-adaptor face)
             )
         else:
             # Original social decoders: LAH (directed [h_i‖h_j]) + SA (symmetric
@@ -271,6 +272,7 @@ class MTGS(nn.Module):
         )
 
         person_tokens = gaze_tokens.view(b * t, n, -1).clone()
+        face_feat     = gaze_tokens.view(b, t, n, -1)   # raw GazeEncoder tokens (pre-adaptor face) for gaze_graph
         num_valid_b   = x["num_valid_people"].view(b, t).max(dim=1).values.clamp(min=1)  # (b,) for gaze_graph
 
         # Apply ViT Adaptor =================================================
@@ -369,6 +371,7 @@ class MTGS(nn.Module):
                 x["head_bboxes"].view(b, t, n, -1),# (B, T, N, 4)
                 gaze_hm,                           # (B, T, N, Hh, Ww)
                 inout.view(b, t, n),               # (B, T, N) — raw logit
+                face_feat,                         # (B, T, N, token_dim) — raw face for node init
             )
         )
         # lah_mat, laeo_mat, sa_mat: (B, T, N, N)

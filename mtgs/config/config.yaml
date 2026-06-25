@@ -41,10 +41,10 @@ model:
 gaze_graph:
   use: true             # true: GazeGraphBlock 헤드 | false: 원본 social decoder(person token pair→LAH/LAEO/SA)
   num_layers: 2         # L dual-role refinement iters (row→col)×L
-  edge_dim: 256         # edge hidden dim De
+  edge_dim: 256         # edge hidden dim De (V14: node D=512와 동일하게 상향)
   use_prior: true       # scale geometric edge features by learnable prior_w
   prior_weight: 0.5     # initial value of prior_w
-  use_node_xattn: true  # source node: Pi'=LN(Pi+XAttn(Pi,hm_i))
+  use_node_xattn: true  # (V14에서 deprecated: node init은 heatmap XAttn 미사용)
   frozen: false         # true: freeze trunk, train only gaze_graph_block
   laeo_derive: "lah_min"  # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
   lambda_null: 0.5      # weight for dual null-edge loss (null_in + null_out)

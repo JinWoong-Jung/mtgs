@@ -16,16 +16,16 @@ export XFORMERS_DISABLED=1
 # sbatch 제출 디렉토리 기준으로 scripts/ 로 이동
 cd "$SLURM_SUBMIT_DIR/scripts"
 
-CHECKPOINT="/home/jinwoongjung/MTGS/experiments/vg_gaze_graph_v3(lah_min, monitor=social_ap)/train/checkpoints/best.ckpt"
+CHECKPOINT="/home/jinwoongjung/MTGS/weights/mtgs-vsgaze.ckpt"
 
-EXP_NAME="reproduce_vg_gaze_graph_lahmin_socialap"
+EXP_NAME="baseline"
 
 # NOTE: CHECKPOINT path contains spaces/parens/commas → must be single-quoted so
 # Hydra treats it as a literal string value (not list/group syntax).
 # model.weights=False skips the warm-start load (test.checkpoint overrides all weights anyway).
 python -s ./main.py experiment.task=test \
     model.weights=False \
-    gaze_graph.use=true \
+    gaze_graph.use=false \
     gaze_graph.laeo_derive=lah_min \
     "test.checkpoint='${CHECKPOINT}'" \
     "hydra.run.dir=\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}"
