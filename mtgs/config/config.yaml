@@ -34,7 +34,6 @@ model:
   decoder_hidden_dims: [96, 192, 384, 768]
   decoder_use_bn: True
   gaze_weights: /home/jinwoongjung/MTGS/weights/gaze360_resnet18.pt # update path
-  multivit_weights: False
   weights: "/home/jinwoongjung/MTGS/experiments/GazeFollow/train/checkpoints/best.ckpt"  # {False, path to weights}
 
 # ── Gaze Graph (social-prediction head; attached after the fixed interaction trunk) ──
@@ -44,45 +43,9 @@ gaze_graph:
   edge_dim: 256         # edge hidden dim De (V14: node D=512와 동일하게 상향)
   use_prior: true       # scale geometric edge features by learnable prior_w
   prior_weight: 0.5     # initial value of prior_w
-  use_node_xattn: true  # (V14에서 deprecated: node init은 heatmap XAttn 미사용)
   frozen: false         # true: freeze trunk, train only gaze_graph_block
   laeo_derive: "lah_min"  # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
   lambda_null: 0.5      # weight for dual null-edge loss (null_in + null_out)
-
-
-# ── VLM Reasoner (Stage B: frozen MTGS + trainable cross-attn) ──────────────
-vlm:
-  backbone: "/home/jinwoongjung/QWEN_GazeEstimation/model/Qwen3-VL-4B-Instruct"    # HF repo or local path
-  visual_encoder: false                      # true: prepend scene visual tokens; false: text+graph only
-  load_dtype: "bf16"
-  memory_tokens_m: 32                       # G_VLM token count M
-  tokenizer_depth: 1                        # set-to-token MHA depth
-  # Qwen3-VL-4B/8B: 36 layers, full_attention_interval=4 → Full Attention at [3,7,...,35]
-  cross_attn_layer_indices: [3,7,11,15,19,23,27,31,35]
-  gate_init: 0.0                            # g_ℓ 0-init (identity at warmup start)
-  tasks: ["lah", "laeo", "sa"]
-  stage_a_ckpt: null                        # required: path to Stage A gaze_graph ckpt
-
-  # Precomputed center-frame graph features (offline extraction → skip MTGS at train).
-  feature_cache:
-    use: true                              # true: train from cache (no MTGS backbone)
-    dir: /home/jinwoongjung/MTGS/data/vlm_feature_cache  # holds train.h5 / val.h5
-
-  optimizer:
-    lr: 1e-5
-    weight_decay: 0.01
-
-  scheduler:
-    type: CosineAnnealingLR        # "cosine" | null
-    warmup_epochs: 0
-    t_max_epochs: 5    # should match train.epochs
-
-  # Prompt templates: {src_bbox} and {dst_bbox} are substituted at runtime.
-  # Remove the bbox placeholders for no-grounding ablation.
-  prompt_templates:
-    lah:  "Does <P> {src_bbox} look at <P> {dst_bbox}? Answer:"
-    laeo: "Do <P> {src_bbox} and <P> {dst_bbox} look at each other? Answer:"
-    sa:   "Do <P> {src_bbox} and <P> {dst_bbox} attend to the same target? Answer:"
 
 head_detector:
   checkpoint_file: /home/jinwoongjung/MTGS/weights/crowdhuman_yolov5m.pt # update path
@@ -161,11 +124,8 @@ train:
   freeze:
     gaze_encoder: False
     gaze_encoder_backbone: False
-    image_tokenizer: True
-    depth_tokenizer: False
     vit_encoder: True
     vit_adaptor: False
-    gaze_decoder: False
     inout_decoder: False
     # Post-training (gaze_graph only): use the loaded transformer trunk as a
     # FROZEN visual extractor and train ONLY gaze_graph_block. Freezes the whole
@@ -173,11 +133,6 @@ train:
     all_but_gaze_graph: False
   checkpoint_monitor: "metric/val/dist"
   checkpoint_mode: "min"
-  swa:
-    use: True
-    lr: [1e-6, 1e-6, 1e-6, 3e-7]  # 4 param groups (gaze-encoder-temporal, people-temporal, gaze-graph-block, base)
-    epoch_start: 12
-    annealing_epochs: 6
 
 val:
   batch_size: 8
@@ -191,10 +146,17 @@ optimizer:
   weight_decay: 1e-3
 
 scheduler:
-    type: CosineAnnealingWarmRestarts # {CosineAnnealingWarmRestarts, StepLR}
-    warmup_epochs: 4
-    t_0_epochs: 20
-    t_mult: 1
+    type: CosineAnnealingLR  # {CosineAnnealingLR, StepLR}
+    warmup_epochs: 2         # per-step linear warmup spanning 2 epochs (smooth ramp)
+    eta_min: 1.0e-8          # cosine floor
+    # step-level: warmup/cosine step counts derived from trainer.estimated_stepping_batches
+    # (real dataloader length) → smooth per-step, independent of data.num_samples
+
+# ── Social BCE pos_weight (rare-positive upweighting) per task ──────────────
+loss:
+  lah_pos_weight: 6.38
+  laeo_pos_weight: 26.92
+  sa_pos_weight: 2.11     # only used when SA is logit-based (coatt_is_prob=False)
 
 hydra:
   run:

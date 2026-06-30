@@ -34,7 +34,7 @@ MTGS/
 │   │   └── adaptor_modules.py
 │   ├── train/
 │   │   ├── dataset.py        # build_dataset()
-│   │   ├── collate.py        # pad_collate_fn (VLM 파이프라인 전용)
+│   │   ├── collate.py        # pad_collate_fn
 │   │   ├── losses.py
 │   │   ├── trainer.py
 │   │   ├── callbacks.py
@@ -42,15 +42,15 @@ MTGS/
 │   └── utils/
 ├── scripts/
 │   ├── main.py
-│   ├── main_llm.py
 │   ├── train_gazefollow.sh
 │   ├── train_vsgaze.sh
 │   ├── train_postgraph.sh    # post-training: trunk frozen, gaze_graph_block만 학습
-│   ├── train_llm_align.sh
 │   ├── test_gazefollow.sh
 │   └── test_vsgaze.sh
 └── logs/
 ```
+
+> **⚠️ VLM (Stage B) 제거됨 (2026-06-29):** 기존 VLM reasoner 구현(`mtgs/networks/vlm/`, vlm datamodule, `main_vlm.py`/`extract_vlm_features`/`train_vlm_align.sh`, config `vlm:` 섹션)을 **전부 삭제**함. core gaze 파이프라인은 VLM 미참조라 영향 없음. **VLM 보강은 향후 동료 코드를 가져와 새로 통합 예정** — 옛 설계(GraphEvidenceTokenizer/EvidenceAugmentedVLM 등)를 복원하지 말 것. 상세: 메모리 `vlm-removed.md`.
 
 ---
 
@@ -166,8 +166,7 @@ gaze_graph:
   laeo_derive: "lah_min"    # "lah_min" | "decoder" (전용 MLP head 직접 사용)
   lambda_null: 0.5          # null aux loss weight
 
-vlm:                        # LLM alignment stage (별도 파이프라인)
-  ...
+# (vlm: 섹션 제거됨 — VLM은 향후 동료 코드로 재도입 예정)
 
 test:
   batch_size: 1

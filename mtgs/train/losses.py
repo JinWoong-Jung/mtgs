@@ -10,36 +10,6 @@ import torch
 import torch.nn.functional as F
 
 
-def focal_social_loss(social_pred, social_gt, mask, gamma=2.0, pos_weight=2.0, label_smoothing=0.05):
-    """Focal BCE for sparse social labels (e.g. LAEO mutual gaze).
-
-    Combines three stabilization mechanisms:
-    - Focal weighting (1-p_t)^gamma  — down-weights easy negatives that dominate LAEO batches
-    - pos_weight                      — upweights rare positives (LAEO ≪ LAH in frequency)
-    - label_smoothing                 — softens targets for noisy derived labels (LAEO=min(LAH_ij,LAH_ji))
-    """
-    social_gt = social_gt * mask
-    gt_f = social_gt.float()
-
-    # label smoothing: 0 → eps/2, 1 → 1 - eps/2
-    gt_smooth = gt_f * (1.0 - label_smoothing) + 0.5 * label_smoothing
-
-    with torch.no_grad():
-        p = torch.sigmoid(social_pred)
-        p_t = p * gt_f + (1.0 - p) * (1.0 - gt_f)
-        focal_w = (1.0 - p_t) ** gamma
-
-    loss = F.binary_cross_entropy_with_logits(
-        social_pred,
-        gt_smooth,
-        pos_weight=torch.tensor(pos_weight, device=social_gt.device),
-        reduction="none",
-    )
-    loss = focal_w * loss
-    num_instances = mask.sum()
-    return torch.mul(loss, mask).sum() / (num_instances + 1e-6)
-
-
 def social_loss(social_pred, social_gt, mask, pos_weight=2.0):
     """Compute a loss for coatt or laeo or lah. This implements a standard binary cross-entropy loss.
 
@@ -93,13 +63,16 @@ def compute_social_loss(
     coatt_gt,
     coatt_mask,
     coatt_is_prob=False,
+    lah_pos_weight=3.0,
+    laeo_pos_weight=2.0,
+    coatt_pos_weight=2.0,
 ):
-    lah_loss = social_loss(lah_pred, lah_gt, lah_mask, pos_weight=3.0)
-    laeo_loss = social_loss(laeo_pred, laeo_gt, laeo_mask)
+    lah_loss = social_loss(lah_pred, lah_gt, lah_mask, pos_weight=lah_pos_weight)
+    laeo_loss = social_loss(laeo_pred, laeo_gt, laeo_mask, pos_weight=laeo_pos_weight)
     coatt_loss = (
         social_loss_prob(coatt_pred, coatt_gt, coatt_mask)
         if coatt_is_prob
-        else social_loss(coatt_pred, coatt_gt, coatt_mask)
+        else social_loss(coatt_pred, coatt_gt, coatt_mask, pos_weight=coatt_pos_weight)
     )
 
     lah_coeff = 1
@@ -206,12 +179,12 @@ def compute_dist_loss(gp_pred, gp_gt, mask):
 
 
 def compute_heatmap_loss(hm_pred, hm_gt, mask, dataset=None):
-    heatmap_loss = F.mse_loss(hm_pred, hm_gt, reduce=False).mean([2, 3])
+    heatmap_loss = F.mse_loss(hm_pred, hm_gt, reduction="none").mean([2, 3])
     heatmap_loss = torch.mul(heatmap_loss, mask)
     if dataset:
         dataset_mask = np.where(
-            (np.array(dataset) == "coatt").astype(np.int)
-            + (np.array(dataset) == "laeo").astype(np.int)
+            (np.array(dataset) == "coatt").astype(int)
+            + (np.array(dataset) == "laeo").astype(int)
         )[0]
         fact = torch.zeros_like(heatmap_loss) + 1
         fact[dataset_mask] = 0.1  # 0.1x loss for UCO-LAEO and VideoCoAtt
@@ -225,8 +198,8 @@ def compute_angular_loss(gv_pred, gv_gt, mask, dataset=None):
     angular_loss = torch.mul(angular_loss, mask)
     if dataset:
         dataset_mask = np.where(
-            (np.array(dataset) == "coatt").astype(np.int)
-            + (np.array(dataset) == "laeo").astype(np.int)
+            (np.array(dataset) == "coatt").astype(int)
+            + (np.array(dataset) == "laeo").astype(int)
         )[0]
         fact = torch.zeros_like(angular_loss) + 1
         fact[dataset_mask] = 0.1  # 0.1x loss for UCO-LAEO and VideoCoAtt

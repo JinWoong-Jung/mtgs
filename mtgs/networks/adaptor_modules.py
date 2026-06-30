@@ -216,21 +216,6 @@ class InteractionBlock(nn.Module):
 
         return x, c
 
-    def forward_extract_only(self, x, c):
-        """scene→people cross-attn only (extractor step, no injection or ViT)."""
-        c = self.extractor(query=c, feat=x)
-        if self.extra_extractors is not None:
-            for extractor in self.extra_extractors:
-                c = extractor(query=c, feat=x)
-        return x, c
-
-    def forward_inject_vit(self, x, c, blocks):
-        """people→scene cross-attn + ViT blocks only (no extraction)."""
-        x = self.injector(query=x, feat=c)
-        for blk in blocks:
-            x = blk(x)
-        return x, c
-
 
 def _compute_bbox_overlap(
     hm_norm: torch.Tensor, bboxes: torch.Tensor
@@ -473,7 +458,6 @@ class GazeGraphBlock(nn.Module):
         heads: int = 4,
         use_prior: bool = True,
         prior_weight: float = 0.5,
-        use_node_xattn: bool = True,   # deprecated (V14): node init no longer uses heatmap XAttn
         face_dim: int = 768,           # raw GazeEncoder token dim (pre-adaptor facial feature)
     ):
         super().__init__()

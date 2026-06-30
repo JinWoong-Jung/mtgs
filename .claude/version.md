@@ -487,6 +487,60 @@ scores_in_t = self.pool_in(E_col).squeeze(-1)
 
 ---
 
+## V14.6 — V14.5 기반 코드 정리 + 학습 파이프라인 개편
+
+> **GazeGraphBlock 아키텍처는 V14.5와 동일** (SA head 5×De edge 기반, Linear scoring, face 재주입 node init).
+> V14.6은 **모델 동작을 바꾸지 않는 정리(A/C/F) + 학습 인프라 개선(scheduler/SWA/loss)** 의 묶음.
+> 검증: gaze_graph_block 초기화 해시가 V14.5와 byte-identical (`9f3d824340cabcaf`).
+
+### (A) Dead code 제거 — 동작 불변
+- `mtgs_net.py`: `ViTEncoder`/`HMDecoder`/`LinearHeatmapDecoder`/`SimplerHeatmapDecoder`/`DPTDecoder` 클래스, `GazeEncoder._init_weights` 삭제
+- `adaptor_modules.py`: `InteractionBlock.forward_extract_only`/`forward_inject_vit` 삭제
+- `losses.py`: `focal_social_loss` 삭제
+- 미사용 import 정리 (`math`, `torchvision.transforms.functional`, `spatial_argmax2d/softargmax2d`)
+
+### (C) Dead config 제거
+- `gaze_graph.use_node_xattn` (config + models/mtgs_net/adaptor_modules/vlm_builder 배선 전부)
+- `model.multivit_weights` (+ `_init_weights`의 multivit 분기)
+- `train.freeze.gaze_decoder` / `freeze.image_tokenizer` / `freeze.depth_tokenizer` (죽은 freeze 플래그)
+  - ※ `gaze_decoder`/`image_tokenizer` **모듈 자체는 유지**, freeze 플래그만 제거
+
+### (F) Dead 주석 제거 — mtgs_net.py 대량 주석 블록
+
+### Scheduler 전면 개편
+- `CosineAnnealingWarmRestarts(step-level, num_samples 기반)` → **`SequentialLR(LinearLR warmup → CosineAnnealingLR)`**
+- **per-step** warmup/cosine, step 수는 `trainer.estimated_stepping_batches`(실제 dataloader 길이) 기반 → `data.num_samples` 불일치 영향 제거
+- config: `type: CosineAnnealingLR`, `warmup_epochs: 2`, `eta_min: 1e-8`
+- 곡선: 2 epoch 선형 상승 → peak → cosine으로 eta_min까지 매끄럽게 하강 (재시작 없음)
+- 기존 수동 warmup(`lr_scheduler_step`) 제거
+
+### SWA 완전 제거
+- config `train.swa` 블록, `callbacks.py`의 `StochasticWeightAveraging`, `experiments.py`의 swa 인자, `models.py`의 마지막-epoch `automatic_optimization=False` 워크어라운드 전부 삭제
+- 효과: 마지막 epoch 학습 정지/LR 동결 사라짐 → 전 epoch 정상 학습 + cosine이 eta_min까지 도달
+- `train_vsgaze.sh`/`train_gazefollow.sh`의 swa·t_0_epochs override 정리
+
+### Loss: pos_weight config화
+- `compute_social_loss`에 `lah/laeo/coatt_pos_weight` 파라미터 추가
+- config `loss:` 섹션 신설 (`lah_pos_weight`/`laeo_pos_weight`/`sa_pos_weight`), train/val 호출부에서 `cfg.loss.*` 전달
+- 기본값 LAH=3.0 / LAEO=2.0 / SA=2.0 (기존과 동일)
+
+### Loss 함수 정리 (audit)
+- `compute_heatmap_loss`: `F.mse_loss(reduce=False)` → `reduction="none"` (deprecated API)
+- `compute_heatmap_loss`/`compute_angular_loss`: `np.int` → `int` (numpy≥1.24 제거 API; dataset=None이라 잠복이었음)
+
+### Upper-triangle 일관성 (SA + LAEO)
+- SA·LAEO는 대칭(mat[i,j]=mat[j,i]) → train/val loss에서 **둘 다 upper-tri(src<dst)** 로 통일 (기존엔 SA만)
+- metric: `gt.masked_fill(~mask, -1)` → ignore_index로 대칭 pair를 **1회만 채점** (loss와 일관)
+- LAH은 directed라 양방향 유지
+- 수치 영향 거의 없음 (중복 제거라 AP/AUC·loss 평균 보존). 정합성 정리.
+
+### val/test dataloader
+- `vsgaze.py`: val/test `shuffle=False` (train만 True) — Lightning 권장, 평가 재현성
+
+> **요약:** V14.6 = V14.5 아키텍처 그대로 + (정리 A/C/F) + (학습 인프라: step-level cosine warmup / SWA 제거 / pos_weight config / loss audit / upper-tri 일관성). 모델 forward·초기화는 V14.5와 동일하게 유지됨.
+
+---
+
 ## 버전별 핵심 변경 비교
 
 | 항목 | V6 | V9 | V10 | V11 | V12 | V13 | V14 |

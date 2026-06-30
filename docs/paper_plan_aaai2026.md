@@ -1,7 +1,7 @@
 # AAAI 2026 Paper Plan
-**생성일:** 2026-06-14  
+**생성일:** 2026-06-14 (VLM 부분 2026-06-29 제거·deferred)  
 **데드라인:** 2026년 8월 초 (AAAI 2026)  
-**상태:** LAH 실험 진행 중 / VLM Stage B 학습 전
+**상태:** edge-centric graph(V14.6) 정리 완료 / VLM 보강은 동료 코드 통합 후 별도 진행
 
 ---
 
@@ -9,7 +9,7 @@
 *Edge-Centric Directed Graph Reasoning for Multi-Person Social Gaze Prediction*
 
 ## 한 줄 주장
-Person token pair 방식 대신 directed edge feature를 직접 social prediction에 활용하면 "i가 j를 본다"는 행위를 구조적으로 인코딩할 수 있으며, 이를 VLM reasoning으로 보강해 LAH/LAEO/SA 전 태스크에서 유의미한 성능 향상을 달성한다.
+Person token pair 방식 대신 directed edge feature를 직접 social prediction에 활용하면 "i가 j를 본다"는 행위를 구조적으로 인코딩할 수 있으며, LAH/LAEO/SA 전 태스크에서 유의미한 성능 향상을 달성한다. (VLM reasoning 보강은 추후 별도)
 
 ---
 
@@ -21,7 +21,8 @@ Person token pair 방식 대신 directed edge feature를 직접 social predictio
 - **Contribution preview:**
   1. Directed edge-centric graph로 social gaze를 명시적으로 모델링
   2. E[i→j] 기반 head 설계로 LAH/LAEO/SA 개선
-  3. VLM knowledge graph로 추가 성능 향상
+  3. null_in/out 노드로 scene·out-of-frame 응시를 명시적 target으로 처리
+  - (VLM 보강은 동료 코드 통합 후 추가 contribution 후보 — 추후)
 - **Word count 목표:** ~600-800 words
 
 ### Chapter 2 — Related Work
@@ -29,9 +30,8 @@ Person token pair 방식 대신 directed edge feature를 직접 social predictio
 |------|-----------|
 | Gaze following | Low-level "어디를 보는가"는 잘 다루나 person-to-person relation 없음 |
 | Social gaze | Relation modeling 시도했으나 person token 기반 → 행위 자체를 구조적으로 인코딩 못함 |
-| VLM reasoning | Social relation 이해 능력 있고 gaze와 결합 시도 있으나, graph evidence를 reasoner에 주입하는 방식은 미개척 |
 
-- **결론 문단 목적:** 세 계열 모두 부분적 해결 → edge-centric graph + VLM reasoner 통합이 필요
+- **결론 문단 목적:** edge-centric directed graph로 social relation을 구조적으로 인코딩하는 접근이 필요
 
 ### Chapter 3 — Method
 
@@ -69,12 +69,8 @@ Person token pair 방식 대신 directed edge feature를 직접 social predictio
 - **null_out:** frame 밖 응시 커버
 - 없으면 해당 케이스가 다른 person edge로 흘러들어가 그래프 전체 오염
 
-#### (C) VLM Stage B
-- 동결 MTGS → forward hook으로 E/v_src/v_tgt/edge_valid 추출
-- `GraphEvidenceTokenizer`: E_c (center frame) → M=32 token G_VLM
-- `EvidenceAugmentedVLM`: Qwen3-VL-8B, 9개 Full-Attn 레이어에 cross-attn 주입 (gate 0-init)
-- Yes/No QA loss로 LAH/LAEO/SA alignment 학습
-- 학습 대상: graph_tokenizer, W_node, MemoryCrossAttn×9, `<P>` embedding
+#### (C) VLM 보강 — **추후 재작성 예정 (TBD)**
+> 기존 VLM(Stage B) 구현은 전부 제거됨. VLM 보강은 **동료 코드 통합 후 새로 설계·기술**할 예정. 옛 설계(GraphEvidenceTokenizer/EvidenceAugmentedVLM)는 폐기.
 
 ### Chapter 4 — Experiments
 
@@ -93,15 +89,17 @@ Person token pair 방식 대신 directed edge feature를 직접 social predictio
 
 **Ablation 항목 (필수):**
 1. null_in/out 제거 → null 노드의 기여도 검증
-2. VLM 제거 → Stage B contribution 단독 측정
-3. Source node heatmap XAttn 제거 → node init 설계의 중요성
-4. LAH head 입력 구성: E[i→j] 단독 vs +heatmap[i] vs +v_src/v_tgt (진행 중)
+2. null_in column-attention 제거 → SA의 edge-기반 cross-person scene-gaze 인코딩 검증
+3. dual-role refinement / re-injection 제거 → refinement 설계의 중요성
+4. node→edge readout (gaze_graph.use=false vs true) → edge-centric 핵심 주장 검증
+5. SA head 입력 구성 (ni only vs +directed edge)
+- (VLM 관련 ablation은 동료 코드 통합 후 추가 예정)
 
 ### Chapter 5 — Discussion & Conclusion
 - **Take-home:** Directed graph로 사회적 상호작용을 모델링하면 person token보다 직관적·구조적 예측 가능 (교수님과 정교화 예정)
-- **한계 1:** Graph + VLM inference overhead — gaze following 단독 대비 무거움
+- **한계 1:** Graph inference overhead — gaze following 단독 대비 무거움
 - **한계 2:** 학습 N≤4 고정 / 테스트 가변 N = batch_size=1 제약
-- **Future work:** LAH head 피처 설계 자동화, VLM Stage C joint fine-tuning, 더 큰 N 스케일링
+- **Future work:** 더 큰 N 스케일링, VLM 보강(동료 코드 통합 후)
 
 ---
 
@@ -113,8 +111,8 @@ Person token pair 방식 대신 directed edge feature를 직접 social predictio
 | I-2 | **SA 메커니즘:** null_in edge가 "이 사람이 장면의 어디를 보는가"를 집약 → SA head가 장면 응시 패턴 비교를 직접 수행 가능 | Q2 |
 | I-3 | **Null node 역할:** null_in=비-인물 응시, null_out=frame 밖. 없으면 해당 케이스가 다른 edge로 흘러들어가 그래프 오염 | Q9 |
 | I-4 | **Dual-role node:** Source="어디를 보는가"(gaze output), Target="얼마나 보여지는가"(gaze input) — 동일 person이지만 역할이 다르므로 분리 초기화 필요 | Q8 |
-| I-5 | **Contribution claim:** Edge-centric directed graph + VLM knowledge graph reasoning의 결합이 핵심 novelty | L5-W1 |
-| I-6 | **Priority:** LAH 개선 최우선. SA는 확보. VLM은 추가 contribution이지만 논문 성립의 필수 요건 아님 | Q4 |
+| I-5 | **Contribution claim:** Edge-centric directed graph로 social relation 디코딩 단위를 node→edge로 이전 (VLM 보강은 추후 별도) | L5-W1 |
+| I-6 | **Priority:** edge-centric graph가 핵심. (VLM은 동료 코드 통합 후 추가 contribution 후보) | Q4 |
 | I-7 | **가장 약한 고리:** LAH AP 개선 미확인. 실험 결과가 나와야 핵심 주장 완성. LAEO도 파생이므로 동일 리스크 | Q15 |
 | I-8 | **Open question (L5-W2):** "이 논문이 없으면 문헌에서 무엇이 빠지는가" — 교수님·팀원과 상의 후 contribution 서술 정교화 필요 | Step 2.5 |
 
@@ -123,8 +121,8 @@ Person token pair 방식 대신 directed edge feature를 직접 social predictio
 ## 리스크 & 다음 액션
 
 **논문 성립 필수 조건:**
-1. **LAH AP 유의미한 개선** — head 피처 설계 실험 (heatmap, v_src/v_tgt 추가) 결과 확인
-2. **VLM Stage B 학습 완료 + 성능 검증** (기간이 허용하는 한)
+1. **LAH AP 유의미한 개선** — head 피처 설계 실험 결과 확인 (※ 현재 V14.6에서 LAH AP 개선 확보됨)
+2. (VLM 보강은 동료 코드 통합 후 별도 진행 — 논문 성립 필수 요건 아님)
 
 **현재 확보된 것:**
 - SA AP: +5.4p 개선 (0.6114 → 0.6652)
