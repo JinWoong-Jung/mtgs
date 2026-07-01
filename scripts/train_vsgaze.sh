@@ -33,12 +33,12 @@ WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # GazeFol
 
 FROZEN=false
 
-EXP_NAME="V14.7_pos_weight=[6.38,26.92,2.11]"
+EXP_NAME="V14.8(lah_min)"
 
 CHECKPOINT_MONITOR="metric/val/social_ap"
 CHECKPOINT_MODE="max"
 
-LAEO_DERIVE="decoder"
+LAEO_DERIVE="lah_min"
 
 python -s ./main.py experiment.task=$TASKS \
     model.weights=$WEIGHTS \

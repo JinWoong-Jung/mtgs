@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from mtgs.utils import pair, build_2d_sincos_posemb
+from mtgs.utils import pair
 from mtgs.networks.adaptor_modules import InteractionBlock, GazeGraphBlock
 
 import logging
@@ -83,16 +83,6 @@ class MTGS(nn.Module):
 
         self.gaze_encoder_temporal = TransformerBlock(
             dim=gaze_feature_dim, num_heads=8, mlp_ratio=0.25, drop_path_rate=0.3
-        )
-
-        self.image_tokenizer = SpatialInputTokenizer(
-            num_channels=3,
-            stride_level=1,
-            patch_size=patch_size,
-            token_dim=token_dim,
-            use_sincos_pos_emb=True,
-            is_learnable_pos_emb=False,
-            image_size=image_size,
         )
 
         # scene encoder: DINOv2
@@ -177,9 +167,6 @@ class MTGS(nn.Module):
                 torch.zeros(window_size, gaze_feature_dim)
             )  # final used
 
-        # speaking status projection layer
-        self.speaking_proj = nn.Linear(1, token_dim)
-
         # gaze point decoder
         self.output = output
         if output == "heatmap":
@@ -191,8 +178,6 @@ class MTGS(nn.Module):
                 hidden_dims=decoder_hidden_dims,
                 use_bn=decoder_use_bn,
             )
-        else:
-            self.gaze_decoder = LinearDecoder(token_dim // 2)
 
         # projection layers for social gaze prediction
         self.gaze_projs = nn.Sequential(
@@ -468,23 +453,6 @@ class ResidualLinearBlock(nn.Module):
         z = torch.relu(self.bn1(self.fc1(x)))
         o = torch.relu(self.bn2(self.fc2(z)) + self.res_fc(x))
         return o
-
-
-class LinearDecoder(nn.Module):
-    def __init__(self, token_dim):
-        super().__init__()
-        self.token_dim = token_dim
-
-        self.block1 = ResidualLinearBlock(2 * token_dim, scale=2)
-        self.block2 = ResidualLinearBlock(token_dim // 2, scale=2)
-        self.fc = nn.Linear(token_dim // 8, 2)
-
-    def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.fc(x)
-        x = torch.sigmoid(x)
-        return x
 
 
 class InOutDecoder(nn.Module):
@@ -765,96 +733,6 @@ class DropPath(nn.Module):
 # ****************************************************** #
 #                SPATIAL INPUT TOKENIZER                 #
 # ****************************************************** #
-class SpatialInputTokenizer(nn.Module):
-    """Tokenizer for spatial inputs, like images or heatmaps.
-    Creates tokens from patches over the input image.
-
-    :param num_channels: Number of input channels of the image/feature map
-    :param stride_level: Stride level compared to the full-sized image (e.g. 4 for 1/4th the size of the image).
-    :param patch_size: Int or tuple of the patch size over the full image size. Patch size for smaller inputs will be computed accordingly.
-    :param token_dim: Dimension of output tokens.
-    :param use_sincos_pos_emb: Set to True (default) to use fixed 2D sin-cos positional embeddings.
-    :param is_learnable_pos_emb: Set to True to learn positional embeddings instead.
-    :param image_size: Default image size. Used to initialize size of positional embeddings.
-    """
-
-    def __init__(
-        self,
-        num_channels: int,
-        stride_level: int,
-        patch_size: Union[int, Tuple[int, int]],
-        token_dim: int = 768,
-        use_sincos_pos_emb: bool = True,
-        is_learnable_pos_emb: bool = False,
-        image_size: Union[int, Tuple[int]] = 224,
-    ):
-        super().__init__()
-        self.num_channels = num_channels
-        self.stride_level = stride_level
-        self.patch_size = pair(patch_size)
-        self.token_dim = token_dim
-        self.use_sincos_pos_emb = use_sincos_pos_emb
-        self.is_learnable_pos_emb = is_learnable_pos_emb
-        self.image_size = pair(image_size)
-        self.num_patches = (self.image_size[0] // self.patch_size[0]) * (
-            self.image_size[1] // self.patch_size[1]
-        )
-
-        self.P_H = max(1, self.patch_size[0] // stride_level)
-        self.P_W = max(1, self.patch_size[1] // stride_level)
-
-        self._init_pos_emb()
-        self.proj = nn.Conv2d(
-            in_channels=self.num_channels,
-            out_channels=self.token_dim,
-            kernel_size=(self.P_H, self.P_W),
-            stride=(self.P_H, self.P_W),
-        )
-
-    def _init_pos_emb(self):
-        # Fixed-size positional embeddings. Can be interpolated to different input sizes
-        h_pos_emb = self.image_size[0] // (self.stride_level * self.P_H)
-        w_pos_emb = self.image_size[1] // (self.stride_level * self.P_W)
-
-        if self.use_sincos_pos_emb:
-            self.pos_emb = build_2d_sincos_posemb(
-                h=h_pos_emb, w=w_pos_emb, embed_dim=self.token_dim
-            )
-            self.pos_emb = nn.Parameter(
-                self.pos_emb, requires_grad=self.is_learnable_pos_emb
-            )
-        else:
-            self.pos_emb = nn.Parameter(
-                torch.zeros(1, self.token_dim, h_pos_emb, w_pos_emb)
-            )
-            nn.init.trunc_normal_(self.pos_emb, mean=0.0, std=0.02, a=-2.0, b=2.0)
-
-    def forward(self, x):
-        # input.shape = BxCxHxW >> output.shape = BxNxD (where N=n_tokens, D=token_dim)
-
-        B, C, H, W = x.shape
-
-        assert (H % self.P_H == 0) and (W % self.P_W == 0), (
-            f"Image size {H}x{W} must be divisible by patch size {self.P_H}x{self.P_W}"
-        )
-        # Number of patches in height and width
-        N_H, N_W = H // self.P_H, W // self.P_W
-
-        # Create tokens [B, C, PH, PW] >> [B, D, H, W] >> [B, (H*W), D]
-        x_tokens = einops.rearrange(self.proj(x), "b d h w -> b (h w) d")
-
-        # Create positional embedding
-        x_pos_emb = F.interpolate(
-            self.pos_emb, size=(N_H, N_W), mode="bicubic", align_corners=False
-        )
-        x_pos_emb = einops.rearrange(x_pos_emb, "b d h w -> b (h w) d")
-
-        # Add patches and positional embeddings
-        x = x_tokens + x_pos_emb
-
-        return x, N_H, N_W
-
-
 class Interpolate(nn.Module):
     """Interpolation module."""
 

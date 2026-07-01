@@ -34,7 +34,7 @@ model:
   decoder_hidden_dims: [96, 192, 384, 768]
   decoder_use_bn: True
   gaze_weights: /home/jinwoongjung/MTGS/weights/gaze360_resnet18.pt # update path
-  weights: "/home/jinwoongjung/MTGS/experiments/GazeFollow/train/checkpoints/best.ckpt"  # {False, path to weights}
+  weights: "/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # {False, path to weights}
 
 # ── Gaze Graph (social-prediction head; attached after the fixed interaction trunk) ──
 gaze_graph:
@@ -153,10 +153,11 @@ scheduler:
     # (real dataloader length) → smooth per-step, independent of data.num_samples
 
 # ── Social BCE pos_weight (rare-positive upweighting) per task ──────────────
+# Config-ized from the old hardcoded values (V14.5 behaviour: lah=3.0, laeo=2.0, sa=2.0).
 loss:
-  lah_pos_weight: 6.38
-  laeo_pos_weight: 26.92
-  sa_pos_weight: 2.11     # only used when SA is logit-based (coatt_is_prob=False)
+  lah_pos_weight: 3.0
+  laeo_pos_weight: 2.0
+  sa_pos_weight: 2.0      # only used when SA is logit-based (coatt_is_prob=False)
 
 hydra:
   run:

@@ -250,9 +250,9 @@ def _compute_bbox_overlap(
     area = mask.sum((-2, -1)).clamp(min=1.0)  # (BT, N_tgt)
 
     # overlap[b, i, j] = Σ_{hw} hm[b,i,h,w] * mask[b,j,h,w]
-    #   hm_norm  (BT, N_src, H, W) → unsqueeze N_tgt → (BT, N_src, 1, H, W)
-    #   mask     (BT, N_tgt, H, W) → unsqueeze N_src → (BT, 1, N_tgt, H, W)
-    overlap = (hm_norm.unsqueeze(2) * mask.unsqueeze(1)).sum((-2, -1))  # (BT, N_src, N_tgt)
+    # einsum contracts H,W directly (batched matmul) — avoids materialising the
+    # (BT, N_src, N_tgt, H, W) intermediate, which blows up VRAM at test (N up to 39).
+    overlap = torch.einsum("bihw,bjhw->bij", hm_norm, mask)  # (BT, N_src, N_tgt)
     return overlap.to(dtype)  # already in [0,1]: hm_norm sums to 1
 
 

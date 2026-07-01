@@ -129,50 +129,6 @@ class MTGSModel(pl.LightningModule):
         # Freeze Weights
         self._freeze()
 
-    @staticmethod
-    def _remap_gaze_graph_weights(weights):
-        """Back-compat warm-start for the two-path GazeGraphBlock.
-
-        A pre-split gaze_graph checkpoint has a single shared refinement
-        (`row_layer/col_layer/upd_*/norm_*/refresh/norm_e`) + one `edge_head`.
-        The new layout has two isolated refiners (`trunk.*`, `sa.*`) + per-type
-        heads (`head_lah/head_sa/head_null`). Copy the old shared weights onto
-        BOTH paths (and the old head onto all three heads) so LAH refinement is
-        preserved instead of cold-starting. No-op for new-layout checkpoints.
-        """
-        prefix = "gaze_graph_block."
-        has_old = any(k.startswith(prefix + "edge_head.") for k in weights)
-        has_new = any(k.startswith(prefix + "trunk.") for k in weights)
-        if not has_old or has_new:
-            return weights
-
-        refine_map = {
-            "row_layer": "row", "col_layer": "col",
-            "upd_src": "upd_src", "upd_tgt": "upd_tgt",
-            "norm_src": "norm_src", "norm_tgt": "norm_tgt",
-            "refresh": "refresh", "norm_e": "norm_e",
-        }
-        out = OrderedDict()
-        for k, v in weights.items():
-            if not k.startswith(prefix):
-                out[k] = v
-                continue
-            sub = k[len(prefix):]                       # e.g. "row_layer.self_attn..."
-            top = sub.split(".", 1)[0]
-            rest = sub[len(top):]                       # ".<param...>"
-            if top in refine_map:
-                new = refine_map[top] + rest
-                out[prefix + "trunk." + new] = v
-                out[prefix + "sa." + new] = v.clone()
-            elif top == "edge_head":
-                out[prefix + "head_lah" + rest] = v
-                out[prefix + "head_null" + rest] = v.clone()
-                out[prefix + "head_sa" + rest] = v.clone()
-            else:                                       # mlp_init, *xattn*, node projs, region/hm, etc.
-                out[k] = v
-        logger.info("Remapped pre-split GazeGraphBlock weights onto trunk/sa two-path layout")
-        return out
-
     def _init_weights(self):
         # Load pre-trained weights
         if self.model_weights:
@@ -183,7 +139,6 @@ class MTGSModel(pl.LightningModule):
                     for name, value in model_ckpt["state_dict"].items()
                 ]
             )
-            model_weights = self._remap_gaze_graph_weights(model_weights)
             model_state = self.model.state_dict()
             skipped = []
             filtered_weights = OrderedDict()
