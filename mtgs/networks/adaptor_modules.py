@@ -25,7 +25,7 @@ class CrossAttention(nn.Module):
         self.q = nn.Linear(dim, dim, bias=use_q_bias)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, gaze_token, img_tokens, key_padding_mask=None):
+    def forward(self, gaze_token, img_tokens):
         B, N, C = img_tokens.shape
         _, NP, _ = gaze_token.shape
 
@@ -44,11 +44,6 @@ class CrossAttention(nn.Module):
         )
 
         attn = (q @ k.transpose(-2, -1)) * self.scale  # (b, nh, np, n)
-        if key_padding_mask is not None:
-            # key_padding_mask: (b, n) bool, True = exclude key
-            attn = attn.masked_fill(
-                key_padding_mask[:, None, None, :], float("-inf")
-            )
         attn = attn.softmax(dim=-1)
 
         o = (attn @ v).transpose(1, 2).reshape(B, NP, C)  # (b, np, d)
@@ -247,11 +242,10 @@ def _compute_bbox_overlap(
         (xx.view(1, 1, 1, W) >= x1) & (xx.view(1, 1, 1, W) <= x2) &
         (yy.view(1, 1, H, 1) >= y1) & (yy.view(1, 1, H, 1) <= y2)
     ).to(dtype)
-    area = mask.sum((-2, -1)).clamp(min=1.0)  # (BT, N_tgt)
 
-    # overlap[b, i, j] = Σ_{hw} hm[b,i,h,w] * mask[b,j,h,w]
-    # einsum contracts H,W directly (batched matmul) — avoids materialising the
-    # (BT, N_src, N_tgt, H, W) intermediate, which blows up VRAM at test (N up to 39).
+    # overlap[b, i, j] = Σ_{hw} hm_norm[b,i,h,w] * mask[b,j,h,w]
+    #   Contract H,W directly with einsum — avoids materialising the
+    #   (BT, N_src, N_tgt, H, W) outer product (huge for large N at test time).
     overlap = torch.einsum("bihw,bjhw->bij", hm_norm, mask)  # (BT, N_src, N_tgt)
     return overlap.to(dtype)  # already in [0,1]: hm_norm sums to 1
 
@@ -458,12 +452,15 @@ class GazeGraphBlock(nn.Module):
         heads: int = 4,
         use_prior: bool = True,
         prior_weight: float = 0.5,
+        use_node_xattn: bool = True,   # deprecated (V14): node init no longer uses heatmap XAttn
         face_dim: int = 768,           # raw GazeEncoder token dim (pre-adaptor facial feature)
+        laeo_derive: str = "lah_min",  # "decoder": use head_laeo | "lah_min": derived downstream
     ):
         super().__init__()
         D, De = token_dim, edge_dim
         self.De             = De
         self.use_prior      = use_prior
+        self.laeo_derive    = laeo_derive
 
         # ── Null node parameters (one per null type) ──────────────────────────
         self.null_in_node  = nn.Parameter(torch.zeros(D))
@@ -582,6 +579,12 @@ class GazeGraphBlock(nn.Module):
         null_in_prior    = 1.0 - person_bbox_mass
         null_out_prior   = 1.0 - in_prob
 
+        # Detach gaze_vecs: the graph consumes predicted gaze as fixed geometric
+        # evidence (like the detached heatmap and the data-only bboxes). Social-graph
+        # gradients must not flow back into the gaze-regression head, keeping the
+        # front-end origin-faithful.  Used by both the align prior and the geom node feat.
+        gaze_vecs = gaze_vecs.detach()
+
         # p2p prior: cos(gaze_vec[i], normalize(center[j] - center[i]))
         centers  = (head_bboxes[..., :2] + head_bboxes[..., 2:]) * 0.5  # (B, T, N, 2)
         wh       = (head_bboxes[..., 2:] - head_bboxes[..., :2])        # (B, T, N, 2)
@@ -663,12 +666,18 @@ class GazeGraphBlock(nn.Module):
             E_pp.reshape(B * T * N * N, De)
         ).reshape(B, T, N, N)
 
-        # LAEO: MLP(cat(E[i→j], E[j→i])) — average both orderings for exact symmetry
-        laeo_mat = self.head_laeo(
-            torch.cat([E_pp, E_pp.transpose(2, 3)], dim=-1)
-            .reshape(B * T * N * N, 2 * De)
-        ).reshape(B, T, N, N)
-        laeo_mat = (laeo_mat + laeo_mat.transpose(2, 3)) * 0.5
+        # LAEO: only the "decoder" mode uses head_laeo. "lah_min" derives LAEO from
+        # LAH downstream (mtgs_net), so skip the head_laeo forward entirely here to
+        # avoid wasted compute on a discarded output.
+        if self.laeo_derive == "decoder":
+            # MLP(cat(E[i→j], E[j→i])) — average both orderings for exact symmetry
+            laeo_mat = self.head_laeo(
+                torch.cat([E_pp, E_pp.transpose(2, 3)], dim=-1)
+                .reshape(B * T * N * N, 2 * De)
+            ).reshape(B, T, N, N)
+            laeo_mat = (laeo_mat + laeo_mat.transpose(2, 3)) * 0.5
+        else:
+            laeo_mat = None
 
         # SA: edge-based, cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
         ni     = E[:, :, :, N, :]                                          # (B,T,N,De) null_in edge per person
@@ -697,6 +706,8 @@ class GazeGraphBlock(nn.Module):
         ], dim=2)
 
         return (
-            lah_mat.float(), laeo_mat.float(), sa_mat.float(),
+            lah_mat.float(),
+            laeo_mat.float() if laeo_mat is not None else None,
+            sa_mat.float(),
             null_in_out.float(), null_out_out.float(), edge_valid,
         )

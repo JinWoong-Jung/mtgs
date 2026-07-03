@@ -34,7 +34,8 @@ model:
   decoder_hidden_dims: [96, 192, 384, 768]
   decoder_use_bn: True
   gaze_weights: /home/jinwoongjung/MTGS/weights/gaze360_resnet18.pt # update path
-  weights: "/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # {False, path to weights}
+  multivit_weights: False
+  weights: "/home/jinwoongjung/MTGS/experiments/GazeFollow/train/checkpoints/best.ckpt"  # {False, path to weights}
 
 # ── Gaze Graph (social-prediction head; attached after the fixed interaction trunk) ──
 gaze_graph:
@@ -43,9 +44,12 @@ gaze_graph:
   edge_dim: 256         # edge hidden dim De (V14: node D=512와 동일하게 상향)
   use_prior: true       # scale geometric edge features by learnable prior_w
   prior_weight: 0.5     # initial value of prior_w
+  use_node_xattn: true  # (V14에서 deprecated: node init은 heatmap XAttn 미사용)
   frozen: false         # true: freeze trunk, train only gaze_graph_block
   laeo_derive: "lah_min"  # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
   lambda_null: 0.5      # weight for dual null-edge loss (null_in + null_out)
+
+# (vlm: 섹션 제거됨 — VLM은 향후 동료 코드로 재도입 예정)
 
 head_detector:
   checkpoint_file: /home/jinwoongjung/MTGS/weights/crowdhuman_yolov5m.pt # update path
@@ -124,8 +128,11 @@ train:
   freeze:
     gaze_encoder: False
     gaze_encoder_backbone: False
+    image_tokenizer: True
+    depth_tokenizer: False
     vit_encoder: True
     vit_adaptor: False
+    gaze_decoder: False
     inout_decoder: False
     # Post-training (gaze_graph only): use the loaded transformer trunk as a
     # FROZEN visual extractor and train ONLY gaze_graph_block. Freezes the whole
@@ -133,6 +140,11 @@ train:
     all_but_gaze_graph: False
   checkpoint_monitor: "metric/val/dist"
   checkpoint_mode: "min"
+  swa:
+    use: False   # disabled: LR now follows linear-warmup → full cosine decay over all epochs
+    lr: [1e-6, 1e-6, 1e-6, 3e-7]  # (dormant) 4 param groups (gaze-encoder-temporal, people-temporal, gaze-graph-block, base)
+    epoch_start: 12
+    annealing_epochs: 6
 
 val:
   batch_size: 8
@@ -146,18 +158,9 @@ optimizer:
   weight_decay: 1e-3
 
 scheduler:
-    type: CosineAnnealingLR  # {CosineAnnealingLR, StepLR}
-    warmup_epochs: 2         # per-step linear warmup spanning 2 epochs (smooth ramp)
-    eta_min: 1.0e-8          # cosine floor
-    # step-level: warmup/cosine step counts derived from trainer.estimated_stepping_batches
-    # (real dataloader length) → smooth per-step, independent of data.num_samples
-
-# ── Social BCE pos_weight (rare-positive upweighting) per task ──────────────
-# Config-ized from the old hardcoded values (V14.5 behaviour: lah=3.0, laeo=2.0, sa=2.0).
-loss:
-  lah_pos_weight: 3.0
-  laeo_pos_weight: 2.0
-  sa_pos_weight: 2.0      # only used when SA is logit-based (coatt_is_prob=False)
+    type: CosineAnnealingLR
+    warmup_epochs: 3   # linear warmup length in EPOCHS (converted to steps internally for a continuous ramp)
+    eta_min: 0         # final LR floor for the cosine decay
 
 hydra:
   run:

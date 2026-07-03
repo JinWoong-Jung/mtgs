@@ -8,13 +8,15 @@ import itertools
 import os
 from typing import List, Tuple, Union
 
+import math
 import einops
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from mtgs.utils import pair
+import torchvision.transforms.functional as TF
+from mtgs.utils import pair, build_2d_sincos_posemb
 from mtgs.networks.adaptor_modules import InteractionBlock, GazeGraphBlock
 
 import logging
@@ -52,6 +54,7 @@ class MTGS(nn.Module):
         gaze_graph_edge_dim: int = 128,
         gaze_graph_use_prior: bool = True,
         gaze_graph_prior_weight: float = 0.5,
+        gaze_graph_use_node_xattn: bool = True,
         gaze_graph_laeo_derive: str = "decoder",
         gaze_graph_use: bool = True,
     ):
@@ -85,7 +88,29 @@ class MTGS(nn.Module):
             dim=gaze_feature_dim, num_heads=8, mlp_ratio=0.25, drop_path_rate=0.3
         )
 
-        # scene encoder: DINOv2
+        self.image_tokenizer = SpatialInputTokenizer(
+            num_channels=3,
+            stride_level=1,
+            patch_size=patch_size,
+            token_dim=token_dim,
+            use_sincos_pos_emb=True,
+            is_learnable_pos_emb=False,
+            image_size=image_size,
+        )
+
+        # scene encoder: MultiMAE
+        # self.encoder = ViTEncoder(
+        #     num_global_tokens = encoder_num_global_tokens,
+        #     token_dim = token_dim,
+        #     depth = encoder_depth,
+        #     num_heads = encoder_num_heads,
+        #     mlp_ratio = encoder_mlp_ratio,
+        #     use_qkv_bias = encoder_use_qkv_bias,
+        #     drop_rate = encoder_drop_rate,
+        #     attn_drop_rate = encoder_attn_drop_rate,
+        #     drop_path_rate = encoder_drop_path_rate
+        # )
+        # scene encoder: DinoV2
         _dinov2_cache = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
         if os.path.isdir(_dinov2_cache):
             self.encoder = torch.hub.load(_dinov2_cache, "dinov2_vitb14", source="local")
@@ -142,7 +167,9 @@ class MTGS(nn.Module):
                 num_layers=gaze_graph_num_layers,
                 use_prior=gaze_graph_use_prior,
                 prior_weight=gaze_graph_prior_weight,
+                use_node_xattn=gaze_graph_use_node_xattn,
                 face_dim=token_dim,   # raw GazeEncoder token dim (pre-adaptor face)
+                laeo_derive=gaze_graph_laeo_derive,  # skip head_laeo forward when "lah_min"
             )
         else:
             # Original social decoders: LAH (directed [h_i‖h_j]) + SA (symmetric
@@ -167,9 +194,23 @@ class MTGS(nn.Module):
                 torch.zeros(window_size, gaze_feature_dim)
             )  # final used
 
+        # speaking status projection layer
+        self.speaking_proj = nn.Linear(1, token_dim)
+
         # gaze point decoder
         self.output = output
         if output == "heatmap":
+            #             self.gaze_hm_decoder = HMDecoder(stride_level = 1,
+            #                                              patch_size = patch_size,
+            #                                              token_dim = token_dim,
+            #                                              image_size = image_size,
+            #                                              hm_size = self.hm_size)
+            #             self.gaze_hm_decoder = LinearHeatmapDecoder(input_dim = token_dim,
+            #                                                          output_hm_size = self.hm_size)
+            #             self.gaze_hm_decoder = SimplerHeatmapDecoder(token_dim = token_dim,
+            #                                                          h = self.image_size[1]//patch_size,
+            #                                                          w = self.image_size[0]//patch_size,
+            #                                                          output_hm_size = self.hm_size)
             self.gaze_hm_decoder_new = ConditionalDPTDecoder(
                 token_dim=token_dim,
                 feature_dim=decoder_feature_dim,
@@ -178,6 +219,8 @@ class MTGS(nn.Module):
                 hidden_dims=decoder_hidden_dims,
                 use_bn=decoder_use_bn,
             )
+        else:
+            self.gaze_decoder = LinearDecoder(token_dim // 2)
 
         # projection layers for social gaze prediction
         self.gaze_projs = nn.Sequential(
@@ -222,6 +265,9 @@ class MTGS(nn.Module):
 
         # Tokenize Inputs ===================================================
         b, t, c, h_img, w_img = x["image"].shape
+        # for MultiMAE
+        # image_tokens, N_H, N_W = self.image_tokenizer(x["image"].view(b*t, c, h_img, w_img)) # (b*t, nt, d) / nt = num_tokens, d = token_dim; (N_H, N_W): number of patches (height, width)
+        # for DinoV2
         image_tokens = self.encoder.prepare_tokens_with_masks(
             x["image"].view(b * t, c, h_img, w_img)
         )
@@ -339,9 +385,6 @@ class MTGS(nn.Module):
         lah_mat  = lah_mat.masked_fill(
             ~ev_lah.unsqueeze(1).expand(b, t, n, n), -1e4
         )
-        laeo_mat = laeo_mat.masked_fill(
-            ~ev_lah.unsqueeze(1).expand(b, t, n, n), -1e4
-        )
         sa_mat   = sa_mat.masked_fill(
             ~ev_sa.unsqueeze(1).expand(b, t, n, n), -1e4
         )
@@ -351,8 +394,12 @@ class MTGS(nn.Module):
         # E[i→j] encodes "i looks at j", so lah_mat[b,a] = E[b→a] = "b looks at a" ✓
         lah   = lah_mat.view(b * t, n, n)[:, dst_idx, src_idx]
         if self.gaze_graph_laeo_derive == "lah_min":
+            # laeo_mat is None here (head_laeo skipped); derive from LAH directions.
             laeo = torch.minimum(lah, lah[:, rev_idx])
         else:
+            laeo_mat = laeo_mat.masked_fill(
+                ~ev_lah.unsqueeze(1).expand(b, t, n, n), -1e4
+            )
             laeo = laeo_mat.view(b * t, n, n)[:, dst_idx, src_idx]
         coatt = sa_mat.view(b * t, n, n)[:, src_idx, dst_idx]
 
@@ -406,6 +453,18 @@ class GazeEncoder(nn.Module):
             nn.Tanh(),
         )
 
+        # Initialize weights
+        # self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
     def forward_backbone(self, head):
         b, n, c, h, w = head.shape
 
@@ -453,6 +512,23 @@ class ResidualLinearBlock(nn.Module):
         z = torch.relu(self.bn1(self.fc1(x)))
         o = torch.relu(self.bn2(self.fc2(z)) + self.res_fc(x))
         return o
+
+
+class LinearDecoder(nn.Module):
+    def __init__(self, token_dim):
+        super().__init__()
+        self.token_dim = token_dim
+
+        self.block1 = ResidualLinearBlock(2 * token_dim, scale=2)
+        self.block2 = ResidualLinearBlock(token_dim // 2, scale=2)
+        self.fc = nn.Linear(token_dim // 8, 2)
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.fc(x)
+        x = torch.sigmoid(x)
+        return x
 
 
 class InOutDecoder(nn.Module):
@@ -582,6 +658,8 @@ class ConditionalDPTDecoder(nn.Module):
             g = self.gaze_projs[f"g{factor}"](gaze_layer)  # (b, n, d) > # (b, n, d')
             # (b, n, d', H/32, W/32) > (b*n, d', H/32, W/32)
             f = torch.einsum("bdhw,bnd->bndhw", f, g).view(-1, self.feature_dim, h, w)
+            # f = f.unsqueeze(1).repeat(1, n, 1, 1, 1) + g.view(b, n, d, 1, 1) # (b, n, d', H/32, W/32)
+            # f = f.view(-1, self.feature_dim, h, w) # (b, n, d', H/32, W/32) > (b*n, d', H/32, W/32)
             if idx == 0:
                 z = self.fusion_blocks[f"f{factor}"](f)  # (b*n, d', H/16, W/16)
             else:
@@ -595,9 +673,193 @@ class ConditionalDPTDecoder(nn.Module):
         return z
 
 
+class LinearHeatmapDecoder(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=1024, output_hm_size=64):
+        """
+        Project and reshape the output gaze token into a heatmap.
+        """
+        super().__init__()
+
+        self.output_hm_size = output_hm_size
+
+        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.res_fc = nn.Linear(input_dim, hidden_dim)
+        self.out_fc = nn.Linear(hidden_dim, output_hm_size[0] * output_hm_size[1])
+
+    def forward(self, x):
+        z = torch.relu(self.bn1(self.fc1(x)))
+        o = torch.relu(self.bn2(self.fc2(z)) + self.res_fc(x))
+        o = self.out_fc(o)
+        o = o.view(-1, self.output_hm_size[1], self.output_hm_size[0])
+        return o
+
+
+class SimplerHeatmapDecoder(nn.Module):
+    """
+    Project image tokens and gaze tokens, then perform a pixel-wise dot-product before
+    upsampling to 64x64 using a resize operation.
+    """
+
+    def __init__(self, token_dim=768, h=14, w=14, output_hm_size=(64, 64), factor=6):
+        super().__init__()
+
+        self.h, self.w = h, w
+        self.num_img_tokens = h * w
+        self.output_hm_size = output_hm_size
+
+        self.img_proj = MLP(token_dim, token_dim, token_dim // factor, drop_rate=0.0)
+        self.gaze_proj = MLP(token_dim, token_dim, token_dim // factor, drop_rate=0.0)
+
+    def forward(self, x_img, x_gaze):
+        b, n, d = x_gaze.shape
+
+        # (b, h*w, d) > (b, h*w, d') > (b, d', h*w)
+        x_img = self.img_proj(x_img).permute(0, 2, 1)
+        x_gaze = self.gaze_proj(x_gaze)  # (b, n, d) > (b, n, d')
+
+        # (b, n, h*w) > (b, n, h', w')
+        heatmap = (x_gaze @ x_img).view(b, n, self.h, self.w)
+        heatmap = TF.resize(
+            heatmap, (self.output_hm_size[1], self.output_hm_size[0]), antialias=True
+        )
+
+        return heatmap
+
+
+class HMDecoder(nn.Module):
+    """
+    Perform an element-wise dot product of a 64x64xtoken_dim positional embedding with the person token then smooth
+    """
+
+    def __init__(
+        self,
+        patch_size: Union[int, Tuple[int, int]],
+        stride_level: int,
+        token_dim: int = 768,
+        image_size: Union[int, Tuple[int]] = 224,
+        hm_size: Union[int, Tuple[int]] = 64,
+    ):
+        super().__init__()
+        patch_size = pair(patch_size)
+        image_size = pair(image_size)
+        hm_size = pair(hm_size)
+
+        # build position embedding
+        P_H = max(1, patch_size[0] // stride_level)
+        P_W = max(1, patch_size[1] // stride_level)
+        h_pos_emb = image_size[0] // (stride_level * P_H)
+        w_pos_emb = image_size[1] // (stride_level * P_W)
+        self.pos_emb = build_2d_sincos_posemb(
+            h=h_pos_emb, w=w_pos_emb, embed_dim=token_dim
+        )
+        self.pos_emb = F.interpolate(
+            self.pos_emb, size=hm_size, mode="bicubic", align_corners=False
+        )
+
+        # smoothing conv layers
+        self.head = nn.Sequential(
+            nn.Conv2d(token_dim, token_dim // 2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(token_dim // 2),
+            nn.ReLU(True),
+            nn.Conv2d(token_dim // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(self, x):
+        device = x.device
+        self.pos_emb = self.pos_emb.to(device)
+        x = self.pos_emb + x.unsqueeze(-1).unsqueeze(-1)
+        x = self.head(x)
+        return x
+
+
 # ****************************************************** #
 #                      VIT ENCODER                       #
 # ****************************************************** #
+class ViTEncoder(nn.Module):
+    def __init__(
+        self,
+        num_global_tokens: int = 1,
+        token_dim: int = 768,
+        depth: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        use_qkv_bias: bool = True,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        drop_path_rate: float = 0.0,
+    ):
+        super().__init__()
+
+        # Add global tokens
+        self.num_global_tokens = num_global_tokens
+        self.global_tokens = nn.Parameter(torch.zeros(1, num_global_tokens, token_dim))
+        nn.init.trunc_normal_(self.global_tokens, std=0.02)
+
+        # Add encoder layers
+        # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.blocks = nn.Sequential(
+            *[
+                TransformerBlock(
+                    dim=token_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    use_qkv_bias=use_qkv_bias,
+                    drop_rate=drop_rate,
+                    attn_drop_rate=attn_drop_rate,
+                    drop_path_rate=dpr[i],
+                )
+                for i in range(depth)
+            ]
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+        # Initialize the weights of Q, K, V separately
+        for name, m in self.named_modules():
+            if isinstance(m, nn.Linear) and ("qkv" in name):
+                val = math.sqrt(6.0 / float(m.weight.shape[0] // 3 + m.weight.shape[1]))
+                nn.init.uniform_(m.weight, -val, val)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def __len__(self):
+        return len(self.encoder)
+
+    def forward(self, input_tokens: torch.Tensor, return_all_layers: bool = True):
+        # Add global tokens to input tokens
+        global_tokens = einops.repeat(
+            self.global_tokens, "() n d -> b n d", b=len(input_tokens)
+        )
+        input_tokens = torch.cat([input_tokens, global_tokens], dim=1)
+
+        # Pass tokens through Transformer
+        if not return_all_layers:
+            encoder_tokens = self.blocks(input_tokens)
+        else:
+            # Optionally access every intermediate layer
+            encoder_tokens = []
+            tokens = input_tokens
+            for block in self.blocks:
+                tokens = block(tokens)
+                encoder_tokens.append(tokens)
+
+        return encoder_tokens
+
+
 class TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -733,6 +995,211 @@ class DropPath(nn.Module):
 # ****************************************************** #
 #                SPATIAL INPUT TOKENIZER                 #
 # ****************************************************** #
+class SpatialInputTokenizer(nn.Module):
+    """Tokenizer for spatial inputs, like images or heatmaps.
+    Creates tokens from patches over the input image.
+
+    :param num_channels: Number of input channels of the image/feature map
+    :param stride_level: Stride level compared to the full-sized image (e.g. 4 for 1/4th the size of the image).
+    :param patch_size: Int or tuple of the patch size over the full image size. Patch size for smaller inputs will be computed accordingly.
+    :param token_dim: Dimension of output tokens.
+    :param use_sincos_pos_emb: Set to True (default) to use fixed 2D sin-cos positional embeddings.
+    :param is_learnable_pos_emb: Set to True to learn positional embeddings instead.
+    :param image_size: Default image size. Used to initialize size of positional embeddings.
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        stride_level: int,
+        patch_size: Union[int, Tuple[int, int]],
+        token_dim: int = 768,
+        use_sincos_pos_emb: bool = True,
+        is_learnable_pos_emb: bool = False,
+        image_size: Union[int, Tuple[int]] = 224,
+    ):
+        super().__init__()
+        self.num_channels = num_channels
+        self.stride_level = stride_level
+        self.patch_size = pair(patch_size)
+        self.token_dim = token_dim
+        self.use_sincos_pos_emb = use_sincos_pos_emb
+        self.is_learnable_pos_emb = is_learnable_pos_emb
+        self.image_size = pair(image_size)
+        self.num_patches = (self.image_size[0] // self.patch_size[0]) * (
+            self.image_size[1] // self.patch_size[1]
+        )
+
+        self.P_H = max(1, self.patch_size[0] // stride_level)
+        self.P_W = max(1, self.patch_size[1] // stride_level)
+
+        self._init_pos_emb()
+        self.proj = nn.Conv2d(
+            in_channels=self.num_channels,
+            out_channels=self.token_dim,
+            kernel_size=(self.P_H, self.P_W),
+            stride=(self.P_H, self.P_W),
+        )
+
+    def _init_pos_emb(self):
+        # Fixed-size positional embeddings. Can be interpolated to different input sizes
+        h_pos_emb = self.image_size[0] // (self.stride_level * self.P_H)
+        w_pos_emb = self.image_size[1] // (self.stride_level * self.P_W)
+
+        if self.use_sincos_pos_emb:
+            self.pos_emb = build_2d_sincos_posemb(
+                h=h_pos_emb, w=w_pos_emb, embed_dim=self.token_dim
+            )
+            self.pos_emb = nn.Parameter(
+                self.pos_emb, requires_grad=self.is_learnable_pos_emb
+            )
+        else:
+            self.pos_emb = nn.Parameter(
+                torch.zeros(1, self.token_dim, h_pos_emb, w_pos_emb)
+            )
+            nn.init.trunc_normal_(self.pos_emb, mean=0.0, std=0.02, a=-2.0, b=2.0)
+
+    def forward(self, x):
+        # input.shape = BxCxHxW >> output.shape = BxNxD (where N=n_tokens, D=token_dim)
+
+        B, C, H, W = x.shape
+
+        assert (H % self.P_H == 0) and (W % self.P_W == 0), (
+            f"Image size {H}x{W} must be divisible by patch size {self.P_H}x{self.P_W}"
+        )
+        # Number of patches in height and width
+        N_H, N_W = H // self.P_H, W // self.P_W
+
+        # Create tokens [B, C, PH, PW] >> [B, D, H, W] >> [B, (H*W), D]
+        x_tokens = einops.rearrange(self.proj(x), "b d h w -> b (h w) d")
+
+        # Create positional embedding
+        x_pos_emb = F.interpolate(
+            self.pos_emb, size=(N_H, N_W), mode="bicubic", align_corners=False
+        )
+        x_pos_emb = einops.rearrange(x_pos_emb, "b d h w -> b (h w) d")
+
+        # Add patches and positional embeddings
+        x = x_tokens + x_pos_emb
+
+        return x, N_H, N_W
+
+
+# ****************************************************** #
+#                      DPT DECODER                       #
+# ****************************************************** #
+class DPTDecoder(nn.Module):
+    def __init__(
+        self,
+        stride_level: int = 1,
+        patch_size: Union[int, Tuple[int, int]] = 16,
+        hooks: List[int] = [2, 5, 8, 11],
+        hidden_dims: List[int] = [96, 192, 384, 768],
+        token_dim: int = 768,
+        feature_dim: int = 256,
+        use_bn: bool = False,
+    ):
+        super().__init__()
+
+        self.stride_level = stride_level
+        self.patch_size = pair(patch_size)
+        self.hooks = hooks
+        self.token_dim = token_dim
+        self.hidden_dims = hidden_dims
+        self.feature_dim = feature_dim
+        self.use_bn = use_bn
+
+        self.P_H = max(1, self.patch_size[0] // stride_level)
+        self.P_W = max(1, self.patch_size[1] // stride_level)
+
+        self.reassemble_blocks = nn.ModuleDict(
+            {
+                f"r{factor}": Reassemble(
+                    factor,
+                    hidden_dims[idx],
+                    feature_dim=feature_dim,
+                    token_dim=token_dim,
+                )
+                for idx, factor in enumerate([4, 8, 16, 32])
+            }
+        )
+
+        self.fusion_blocks = nn.ModuleDict(
+            {
+                f"f{factor}": FusionBlock(feature_dim, use_bn=use_bn)
+                for idx, factor in enumerate([4, 8, 16, 32])
+            }
+        )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(
+                feature_dim, feature_dim // 2, kernel_size=3, stride=1, padding=1
+            ),
+            Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(feature_dim // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+        )
+
+        # Initialize weights
+        # self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if (
+            isinstance(m, nn.Linear)
+            or isinstance(m, nn.Conv2d)
+            or isinstance(m, nn.ConvTranspose2d)
+        ):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def filter_tokens(self, tokens, start, end):
+        """Takes a sequence of tokens as input and keeps only the ones to be used by the decoder."""
+        # tokens.shape = BxTxD (B=batch, T=tokens, D=dim)
+        return tokens[:, start:end, :]
+
+    def forward(self, x):
+        H, W = x["image_size"]
+        N_H = H // (self.stride_level * self.P_H)
+        N_W = W // (self.stride_level * self.P_W)
+
+        # Retrieve intermediate encoder activations
+        layers = x["input"]
+        layers = [layers[hook] for hook in self.hooks]
+
+        # Filter output tokens
+        layers = [self.filter_tokens(tokens, 0, N_W * N_H) for tokens in layers]
+
+        # Reshape tokens into spatial representation
+        layers = [
+            einops.rearrange(l, "b (nh nw) d -> b d nh nw", nh=N_H, nw=N_W)
+            for l in layers
+        ]
+
+        # Apply reassemble and fusion blocks
+        z32 = self.fusion_blocks.f32(
+            self.reassemble_blocks.r32(layers[3])
+        )  # z32 = (B, C, H/16, W/16)
+        z16 = self.fusion_blocks.f16(
+            self.reassemble_blocks.r16(layers[2]), z32
+        )  # z16 = (B, C, H/8, W/8)
+        z8 = self.fusion_blocks.f8(
+            self.reassemble_blocks.r8(layers[1]), z16
+        )  # z8 = (B, C, H/4, W/4)
+        z4 = self.fusion_blocks.f4(
+            self.reassemble_blocks.r4(layers[0]), z8
+        )  # z4 = (B, C, H/2, W/2)
+
+        # Apply prediction head
+        z = self.head(z4)  # z = (B, C, H, W)
+
+        return z
+
+
 class Interpolate(nn.Module):
     """Interpolation module."""
 

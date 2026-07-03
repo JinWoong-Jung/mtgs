@@ -7,7 +7,6 @@
 import os
 from collections import OrderedDict
 
-import math
 import pickle
 import itertools
 
@@ -21,7 +20,6 @@ from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     LinearLR,
     SequentialLR,
-    MultiStepLR,
 )
 
 from mtgs.train.losses import (
@@ -75,16 +73,13 @@ class MTGSModel(pl.LightningModule):
             gaze_graph_edge_dim=cfg.gaze_graph.edge_dim,
             gaze_graph_use_prior=cfg.gaze_graph.use_prior,
             gaze_graph_prior_weight=cfg.gaze_graph.prior_weight,
+            gaze_graph_use_node_xattn=cfg.gaze_graph.use_node_xattn,
             gaze_graph_laeo_derive=cfg.gaze_graph.laeo_derive,
             gaze_graph_use=cfg.gaze_graph.use,
         )
 
         self.cfg = cfg
         self.output = cfg.model.output
-        self.num_tranining_samples = cfg.data.num_samples
-        self.num_steps_in_epoch = math.ceil(
-            self.num_tranining_samples / cfg.train.batch_size
-        )
         self._pred_file = None
         self._pred_write_count = 0
         self._upper_tri_cache: dict = {}  # cache upper-triangle SA pair mask per n
@@ -92,6 +87,7 @@ class MTGSModel(pl.LightningModule):
         # Model weights paths
         self.model_weights = cfg.model.weights
         self.gaze_weights = cfg.model.gaze_weights
+        self.multivit_weights = cfg.model.multivit_weights
 
         # Define Metrics
         if cfg.experiment.dataset == "gazefollow":
@@ -129,6 +125,50 @@ class MTGSModel(pl.LightningModule):
         # Freeze Weights
         self._freeze()
 
+    @staticmethod
+    def _remap_gaze_graph_weights(weights):
+        """Back-compat warm-start for the two-path GazeGraphBlock.
+
+        A pre-split gaze_graph checkpoint has a single shared refinement
+        (`row_layer/col_layer/upd_*/norm_*/refresh/norm_e`) + one `edge_head`.
+        The new layout has two isolated refiners (`trunk.*`, `sa.*`) + per-type
+        heads (`head_lah/head_sa/head_null`). Copy the old shared weights onto
+        BOTH paths (and the old head onto all three heads) so LAH refinement is
+        preserved instead of cold-starting. No-op for new-layout checkpoints.
+        """
+        prefix = "gaze_graph_block."
+        has_old = any(k.startswith(prefix + "edge_head.") for k in weights)
+        has_new = any(k.startswith(prefix + "trunk.") for k in weights)
+        if not has_old or has_new:
+            return weights
+
+        refine_map = {
+            "row_layer": "row", "col_layer": "col",
+            "upd_src": "upd_src", "upd_tgt": "upd_tgt",
+            "norm_src": "norm_src", "norm_tgt": "norm_tgt",
+            "refresh": "refresh", "norm_e": "norm_e",
+        }
+        out = OrderedDict()
+        for k, v in weights.items():
+            if not k.startswith(prefix):
+                out[k] = v
+                continue
+            sub = k[len(prefix):]                       # e.g. "row_layer.self_attn..."
+            top = sub.split(".", 1)[0]
+            rest = sub[len(top):]                       # ".<param...>"
+            if top in refine_map:
+                new = refine_map[top] + rest
+                out[prefix + "trunk." + new] = v
+                out[prefix + "sa." + new] = v.clone()
+            elif top == "edge_head":
+                out[prefix + "head_lah" + rest] = v
+                out[prefix + "head_null" + rest] = v.clone()
+                out[prefix + "head_sa" + rest] = v.clone()
+            else:                                       # mlp_init, *xattn*, node projs, region/hm, etc.
+                out[k] = v
+        logger.info("Remapped pre-split GazeGraphBlock weights onto trunk/sa two-path layout")
+        return out
+
     def _init_weights(self):
         # Load pre-trained weights
         if self.model_weights:
@@ -139,6 +179,7 @@ class MTGSModel(pl.LightningModule):
                     for name, value in model_ckpt["state_dict"].items()
                 ]
             )
+            model_weights = self._remap_gaze_graph_weights(model_weights)
             model_state = self.model.state_dict()
             skipped = []
             filtered_weights = OrderedDict()
@@ -159,6 +200,37 @@ class MTGSModel(pl.LightningModule):
             )
             del model_ckpt
         else:
+            # Load weights for Multi ViT
+            if self.multivit_weights:
+                multivit_ckpt = torch.load(self.multivit_weights, map_location="cpu", weights_only=False)
+                image_tokenizer_weights = OrderedDict(
+                    [
+                        (name.replace("input_adapters.rgb.", ""), value)
+                        for name, value in multivit_ckpt["model"].items()
+                        if "input_adapters.rgb" in name
+                    ]
+                )
+                self.model.image_tokenizer.load_state_dict(
+                    image_tokenizer_weights, strict=True
+                )
+                logger.info(
+                    f"Successfully loaded weights for the image tokenizer from {self.multivit_weights}"
+                )
+
+                encoder_weights = OrderedDict(
+                    [
+                        (name.replace("encoder.", ""), value)
+                        for name, value in multivit_ckpt["model"].items()
+                        if "encoder" in name
+                    ]
+                )
+                self.model.encoder.blocks.load_state_dict(encoder_weights, strict=True)
+                logger.info(
+                    f"Successfully loaded weights for the ViT encoder from {self.multivit_weights}"
+                )
+
+                del multivit_ckpt, image_tokenizer_weights, encoder_weights
+
             # Load Gaze Encoder Gaze360 Pre-trained Weights
             gaze360_ckpt = torch.load(self.gaze_weights, map_location="cpu", weights_only=False)
             gaze360_weights = OrderedDict(
@@ -219,12 +291,18 @@ class MTGSModel(pl.LightningModule):
         if self.cfg.train.freeze.gaze_encoder:
             logger.info("Freezing the Gaze Encoder layers.")
             self.freeze_module(self.model.gaze_encoder)
+        if self.cfg.train.freeze.image_tokenizer:
+            logger.info("Freezing the Image Tokenizer layers.")
+            self.freeze_module(self.model.image_tokenizer)
         if self.cfg.train.freeze.vit_encoder:
             logger.info("Freezing the ViT Encoder layers.")
             self.freeze_module(self.model.encoder)
         if self.cfg.train.freeze.vit_adaptor:
             logger.info("Freezing the ViT Adaptor layers.")
             self.freeze_module(self.model.vit_adaptor)
+        if self.cfg.train.freeze.gaze_decoder:
+            logger.info("Freezing the Gaze Decoder layers.")
+            self.freeze_module(self.model.gaze_decoder)
         if self.cfg.train.freeze.inout_decoder:
             logger.info("Freezing the InOut Decoder layers.")
             self.freeze_module(self.model.inout_decoder)
@@ -234,10 +312,11 @@ class MTGSModel(pl.LightningModule):
 
     def configure_optimizers(self):
         # Fixed interaction trunk (people_interaction + people_temporal); the social
-        # head is gaze_graph_block (highest LR). 4 param groups.
+        # head is gaze_graph_block (highest LR). 4 param groups → 4-entry train.swa.lr.
         base_lr = self.cfg.optimizer.lr
         # Social head param group: GazeGraphBlock (use=True) or the original
-        # per-pair decoders (use=False). ×3 keeps the same 4-group structure/LR.
+        # per-pair decoders (use=False). ×3 keeps the same 4-group structure/LR
+        # → original scheduler/LR + 4-entry train.swa.lr preserved.
         if self.cfg.gaze_graph.use:
             social_head_group = {
                 "params": self.model.gaze_graph_block.parameters(),
@@ -290,56 +369,53 @@ class MTGSModel(pl.LightningModule):
 
         optimizer = optim.AdamW(params, weight_decay=self.cfg.optimizer.weight_decay)
 
-        # Per-step linear warmup → cosine annealing. Step counts are derived from the
-        # REAL dataloader length (trainer.estimated_stepping_batches), so the schedule
-        # is smooth per-step yet independent of the (possibly stale) data.num_samples.
-        if self.cfg.scheduler.type == "CosineAnnealingLR":
-            warmup_epochs = self.cfg.scheduler.warmup_epochs
-            total_epochs = self.cfg.train.epochs
-            eta_min = self.cfg.scheduler.eta_min
-            total_steps = int(self.trainer.estimated_stepping_batches)
-            warmup_steps = max(1, round(total_steps * warmup_epochs / total_epochs))
-            cosine_steps = max(1, total_steps - warmup_steps)
-            if warmup_epochs > 0:
-                warmup = LinearLR(
-                    optimizer, start_factor=0.01, end_factor=1.0,
-                    total_iters=warmup_steps,
-                )
-                cosine = CosineAnnealingLR(
-                    optimizer, T_max=cosine_steps, eta_min=eta_min
-                )
-                lr_scheduler = SequentialLR(
-                    optimizer, schedulers=[warmup, cosine],
-                    milestones=[warmup_steps],
-                )
-            else:
-                lr_scheduler = CosineAnnealingLR(
-                    optimizer, T_max=total_steps, eta_min=eta_min
-                )
-            lr_scheduler_config = {
+        # Continuous (per-step) schedule: linear warmup → cosine decay.
+        # Warmup/decay lengths are given in EPOCHS but converted to optimizer STEPS
+        # so the LR ramps smoothly *within* each epoch (a per-epoch staircase would
+        # jump discretely at epoch boundaries). Total steps come from the trainer,
+        # which reflects the real dataloader length, grad accumulation and device
+        # count — so there is no dependency on data.num_samples (which could differ
+        # from the actual ConcatDataset length).
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        steps_per_epoch = max(1, total_steps // max(1, self.trainer.max_epochs))
+        warmup_steps = max(1, int(self.cfg.scheduler.warmup_epochs * steps_per_epoch))
+        cosine_steps = max(1, total_steps - warmup_steps)
+        eta_min = getattr(self.cfg.scheduler, "eta_min", 0.0)
+
+        # start_factor ≈ 0 so the ramp begins near zero and rises linearly, per step,
+        # to each param group's full LR at warmup_steps (discriminative ratios kept —
+        # both schedulers scale every group off its own initial_lr).
+        warmup = LinearLR(
+            optimizer,
+            start_factor=1.0 / warmup_steps,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=eta_min)
+        lr_scheduler = SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
                 "scheduler": lr_scheduler,
                 "interval": "step",
                 "frequency": 1,
-            }
-        elif self.cfg.scheduler.type == "StepLR":
-            lr_scheduler = MultiStepLR(
-                optimizer, milestones=[10, 11, 12, 13, 14, 15, 16], gamma=0.5
-            )
-            #             lr_scheduler = StepLR(optimizer, step_size=self.cfg.scheduler.t_0_epochs, gamma=0.1)
-            lr_scheduler_config = {
-                "scheduler": lr_scheduler,
-                "interval": "epoch",
-                "frequency": 1,
-            }
-        else:
-            logger.info("Invalid scheduler selected...")
-
-        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
+            },
+        }
 
     def on_train_epoch_start(self):
         if self.current_epoch == self.trainer.max_epochs - 1:
             # Workaround to always save the last epoch until the bug is fixed in lightning (https://github.com/Lightning-AI/lightning/issues/4539)
             self.trainer.check_val_every_n_epoch = 1
+
+            # Disable backward ONLY when SWA is active (it just recomputes BN stats
+            # over the averaged weights on the final epoch, see lightning#17245).
+            # With SWA off, the last epoch must train normally so the cosine schedule
+            # reaches its final low LR.
+            if self.cfg.train.swa.use:
+                self.automatic_optimization = False
 
         # Post-training: keep the ENTIRE frozen trunk in eval mode so its BatchNorm
         # running stats stay fixed — otherwise heatmap/in-out drift from the original
@@ -356,8 +432,12 @@ class MTGSModel(pl.LightningModule):
         # Set BN layers to eval mode for frozen modules
         if self.cfg.train.freeze.gaze_encoder:
             self.model.gaze_encoder.apply(self._set_batchnorm_eval)
+        if self.cfg.train.freeze.image_tokenizer:
+            self.model.image_tokenizer.apply(self._set_batchnorm_eval)
         if self.cfg.train.freeze.vit_encoder:
             self.model.encoder.apply(self._set_batchnorm_eval)
+        if self.cfg.train.freeze.gaze_decoder:
+            self.model.gaze_decoder.apply(self._set_batchnorm_eval)
         if self.cfg.train.freeze.inout_decoder:
             self.model.inout_decoder.apply(self._set_batchnorm_eval)
 
@@ -417,23 +497,26 @@ class MTGSModel(pl.LightningModule):
         # Compute social gaze loss
         coatt_gt = batch["coatt_labels"].view(batch_size * t, -1)
         coatt_mask = coatt_gt != -1
-        laeo_gt = batch["laeo_labels"].view(batch_size * t, -1)
-        laeo_mask = laeo_gt != -1
-        lah_gt = batch["lah_labels"].view(batch_size * t, -1)
-        lah_mask = lah_gt != -1
-        # gaze_graph mode: SA & LAEO are symmetric (mat[i,j]=mat[j,i]), so both (i,j)
-        # and (j,i) hit the same edge. Restrict to upper-triangle pairs (src < dst)
-        # so each undirected pair is counted once. LAH is directed → keep both.
-        # (use=False decoder predicts each direction independently → supervise all.)
+        # gaze_graph mode: SA is symmetric (sa_mat[i,j]=sa_mat[j,i]), so both (i,j)
+        # and (j,i) backprop through the same edge → 2× gradient. Restrict to
+        # upper-triangle pairs (src < dst) to prevent amplification. The original
+        # decoder (use=False) predicts each direction independently → supervise all.
         if self.cfg.gaze_graph.use:
             if n not in self._upper_tri_cache:
                 pairs = list(itertools.permutations(range(n), 2))
                 self._upper_tri_cache[n] = torch.tensor(
                     [s < d for s, d in pairs], dtype=torch.bool
                 )
-            utri = self._upper_tri_cache[n].to(coatt_mask.device)
-            coatt_mask = coatt_mask & utri
-            laeo_mask = laeo_mask & utri
+            coatt_mask = coatt_mask & self._upper_tri_cache[n].to(coatt_mask.device)
+        laeo_gt = batch["laeo_labels"].view(batch_size * t, -1)
+        laeo_mask = laeo_gt != -1
+        # LAEO is symmetric in gaze_graph mode (lah_min → min is symmetric; decoder →
+        # explicitly averaged), so both (i,j) and (j,i) backprop through the same
+        # edges. Restrict to upper-triangle pairs like coatt to prevent 2× gradient.
+        if self.cfg.gaze_graph.use:
+            laeo_mask = laeo_mask & self._upper_tri_cache[n].to(laeo_mask.device)
+        lah_gt = batch["lah_labels"].view(batch_size * t, -1)
+        lah_mask = lah_gt != -1
 
         loss_social, logs_social = self.compute_social_loss(
             lah_pred,
@@ -446,9 +529,6 @@ class MTGSModel(pl.LightningModule):
             coatt_gt,
             coatt_mask,
             coatt_is_prob=False,
-            lah_pos_weight=self.cfg.loss.lah_pos_weight,
-            laeo_pos_weight=self.cfg.loss.laeo_pos_weight,
-            coatt_pos_weight=self.cfg.loss.sa_pos_weight,
         )
         loss += loss_social
 
@@ -665,22 +745,22 @@ class MTGSModel(pl.LightningModule):
         # Compute social gaze loss
         coatt_gt = batch["coatt_labels"][:, middle_frame_idx, :]
         coatt_mask = coatt_gt != -1
-        laeo_gt = batch["laeo_labels"][:, middle_frame_idx, :]
-        laeo_mask = laeo_gt != -1
-        lah_gt = batch["lah_labels"][:, middle_frame_idx, :]
-        lah_mask = lah_gt != -1
-        # gaze_graph mode: SA & LAEO are symmetric → restrict to upper-triangle pairs
-        # (src < dst) so each undirected pair is counted once in loss AND metrics.
-        # LAH is directed → keep both. (use=False decoder → supervise all.)
+        # gaze_graph mode only: SA symmetric → restrict to upper-triangle pairs
+        # (src < dst) to avoid 2× loss. Original decoder (use=False) → supervise all.
         if self.cfg.gaze_graph.use:
             if n not in self._upper_tri_cache:
                 pairs = list(itertools.permutations(range(n), 2))
                 self._upper_tri_cache[n] = torch.tensor(
                     [s < d for s, d in pairs], dtype=torch.bool
                 )
-            utri = self._upper_tri_cache[n].to(coatt_mask.device)
-            coatt_mask = coatt_mask & utri
-            laeo_mask = laeo_mask & utri
+            coatt_mask = coatt_mask & self._upper_tri_cache[n].to(coatt_mask.device)
+        laeo_gt = batch["laeo_labels"][:, middle_frame_idx, :]
+        laeo_mask = laeo_gt != -1
+        # LAEO is symmetric in gaze_graph mode → restrict to upper-triangle like coatt.
+        if self.cfg.gaze_graph.use:
+            laeo_mask = laeo_mask & self._upper_tri_cache[n].to(laeo_mask.device)
+        lah_gt = batch["lah_labels"][:, middle_frame_idx, :]
+        lah_mask = lah_gt != -1
 
         loss_social, logs_social = self.compute_social_loss(
             lah_pred,
@@ -693,9 +773,6 @@ class MTGSModel(pl.LightningModule):
             coatt_gt,
             coatt_mask,
             coatt_is_prob=False,
-            lah_pos_weight=self.cfg.loss.lah_pos_weight,
-            laeo_pos_weight=self.cfg.loss.laeo_pos_weight,
-            coatt_pos_weight=self.cfg.loss.sa_pos_weight,
         )
         loss += loss_social
 
@@ -740,9 +817,7 @@ class MTGSModel(pl.LightningModule):
         # Update CoAtt Metrics
         if coatt_pred.sum() != 0:
             coatt_pred = torch.sigmoid(coatt_pred)
-            # -1 outside the (upper-tri ∩ valid) mask → ignore_index skips them,
-            # so each symmetric SA pair is scored once (consistent with the loss).
-            coatt_gt = coatt_gt.long().masked_fill(~coatt_mask, -1)
+            coatt_gt = coatt_gt.long()
             if coatt_mask.sum() > 0:
                 self.val_coatt_auc(coatt_pred, coatt_gt)
                 self.val_coatt_ap(coatt_pred, coatt_gt)
@@ -769,8 +844,7 @@ class MTGSModel(pl.LightningModule):
         # Update LAEO metrics
         if laeo_pred.sum() != 0:
             laeo_pred = torch.sigmoid(laeo_pred)
-            # -1 outside the (upper-tri ∩ valid) mask → score each symmetric LAEO pair once.
-            laeo_gt = laeo_gt.long().masked_fill(~laeo_mask, -1)
+            laeo_gt = laeo_gt.long()
             if laeo_mask.sum() > 0:
                 self.val_laeo_auc(laeo_pred, laeo_gt)
                 self.val_laeo_ap(laeo_pred, laeo_gt)

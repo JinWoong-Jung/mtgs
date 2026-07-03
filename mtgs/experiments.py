@@ -62,6 +62,12 @@ class Experiment:
             self.callbacks = build_callbacks(
                 checkpoint_folder=ckpt_folder,
                 use_lr_monitor=self.cfg.wandb.log,
+                use_swa=self.cfg.train.swa.use,
+                swa_params={
+                    "lr": self.cfg.train.swa.lr,
+                    "epoch_start": self.cfg.train.swa.epoch_start,
+                    "annealing_epochs": self.cfg.train.swa.annealing_epochs,
+                },
                 checkpoint_monitor=self.cfg.train.checkpoint_monitor,
                 checkpoint_mode=self.cfg.train.checkpoint_mode,
             )

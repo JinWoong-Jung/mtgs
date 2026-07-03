@@ -33,12 +33,13 @@ WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # GazeFol
 
 FROZEN=false
 
-EXP_NAME="V14.8(lah_min)"
+EXP_NAME="V14.5++"
+SWA="False"
 
 CHECKPOINT_MONITOR="metric/val/social_ap"
 CHECKPOINT_MODE="max"
 
-LAEO_DERIVE="lah_min"
+LAEO_DERIVE="decoder"
 
 python -s ./main.py experiment.task=$TASKS \
     model.weights=$WEIGHTS \
@@ -47,5 +48,6 @@ python -s ./main.py experiment.task=$TASKS \
     gaze_graph.frozen=$FROZEN \
     train.checkpoint_monitor=$CHECKPOINT_MONITOR \
     train.checkpoint_mode=$CHECKPOINT_MODE \
+    train.swa.use=$SWA \
     "hydra.run.dir='\${hydra:runtime.cwd}/../experiments/\${now:%Y-%m-%d}/${EXP_NAME}'"
     

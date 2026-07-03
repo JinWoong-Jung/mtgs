@@ -63,16 +63,13 @@ def compute_social_loss(
     coatt_gt,
     coatt_mask,
     coatt_is_prob=False,
-    lah_pos_weight=3.0,
-    laeo_pos_weight=2.0,
-    coatt_pos_weight=2.0,
 ):
-    lah_loss = social_loss(lah_pred, lah_gt, lah_mask, pos_weight=lah_pos_weight)
-    laeo_loss = social_loss(laeo_pred, laeo_gt, laeo_mask, pos_weight=laeo_pos_weight)
+    lah_loss = social_loss(lah_pred, lah_gt, lah_mask, pos_weight=3.0)
+    laeo_loss = social_loss(laeo_pred, laeo_gt, laeo_mask)
     coatt_loss = (
         social_loss_prob(coatt_pred, coatt_gt, coatt_mask)
         if coatt_is_prob
-        else social_loss(coatt_pred, coatt_gt, coatt_mask, pos_weight=coatt_pos_weight)
+        else social_loss(coatt_pred, coatt_gt, coatt_mask)
     )
 
     lah_coeff = 1
@@ -179,12 +176,12 @@ def compute_dist_loss(gp_pred, gp_gt, mask):
 
 
 def compute_heatmap_loss(hm_pred, hm_gt, mask, dataset=None):
-    heatmap_loss = F.mse_loss(hm_pred, hm_gt, reduction="none").mean([2, 3])
+    heatmap_loss = F.mse_loss(hm_pred, hm_gt, reduce=False).mean([2, 3])
     heatmap_loss = torch.mul(heatmap_loss, mask)
     if dataset:
         dataset_mask = np.where(
-            (np.array(dataset) == "coatt").astype(int)
-            + (np.array(dataset) == "laeo").astype(int)
+            (np.array(dataset) == "coatt").astype(np.int)
+            + (np.array(dataset) == "laeo").astype(np.int)
         )[0]
         fact = torch.zeros_like(heatmap_loss) + 1
         fact[dataset_mask] = 0.1  # 0.1x loss for UCO-LAEO and VideoCoAtt
@@ -198,8 +195,8 @@ def compute_angular_loss(gv_pred, gv_gt, mask, dataset=None):
     angular_loss = torch.mul(angular_loss, mask)
     if dataset:
         dataset_mask = np.where(
-            (np.array(dataset) == "coatt").astype(int)
-            + (np.array(dataset) == "laeo").astype(int)
+            (np.array(dataset) == "coatt").astype(np.int)
+            + (np.array(dataset) == "laeo").astype(np.int)
         )[0]
         fact = torch.zeros_like(angular_loss) + 1
         fact[dataset_mask] = 0.1  # 0.1x loss for UCO-LAEO and VideoCoAtt
@@ -216,8 +213,22 @@ def compute_inout_loss(io_pred, io_gt, mask):
     return bce_loss
 
 
+def _masked_bce(prob, target, mask):
+    """Branchless masked BCE (mean over masked entries), no host<->device sync.
+
+    Equivalent to F.binary_cross_entropy over the selected entries only, because
+    masked positions are zeroed before summing and the denominator counts only
+    selected entries. Returns 0 (still graph-connected) when nothing is selected.
+    """
+    bce = F.binary_cross_entropy(
+        prob.float().clamp(1e-6, 1 - 1e-6), target.float(), reduction="none"
+    )
+    m = mask.float()
+    return (bce * m).sum() / m.sum().clamp(min=1.0)
+
+
 def compute_dual_null_loss(alpha_null_out, alpha_null_in, inout_gt, lah_gt, num_valid_people):
-    """Dual-null supervision for SocialGraphBlock.
+    """Dual-null supervision for SocialGraphBlock (fully vectorised, no Python loop).
 
     L_null_out: BCE(alpha_null_out[g], inout_gt[g] == 0)
         Out-of-frame person should route attention to Null_out.
@@ -225,11 +236,13 @@ def compute_dual_null_loss(alpha_null_out, alpha_null_in, inout_gt, lah_gt, num_
 
     L_null_in: BCE(alpha_null_in[g], all(lah_gt[g→j] == 0) AND inout_gt[g] == 1)
         In-frame person who looks at nobody should route attention to Null_in.
-        Computed only when inout_gt==1 and at least one LAH annotation exists.
+        Computed when inout_gt==1 and (at least one LAH annotation exists OR the
+        person is the only valid one in frame → nv <= 1, target 1).
 
     Valid people occupy BACK slots [N-nv .. N-1] per the padding convention.
-    LAH edges are ordered as itertools.permutations(range(N), 2), so pair
-    (g, d) is at position g*(N-1) + (d if d < g else d-1).
+    LAH edges are ordered as itertools.permutations(range(N), 2). Dataset
+    convention: pair (a,b) = "b looks at a" (TARGET, LOOKER), so "g looks at d"
+    is stored at pair (d, g) → flat index d*(N-1) + (g if g < d else g-1).
 
     Args:
         alpha_null_out:   (BT, N) in [0,1] — probability of routing to Null_out
@@ -242,63 +255,38 @@ def compute_dual_null_loss(alpha_null_out, alpha_null_in, inout_gt, lah_gt, num_
         (loss_null_out, loss_null_in) — scalar BCE losses.
     """
     device = alpha_null_out.device
-    BT = alpha_null_out.shape[0]
-    N  = alpha_null_out.shape[1]
+    BT, N  = alpha_null_out.shape
+    nv     = num_valid_people.view(BT, 1)
 
-    out_probs, out_targets = [], []
-    in_probs,  in_targets  = [], []
+    # Valid people occupy back slots [N-nv .. N-1].
+    ar    = torch.arange(N, device=device).view(1, N)
+    valid = ar >= (N - nv)                                    # (BT, N) bool
 
-    for bt in range(BT):
-        nv = int(num_valid_people[bt])
-        if nv == 0:
-            continue
-        nv_start = N - nv  # valid people at global positions nv_start..N-1
+    # ── L_null_out ────────────────────────────────────────────────────────────
+    out_mask   = valid & (inout_gt != -1)                    # (BT, N)
+    out_target = (inout_gt == 0)                             # 1 if out-of-frame
 
-        for i_local in range(nv):
-            g  = nv_start + i_local
-            io = inout_gt[bt, g].item()
+    # ── L_null_in ────────────────────────────────────────────────────────────
+    # lah_look[bt, g, d] = label of "g looks at d" = pair (d, g).
+    if N >= 2:
+        g_idx = torch.arange(N, device=device).view(N, 1).expand(N, N)
+        d_idx = torch.arange(N, device=device).view(1, N).expand(N, N)
+        flat  = d_idx * (N - 1) + torch.where(g_idx < d_idx, g_idx, g_idx - 1)  # (g, d)
+        flat  = flat.masked_fill(g_idx == d_idx, 0)          # self-loop dummy (excluded below)
+        lah_look = lah_gt[:, flat.reshape(-1)].reshape(BT, N, N)                # (BT, g, d)
+    else:
+        lah_look = torch.full((BT, N, N), -1.0, device=device)
 
-            # ── L_null_out ────────────────────────────────────────────────────
-            # Every valid person with a known inout label contributes.
-            if io != -1:
-                out_probs.append(alpha_null_out[bt, g])
-                out_targets.append(1.0 if io == 0 else 0.0)
+    eye       = torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)     # (1, g, d)
+    valid_tgt = valid.unsqueeze(1) & ~eye                    # (BT, g, d): valid d, d != g
+    has_known        = (valid_tgt & (lah_look != -1)).any(dim=2)   # (BT, g)
+    looks_at_someone = (valid_tgt & (lah_look == 1)).any(dim=2)    # (BT, g)
 
-            # ── L_null_in ─────────────────────────────────────────────────────
-            if io != 1:
-                continue
-            if nv <= 1:
-                # Only valid person in frame → must be looking at scene object
-                in_probs.append(alpha_null_in[bt, g])
-                in_targets.append(1.0)
-                continue
-            # Dataset convention: pair (a,b) = label "b looks at a" (TARGET, LOOKER).
-            # "g looks at d" is stored at pair (d, g) → flat index d*(N-1)+(g if g<d else g-1)
-            outgoing = [
-                d * (N - 1) + (g if g < d else g - 1)
-                for d in range(nv_start, N) if d != g
-            ]
-            lah_i = lah_gt[bt, outgoing]
-            known_lah = lah_i[lah_i != -1]
-            if len(known_lah) == 0:
-                continue  # no annotation for this person
-            null_in_gt = 0.0 if (known_lah == 1).any() else 1.0
-            in_probs.append(alpha_null_in[bt, g])
-            in_targets.append(null_in_gt)
+    in_mask   = valid & (inout_gt == 1) & (has_known | (nv <= 1))  # (BT, g)
+    in_target = ~looks_at_someone                            # 1 if looks at nobody
 
-    with torch.amp.autocast('cuda', enabled=False):
-        if out_probs:
-            probs_t   = torch.stack(out_probs).float()
-            targets_t = torch.tensor(out_targets, dtype=torch.float32, device=device)
-            loss_out  = F.binary_cross_entropy(probs_t, targets_t)
-        else:
-            loss_out  = torch.tensor(0.0, device=device, requires_grad=True)
-
-        if in_probs:
-            probs_t   = torch.stack(in_probs).float()
-            targets_t = torch.tensor(in_targets, dtype=torch.float32, device=device)
-            loss_in   = F.binary_cross_entropy(probs_t, targets_t)
-        else:
-            loss_in   = torch.tensor(0.0, device=device, requires_grad=True)
+    with torch.amp.autocast("cuda", enabled=False):
+        loss_out = _masked_bce(alpha_null_out, out_target, out_mask)
+        loss_in  = _masked_bce(alpha_null_in,  in_target,  in_mask)
 
     return loss_out, loss_in

@@ -104,10 +104,8 @@ class AUC(tm.Metric):
     ):
         for hm_pred, hm_gt, io_gt in zip(gaze_heatmap_pred, gaze_heatmap_gt, inout_gt):
             if io_gt == 1:
-                hm_gt_binary = (hm_gt > 0).int().flatten()
-                if hm_gt_binary.sum() == 0:
-                    continue
-                self.sum_auc += binary_auroc(hm_pred.flatten(), hm_gt_binary)
+                hm_gt_binary = (hm_gt > 0).int()
+                self.sum_auc += binary_auroc(hm_pred, hm_gt_binary)
         self.n_observations += (inout_gt == 1).sum()
 
     def compute(self):

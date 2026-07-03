@@ -261,42 +261,6 @@ def generate_mask(bboxes, img_w, img_h):
     return mask.squeeze(0) if ndim == 1 else mask
 
 
-def spatial_softargmax2d(heatmap, temperature: float = 10.0):
-    """
-    Differentiable soft expected coordinates from a heatmap.
-
-    Computes the weighted centroid of the heatmap using temperature-scaled
-    softmax as weights. Unlike spatial_argmax2d, this is fully differentiable
-    and consistent between train and inference (no GT dependency).
-
-    Args:
-        heatmap (torch.Tensor): Shape (B, H, W) or (H, W). Values in [0, 1].
-        temperature (float): Sharpening factor for softmax. Higher → closer to
-            hard argmax. Default 10 works well for heatmaps in [0, 1].
-
-    Returns:
-        torch.Tensor: Normalized (x, y) coordinates in [0, 1], shape (B, 2) or (2,).
-    """
-    ndim = heatmap.ndim
-    if ndim == 2:
-        heatmap = heatmap.unsqueeze(0)
-
-    B, H, W = heatmap.shape
-    hm_flat = heatmap.reshape(B, -1).float()
-    weights = torch.softmax(hm_flat * temperature, dim=-1)  # (B, H*W)
-
-    grid_y = torch.linspace(0, 1, H, device=heatmap.device)
-    grid_x = torch.linspace(0, 1, W, device=heatmap.device)
-    gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
-    coords = torch.stack([gx.flatten(), gy.flatten()], dim=1)  # (H*W, 2) — (x, y)
-
-    points = (weights.unsqueeze(-1) * coords).sum(1)  # (B, 2)
-
-    if ndim == 2:
-        points = points[0]
-    return points
-
-
 def spatial_argmax2d(heatmap, normalize=True):
     """
     Function to locate the coordinates of the max value in the heatmap.
@@ -345,6 +309,33 @@ def remove_duplicate_max(pts):
     cum_sum = counts.cumsum(0)
     first_unique_idx = torch.cat((torch.tensor([0], device=pts.device), cum_sum[:-1]))
     return pts[first_unique_idx]
+
+
+def build_2d_sincos_posemb(h, w, embed_dim=1024, temperature=10000.0):
+    """Sine-cosine positional embeddings from MoCo-v3
+
+    Source: https://github.com/facebookresearch/moco-v3/blob/main/vits.py
+    """
+    grid_w = torch.arange(w, dtype=torch.float32)
+    grid_h = torch.arange(h, dtype=torch.float32)
+    grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij")
+
+    assert embed_dim % 4 == 0, (
+        "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
+    )
+
+    pos_dim = embed_dim // 4
+    omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+    omega = 1.0 / (temperature**omega)
+    out_w = torch.einsum("m,d->md", [grid_w.flatten(), omega])
+    out_h = torch.einsum("m,d->md", [grid_h.flatten(), omega])
+
+    pos_emb = torch.cat(
+        [torch.sin(out_w), torch.cos(out_w), torch.sin(out_h), torch.cos(out_h)], dim=1
+    )[None, :, :]
+    pos_emb = einops.rearrange(pos_emb, "b (h w) d -> b d h w", h=h, w=w, d=embed_dim)
+
+    return pos_emb
 
 
 def generate_binary_gaze_heatmap(gaze_point, size=(64, 64)):
