@@ -49,8 +49,13 @@ def main():
             sub.split = "val"; sub.transform = eval_tf
     ds = getattr(data, ATTR[args.split])
     collate = getattr(data, DLOADER[args.split])().collate_fn
+    # num_workers=0: guarantees deterministic sample content per index, so sids
+    # align exactly with data_prep.py's overlay/manifest pass. VSGaze __getitem__
+    # uses numpy/python `random` (people-subset) that PyTorch doesn't per-worker
+    # seed; nw>0 can desync sid->sample. Runtime here is graph-forward-bound, so
+    # single-worker loading costs little. (--num_workers kept for API compat.)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers, collate_fn=collate)
+                        num_workers=0, collate_fn=collate)
 
     model = MTGSModel(cfg)
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)

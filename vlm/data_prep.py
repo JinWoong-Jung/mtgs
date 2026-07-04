@@ -94,7 +94,13 @@ def main():
     print(f"[render] split={args.split} shard {args.shard}/{args.nshards} "
           f"frames={len(indices)} -> {outroot}", flush=True)
 
-    dl = DataLoader(sub, batch_size=1, num_workers=args.workers, collate_fn=_one)
+    # num_workers=0 is REQUIRED for sid alignment with graph_export.py: VSGaze
+    # __getitem__ consumes numpy/python `random` (people-subset selection) that
+    # PyTorch does NOT re-seed per worker, so num_workers>0 desyncs which sample
+    # each sid maps to (verified: nw>0 → 0.588 bbox drift vs the canonical nw=0
+    # sample). ds[idx] is deterministic at nw=0, so parallelise via --nshards
+    # (separate processes over disjoint index ranges), never DataLoader workers.
+    dl = DataLoader(sub, batch_size=1, num_workers=0, collate_fn=_one)
     records = []   # manifest, emitted in the SAME pass as overlays
     gtmeta  = {}   # per-sid GT/bbox/inout — eval reads THIS, never re-iterates
     cnt = collections.Counter()
