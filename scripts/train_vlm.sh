@@ -27,6 +27,10 @@ else
     cd "$SLURM_SUBMIT_DIR"
 fi
 
+# Fail fast: in multi-command modes (e.g. `eval` runs nograph then blend) a failed
+# first step must abort, not silently feed the next step stale/missing artifacts.
+set -e
+
 # ── Configuration (override at submission time with: MODE=export sbatch ...) ──
 MODE=${MODE:-graphtext}           # export | overlays | graphtext | token | eval
 SPLIT=${SPLIT:-train}             # train | val | test
