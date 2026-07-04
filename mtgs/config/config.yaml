@@ -158,9 +158,9 @@ optimizer:
   weight_decay: 1e-3
 
 scheduler:
-    type: CosineAnnealingLR
-    warmup_epochs: 3   # linear warmup length in EPOCHS (converted to steps internally for a continuous ramp)
-    eta_min: 0         # final LR floor for the cosine decay
+    type: CosineAnnealingLR     # "CosineAnnealingLR": warmup→cosine decay | "constant": fixed LR, no scheduler
+    warmup_epochs: 3   # linear warmup length in EPOCHS (only used by CosineAnnealingLR)
+    eta_min: 0         # final LR floor for the cosine decay (only used by CosineAnnealingLR)
 
 hydra:
   run:

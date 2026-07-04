@@ -369,6 +369,14 @@ class MTGSModel(pl.LightningModule):
 
         optimizer = optim.AdamW(params, weight_decay=self.cfg.optimizer.weight_decay)
 
+        # Fixed-LR ablation (scheduler.type="constant"): no warmup, no decay — each
+        # param group stays at its constructed LR (base_lr / base_lr*3) for the whole
+        # run. Returning the optimizer alone leaves the LR untouched by Lightning.
+        if getattr(self.cfg.scheduler, "type", "CosineAnnealingLR") == "constant":
+            logger.info("Using constant LR (no scheduler): base=%g, fast=%g",
+                        base_lr, base_lr * 3)
+            return optimizer
+
         # Continuous (per-step) schedule: linear warmup → cosine decay.
         # Warmup/decay lengths are given in EPOCHS but converted to optimizer STEPS
         # so the LR ramps smoothly *within* each epoch (a per-epoch staircase would
