@@ -1,6 +1,7 @@
 # tests/test_vlm_token_prompt.py
+import torch
 from vlm.prompt import token_prompt
-from vlm.injection import GTOK, TOK_COUNT
+from vlm.injection import GTOK, TOK_COUNT, gather_feats
 
 
 def test_gtok_count_matches_tok_count():
@@ -24,10 +25,6 @@ def test_laeo_sa_questions():
     bb = [0.0, 0.0, 0.1, 0.1]
     assert "looking at each other" in token_prompt("laeo", "A", "B", bb, bb)
     assert "same thing or person" in token_prompt("sa", "A", "B", bb, bb)
-
-
-import torch
-from vlm.injection import gather_feats
 
 
 def test_flat_concat_order_matches_gtok_row_major():

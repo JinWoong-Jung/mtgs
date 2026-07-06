@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from vlm.injection import GTOK, gather_feats
+from vlm.injection import gather_feats
 from vlm.prompt import token_prompt
 
 

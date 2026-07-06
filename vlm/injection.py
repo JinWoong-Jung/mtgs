@@ -3,26 +3,12 @@ from __future__ import annotations
 
 Injects the frozen Stage-1 graph's node/edge EMBEDDINGS as soft tokens at <gtok>
 placeholders in the prompt, via a forward_pre_hook on the language model.
+Per query pair (i,j), a variable number of role-keyed vectors (TOK_COUNT[task]) covering
+the directed relation + null channels are injected (lah=3, laeo=4, sa=6).
 """
 
 import torch
 import torch.nn as nn
-
-
-"""Graph soft-token injection for Qwen3-VL (latent-space fusion, à la GraphVLM).
-
-Injects the V14.5 graph's node/edge EMBEDDINGS as soft tokens into the VLM, instead of
-serialising them to text (which the VLM parrots). Per query pair (i,j), a variable number
-of role-keyed vectors (TOK_COUNT[task]) covering the directed relation + null channels.
-  lah  (3): v_src[i], v_tgt[j], edge_fwd
-  laeo (4): v_src[i], v_src[j], edge_fwd, edge_bwd
-  sa   (6): v_src[i], v_src[j], null_in[i], null_in[j], edge_fwd, edge_bwd
-
-Mechanism: the prompt carries TOK_COUNT[task] "<gtok>" placeholder tokens. A forward_pre_hook
-on the TEXT model (model.model.language_model, which receives inputs_embeds AFTER the image
-merge) overwrites the placeholder embeddings with the projected graph vectors. mrope/positions
-are untouched (gtok are ordinary text positions).
-"""
 
 
 GTOK = "<gtok>"

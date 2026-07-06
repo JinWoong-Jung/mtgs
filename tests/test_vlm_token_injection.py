@@ -1,6 +1,7 @@
 # tests/test_vlm_token_injection.py
 import torch
-from vlm.injection import gather_feats, GraphTokenProjector, ROLE, TOK_COUNT, N_ROLES
+import torch.nn as nn
+from vlm.injection import gather_feats, GraphTokenProjector, ROLE, TOK_COUNT, N_ROLES, install_hook, GTOK
 
 
 def _fake_gf(N=4, De=256):
@@ -65,13 +66,12 @@ def test_projector_shape_and_role_conditioning():
     out = proj(feats, roles)
     assert out.shape == (6, 64)
     # same feature, different role -> different output (role actually used)
+    # Re-init role_emb to non-zero so the test is non-vacuous (zero-init makes roles identical).
+    g = torch.Generator().manual_seed(42)
+    proj.role_emb.data = torch.randn(proj.role_emb.shape, generator=g)
     a = proj(torch.zeros(1, 256), torch.tensor([ROLE["SRC"]]))
     b = proj(torch.zeros(1, 256), torch.tensor([ROLE["TGT"]]))
-    assert not torch.allclose(a, b) or torch.equal(proj.role_emb[0], proj.role_emb[1])
-
-
-import torch.nn as nn
-from vlm.injection import install_hook, GTOK
+    assert not torch.allclose(a, b)
 
 
 class _StubLM(nn.Module):

@@ -31,5 +31,5 @@ def test_dead_prompt_helpers_removed():
     for dead in ("build_pointer_prompt", "lah_prompt", "pair_prompt",
                  "masked_target_dist", "_entropy"):
         assert not hasattr(p, dead), f"{dead} should be deleted"
-    # survivors
-    assert hasattr(p, "nograph_prompt") and hasattr(p, "TASKS")
+    # survivors / deleted
+    assert not hasattr(p, "nograph_prompt") and hasattr(p, "TASKS")
