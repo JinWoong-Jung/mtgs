@@ -15,8 +15,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from vlm.injection import GTOK, N_TOK, gather_feats
-from vlm.prompt import nograph_prompt
+from vlm.injection import GTOK, gather_feats
+from vlm.prompt import token_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +69,12 @@ class TokenDS(Dataset):
 
     def __getitem__(self, k):
         r = self.recs[k]
+        gfd = self.gf[r["sid"]]
+        bb = gfd["head_bboxes"]
         pil = Image.open(self.dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
-        prompt = (GTOK * N_TOK) + "\n" + nograph_prompt(r["task"], r["li"], r["lj"])
-        feats = gather_feats(self.gf[r["sid"]], r["i"], r["j"])  # (N_TOK,256)
-        return pil, prompt, r["ans"], feats
+        prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
+        feats, roles = gather_feats(gfd, r["task"], r["i"], r["j"])   # (K,256),(K,)
+        return pil, prompt, r["ans"], feats, roles
 
 
 # ---------------------------------------------------------------------------
@@ -80,12 +82,15 @@ class TokenDS(Dataset):
 # ---------------------------------------------------------------------------
 
 def make_token_collate(processor):
+    """Variable-length token collate: base SFT batch + flat concatenated graph feats/roles.
+    <gtok> positions are filled by the hook in row-major (sample, seq) order, so the flat
+    concat order (sample-major, then in-prompt order) matches exactly."""
     base = make_collate(processor)
 
     def collate(batch):
-        feats = torch.stack([b[3] for b in batch])              # (B,N_TOK,256)
         out = base([(b[0], b[1], b[2]) for b in batch])
-        out["graph_feats"] = feats
+        out["graph_feats"] = torch.cat([b[3] for b in batch], dim=0)       # (ΣK, 256)
+        out["graph_role_ids"] = torch.cat([b[4] for b in batch], dim=0)    # (ΣK,)
         return out
 
     return collate
