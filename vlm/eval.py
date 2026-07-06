@@ -437,20 +437,21 @@ def _main_eval_lora_token():
     dl = DataLoader(_TokenRecDS(recs, args.overlay_dir, gf), batch_size=args.vlm_bs,
                     num_workers=args.num_workers, collate_fn=_coll, pin_memory=False)
     preds = {}
-    for keys, pils, prompts, feats, roles in tqdm(dl, desc=f"tok-eval s{args.shard}/{args.nshards}",
-                                                  unit="batch"):
-        msgs = [[{"role": "user", "content": [{"type": "image", "image": p},
-                 {"type": "text", "text": t}]}]
-                for p, t in zip(pils, prompts)]
-        texts = [proc.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
-                 for m in msgs]
-        inp = proc(text=texts, images=list(pils), return_tensors="pt", padding=True).to("cuda")
-        gtokens = proj(feats.to("cuda", torch.bfloat16), roles.to("cuda"))
-        lm._gtok = {"tokens": gtokens, "mask": (inp["input_ids"] == gtok_id)}
-        logits = model(**inp).logits[:, -1]
-        pyes = torch.softmax(torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1)[:, 0]
-        for k, p in zip(keys, pyes.float().tolist()):
-            preds[k] = p
+    with torch.no_grad():
+        for keys, pils, prompts, feats, roles in tqdm(dl, desc=f"tok-eval s{args.shard}/{args.nshards}",
+                                                      unit="batch"):
+            msgs = [[{"role": "user", "content": [{"type": "image", "image": p},
+                     {"type": "text", "text": t}]}]
+                    for p, t in zip(pils, prompts)]
+            texts = [proc.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+                     for m in msgs]
+            inp = proc(text=texts, images=list(pils), return_tensors="pt", padding=True).to("cuda")
+            gtokens = proj(feats.to("cuda", torch.bfloat16), roles.to("cuda"))
+            lm._gtok = {"tokens": gtokens, "mask": (inp["input_ids"] == gtok_id)}
+            logits = model(**inp).logits[:, -1]
+            pyes = torch.softmax(torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1)[:, 0]
+            for k, p in zip(keys, pyes.float().tolist()):
+                preds[k] = p
 
     out_path = args.preds_out or f"preds_token_{Path(args.ckpt).name}.pt"
     torch.save(preds, out_path)

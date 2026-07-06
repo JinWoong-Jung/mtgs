@@ -56,32 +56,38 @@ def _cmd_train_lora_token():
         recs = [json.loads(l) for l in open(manifest)]
         overlay_dir = Path(overlay_dir)
         preds = {}
-        for b0 in range(0, len(recs), vlm_bs):
-            chunk = recs[b0:b0 + vlm_bs]
-            pils, texts, feats_list, roles_list = [], [], [], []
-            for r in chunk:
-                gfd = gf[r["sid"]]
-                bb = gfd["head_bboxes"]
-                pil = Image.open(overlay_dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
-                prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
-                msgs = [{"role": "user", "content": [
-                    {"type": "image", "image": pil},
-                    {"type": "text", "text": prompt},
-                ]}]
-                texts.append(proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
-                pils.append(pil)
-                f, ro = gather_feats(gfd, r["task"], r["i"], r["j"])
-                feats_list.append(f); roles_list.append(ro)
-            inp = proc(text=texts, images=pils, return_tensors="pt", padding=True).to(device)
-            gtokens = proj(torch.cat(feats_list).to(device, torch.bfloat16),
-                           torch.cat(roles_list).to(device))
-            lm._gtok = {"tokens": gtokens, "mask": (inp["input_ids"] == gtok_id)}
-            logits = model(**inp).logits[:, -1]
-            pyes = torch.softmax(
-                torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1
-            )[:, 0]
-            for r, p in zip(chunk, pyes.float().tolist()):
-                preds[(r["sid"], r["task"], r["i"], r["j"])] = p
+        # Release the training-step allocator cache before val: the val forward runs
+        # under no_grad (no autograd graph retained), but training weights+optimizer
+        # still occupy the device, so free reserved-but-unused blocks first.
+        torch.cuda.empty_cache()
+        with torch.no_grad():
+            for b0 in range(0, len(recs), vlm_bs):
+                chunk = recs[b0:b0 + vlm_bs]
+                pils, texts, feats_list, roles_list = [], [], [], []
+                for r in chunk:
+                    gfd = gf[r["sid"]]
+                    bb = gfd["head_bboxes"]
+                    pil = Image.open(overlay_dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
+                    prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
+                    msgs = [{"role": "user", "content": [
+                        {"type": "image", "image": pil},
+                        {"type": "text", "text": prompt},
+                    ]}]
+                    texts.append(proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+                    pils.append(pil)
+                    f, ro = gather_feats(gfd, r["task"], r["i"], r["j"])
+                    feats_list.append(f); roles_list.append(ro)
+                inp = proc(text=texts, images=pils, return_tensors="pt", padding=True).to(device)
+                gtokens = proj(torch.cat(feats_list).to(device, torch.bfloat16),
+                               torch.cat(roles_list).to(device))
+                lm._gtok = {"tokens": gtokens, "mask": (inp["input_ids"] == gtok_id)}
+                logits = model(**inp).logits[:, -1]
+                pyes = torch.softmax(
+                    torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1
+                )[:, 0]
+                for r, p in zip(chunk, pyes.float().tolist()):
+                    preds[(r["sid"], r["task"], r["i"], r["j"])] = p
+        torch.cuda.empty_cache()   # hand memory back to the training step
         m = eval_metrics(build_mtgs_dicts(gtmeta, preds))
         proc.tokenizer.padding_side = old
         model.train()
