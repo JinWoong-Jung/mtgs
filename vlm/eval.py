@@ -35,13 +35,12 @@ from mtgs.performance.compute_metrics import CPU_Unpickler, compute
 from vlm.cfg import QWEN
 from vlm.injection import (
     GTOK,
-    N_TOK,
     GraphTokenProjector,
     gather_feats,
     install_hook,
 )
 from vlm.overlay import display_labels
-from vlm.prompt import TASKS, nograph_prompt
+from vlm.prompt import TASKS, token_prompt
 
 # ── Local constants (replaces sgg.hgr.train_phase1 / sgg.hgr.eval_softblend) ─
 
@@ -372,15 +371,18 @@ class _TokenRecDS(Dataset):
 
     def __getitem__(self, k):
         r = self.recs[k]
+        gfd = self.gf[r["sid"]]
+        bb = gfd["head_bboxes"]
         pil = Image.open(self.dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
-        prompt = (GTOK * N_TOK) + "\n" + nograph_prompt(r["task"], r["li"], r["lj"])
-        feats = gather_feats(self.gf[r["sid"]], r["i"], r["j"])
-        return (r["sid"], r["task"], r["i"], r["j"]), pil, prompt, feats
+        prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
+        feats, roles = gather_feats(gfd, r["task"], r["i"], r["j"])
+        return (r["sid"], r["task"], r["i"], r["j"]), pil, prompt, feats, roles
 
 
 def _coll(b):
-    keys, pils, prompts, feats = zip(*b)
-    return list(keys), list(pils), list(prompts), torch.stack(feats)
+    keys, pils, prompts, feats, roles = zip(*b)
+    return (list(keys), list(pils), list(prompts),
+            torch.cat(feats, dim=0), torch.cat(roles, dim=0))
 
 
 # ── token CLI main ─────────────────────────────────────────────────────────────
@@ -435,15 +437,15 @@ def _main_eval_lora_token():
     dl = DataLoader(_TokenRecDS(recs, args.overlay_dir, gf), batch_size=args.vlm_bs,
                     num_workers=args.num_workers, collate_fn=_coll, pin_memory=False)
     preds = {}
-    for keys, pils, prompts, feats in tqdm(dl, desc=f"tok-eval s{args.shard}/{args.nshards}",
-                                           unit="batch"):
+    for keys, pils, prompts, feats, roles in tqdm(dl, desc=f"tok-eval s{args.shard}/{args.nshards}",
+                                                  unit="batch"):
         msgs = [[{"role": "user", "content": [{"type": "image", "image": p},
                  {"type": "text", "text": t}]}]
                 for p, t in zip(pils, prompts)]
         texts = [proc.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
                  for m in msgs]
         inp = proc(text=texts, images=list(pils), return_tensors="pt", padding=True).to("cuda")
-        gtokens = proj(feats.to("cuda", torch.bfloat16))
+        gtokens = proj(feats.to("cuda", torch.bfloat16), roles.to("cuda"))
         lm._gtok = {"tokens": gtokens, "mask": (inp["input_ids"] == gtok_id)}
         logits = model(**inp).logits[:, -1]
         pyes = torch.softmax(torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1)[:, 0]

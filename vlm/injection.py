@@ -12,24 +12,20 @@ import torch.nn as nn
 """Graph soft-token injection for Qwen3-VL (latent-space fusion, à la GraphVLM).
 
 Injects the V14.5 graph's node/edge EMBEDDINGS as soft tokens into the VLM, instead of
-serialising them to text (which the VLM parrots). Per query pair (i,j), N_TOK=10 vectors,
-covering each person's emitter/receiver duality + the directed relation + both null channels:
-  v_src[i], v_src[j]            -> i/j as LOOKERS (emitter / source role)
-  v_tgt[i], v_tgt[j]            -> i/j as TARGETS (receiver / target role)
-  edge_pp[i,j], edge_pp[j,i]    -> directed pair embeddings (both directions)
-  edge_null_out[i], edge_null_out[j]  -> 'looks out-of-frame' channel (negative cue)
-  edge_null_in[i], edge_null_in[j]    -> 'is gazed-at-by-nobody' channel (focal/in-degree)
+serialising them to text (which the VLM parrots). Per query pair (i,j), a variable number
+of role-keyed vectors (TOK_COUNT[task]) covering the directed relation + null channels.
+  lah  (3): v_src[i], v_tgt[j], edge_fwd
+  laeo (4): v_src[i], v_src[j], edge_fwd, edge_bwd
+  sa   (6): v_src[i], v_src[j], null_in[i], null_in[j], edge_fwd, edge_bwd
 
-Mechanism: the prompt carries N_TOK "<gtok>" placeholder tokens. A forward_pre_hook on the
-TEXT model (model.model.language_model, which receives inputs_embeds AFTER the image merge)
-overwrites the placeholder embeddings with the projected graph vectors. mrope/positions are
-untouched (gtok are ordinary text positions).
+Mechanism: the prompt carries TOK_COUNT[task] "<gtok>" placeholder tokens. A forward_pre_hook
+on the TEXT model (model.model.language_model, which receives inputs_embeds AFTER the image
+merge) overwrites the placeholder embeddings with the projected graph vectors. mrope/positions
+are untouched (gtok are ordinary text positions).
 """
 
 
 GTOK = "<gtok>"
-
-N_TOK = 10   # DEAD after Task 4 — kept here only so still-old TokenDS/train/eval imports resolve; removed in Task 4.
 
 # Role ids (INVARIANT — shared by gather_feats, the prompt builder, and the projector).
 ROLE = {"SRC": 0, "TGT": 1, "EDGE_FWD": 2, "EDGE_BWD": 3, "NULL_IN": 4}

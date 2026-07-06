@@ -68,3 +68,49 @@ def test_projector_shape_and_role_conditioning():
     a = proj(torch.zeros(1, 256), torch.tensor([ROLE["SRC"]]))
     b = proj(torch.zeros(1, 256), torch.tensor([ROLE["TGT"]]))
     assert not torch.allclose(a, b) or torch.equal(proj.role_emb[0], proj.role_emb[1])
+
+
+import torch.nn as nn
+from vlm.injection import install_hook, GTOK
+
+
+class _StubLM(nn.Module):
+    """Minimal stand-in for the Qwen text model: records the inputs_embeds it receives."""
+    def __init__(self, D=8):
+        super().__init__()
+        self.D = D
+        self.seen = None
+
+    def forward(self, inputs_embeds=None, **kw):
+        self.seen = inputs_embeds
+        return inputs_embeds
+
+
+def test_hook_overwrites_only_gtok_positions_variable_length():
+    lm = _StubLM(D=8)
+    install_hook(lm)
+    proj = GraphTokenProjector(out_dim=8)
+    # batch of 2: LAH (3 tokens) then SA (6 tokens) = 9 gtok positions
+    gf = {
+        "v_src": torch.randn(4, 256), "v_tgt": torch.randn(4, 256),
+        "edge_pp": torch.randn(4, 4, 256), "edge_null_in": torch.randn(4, 256),
+        "head_bboxes": torch.rand(4, 4),
+    }
+    f0, r0 = gather_feats(gf, "lah", 0, 1)
+    f1, r1 = gather_feats(gf, "sa", 2, 3)
+    feats = torch.cat([f0, f1]); roles = torch.cat([r0, r1])
+    tokens = proj(feats, roles)                       # (9, 8)
+    B, L = 2, 12
+    mask = torch.zeros(B, L, dtype=torch.bool)
+    mask[0, 1:4] = True                               # 3 positions row 0
+    mask[1, 2:8] = True                               # 6 positions row 1
+    assert int(mask.sum()) == tokens.shape[0]
+    emb = torch.zeros(B, L, 8)
+    lm._gtok = {"tokens": tokens, "mask": mask}
+    _, kwargs = None, {"inputs_embeds": emb}
+    # emulate the pre-hook path
+    out_args, out_kwargs = lm._forward_pre_hooks[list(lm._forward_pre_hooks)[0]](
+        lm, (), {"inputs_embeds": emb})
+    new_emb = out_kwargs["inputs_embeds"]
+    assert torch.allclose(new_emb[mask], tokens.to(new_emb.dtype))
+    assert torch.count_nonzero(new_emb[~mask]) == 0   # non-gtok untouched

@@ -22,8 +22,8 @@ from peft import LoraConfig, get_peft_model
 from vlm.cfg import QWEN
 from vlm.dataset import TokenDS, make_token_collate
 from vlm.eval import build_mtgs_dicts, evaluate as eval_metrics
-from vlm.prompt import nograph_prompt
-from vlm.injection import GTOK, N_TOK, gather_feats, GraphTokenProjector, install_hook
+from vlm.injection import GTOK, gather_feats, GraphTokenProjector, install_hook
+from vlm.prompt import token_prompt
 
 PROJ = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
 
@@ -33,15 +33,16 @@ PROJ = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_pr
 # ---------------------------------------------------------------------------
 
 def _cmd_train_lora_token():
-    """Graph-TOKEN LoRA SFT of Qwen3-VL-8B: overlay + N_TOK graph soft-tokens (latent
+    """Graph-TOKEN LoRA SFT of Qwen3-VL-8B: overlay + variable graph soft-tokens (latent
     fusion) + query -> yes/no for LAH/LAEO/SA. Trains LoRA (LM) + GraphTokenProjector.
     Injects projected graph embeddings at <gtok> placeholders via a forward hook.
     """
     _MODE = "token"
 
     def inject(lm, proj, batch, gtok_id, device):
-        feats = batch.pop("graph_feats").to(device)
-        gtokens = proj(feats.to(torch.bfloat16))       # (B, N_TOK, D)
+        feats = batch.pop("graph_feats").to(device)          # (ΣK, 256)
+        roles = batch.pop("graph_role_ids").to(device)       # (ΣK,)
+        gtokens = proj(feats.to(torch.bfloat16), roles)      # (ΣK, D)
         mask = (batch["input_ids"] == gtok_id).to(device)
         lm._gtok = {"tokens": gtokens, "mask": mask}
 
@@ -57,19 +58,23 @@ def _cmd_train_lora_token():
         preds = {}
         for b0 in range(0, len(recs), vlm_bs):
             chunk = recs[b0:b0 + vlm_bs]
-            pils, texts, feats = [], [], []
+            pils, texts, feats_list, roles_list = [], [], [], []
             for r in chunk:
+                gfd = gf[r["sid"]]
+                bb = gfd["head_bboxes"]
                 pil = Image.open(overlay_dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
-                prompt = (GTOK * N_TOK) + "\n" + nograph_prompt(r["task"], r["li"], r["lj"])
+                prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
                 msgs = [{"role": "user", "content": [
                     {"type": "image", "image": pil},
                     {"type": "text", "text": prompt},
                 ]}]
                 texts.append(proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
                 pils.append(pil)
-                feats.append(gather_feats(gf[r["sid"]], r["i"], r["j"]))
+                f, ro = gather_feats(gfd, r["task"], r["i"], r["j"])
+                feats_list.append(f); roles_list.append(ro)
             inp = proc(text=texts, images=pils, return_tensors="pt", padding=True).to(device)
-            gtokens = proj(torch.stack(feats).to(device, torch.bfloat16))
+            gtokens = proj(torch.cat(feats_list).to(device, torch.bfloat16),
+                           torch.cat(roles_list).to(device))
             lm._gtok = {"tokens": gtokens, "mask": (inp["input_ids"] == gtok_id)}
             logits = model(**inp).logits[:, -1]
             pyes = torch.softmax(
