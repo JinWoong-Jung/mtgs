@@ -2,8 +2,7 @@ from __future__ import annotations
 """VLM Stage-2 eval harness — locked to the same compute_metrics axis as the
 graph baseline (F1_LAH / F1_LAEO / AP_SA via per-target-argmax, thr=0.5).
 
-Three CLI subcommands:
-  nograph  — batched LoRA inference (no graph token) -> compute_metrics
+Two CLI subcommands:
   token    — LoRA + GraphTokenProjector soft-token inference -> compute_metrics
   blend    — soft-blend alpha-sweep using a cached feat + optional pvlm .pt
 
@@ -21,7 +20,6 @@ import io as _io
 import itertools
 import json
 import logging
-import os
 import re
 from pathlib import Path
 
@@ -40,7 +38,6 @@ from vlm.injection import (
     N_TOK,
     GraphTokenProjector,
     gather_feats,
-    graph_text_block,
     install_hook,
 )
 from vlm.overlay import display_labels
@@ -359,121 +356,10 @@ def build_mtgs_dicts(gtmeta_path, preds):
     return out
 
 
-# ── LoRA nograph inference ─────────────────────────────────────────────────────
+# ── token eval dataset / collate ──────────────────────────────────────────────
 
 _mp.set_sharing_strategy("file_system")
 
-
-class _RecDS(torch.utils.data.Dataset):
-    """Loads overlay PNG + builds the templated text per record (in workers).
-    gf = v14graph dict -> prepend graph-text (match the train dataset)."""
-    def __init__(self, recs, overlay_dir, proc, gf=None):
-        self.recs = recs
-        self.dir = Path(overlay_dir)
-        self.proc = proc
-        self.gf = gf
-
-    def __len__(self):
-        return len(self.recs)
-
-    def __getitem__(self, k):
-        r = self.recs[k]
-        pil = Image.open(self.dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
-        prompt = nograph_prompt(r["task"], r["li"], r["lj"])
-        if self.gf is not None and r["sid"] in self.gf:
-            prompt = (graph_text_block(r["task"], r["i"], r["j"], self.gf[r["sid"]],
-                                       r["li"], r["lj"],
-                                       answer_blind=os.environ.get("GRAPHTEXT_BLIND") == "1")
-                      + "\n" + prompt)
-        msgs = [{"role": "user", "content": [{"type": "image", "image": pil},
-                 {"type": "text", "text": prompt}]}]
-        text = self.proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        return (r["sid"], r["task"], r["i"], r["j"]), pil, text
-
-
-def _collate(b):
-    keys, pils, texts = zip(*b)
-    return list(keys), list(pils), list(texts)
-
-
-def infer(ckpt, manifest, overlay_dir, vlm_bs, shard=0, nshards=1, workers=8, graph_feats=""):
-    """Phase 1: P(yes) per record. Strided shard (records[shard::nshards]) + parallel
-    overlay loading (DataLoader workers) so the 866k-record test set is tractable."""
-    recs = [json.loads(l) for l in open(manifest)]
-    if nshards > 1:
-        recs = recs[shard::nshards]
-    proc = AutoProcessor.from_pretrained(QWEN)
-    proc.tokenizer.padding_side = "left"
-    yes_id = proc.tokenizer.encode("yes", add_special_tokens=False)[0]
-    no_id = proc.tokenizer.encode("no", add_special_tokens=False)[0]
-    base = Qwen3VLForConditionalGeneration.from_pretrained(QWEN, dtype=torch.bfloat16,
-                                                           device_map="cuda")
-    if ckpt.lower() in ("", "none", "base", "zeroshot"):
-        print("[eval] ZERO-SHOT (frozen base, no LoRA)", flush=True)
-        model = base.eval()
-    else:
-        model = PeftModel.from_pretrained(base, ckpt).merge_and_unload().eval()
-
-    gf = torch.load(graph_feats, weights_only=False) if graph_feats else None
-    if gf is not None:
-        print(f"[eval] graph-text augmented ({graph_feats})", flush=True)
-    dl = DataLoader(_RecDS(recs, overlay_dir, proc, gf=gf), batch_size=vlm_bs,
-                    num_workers=workers, collate_fn=_collate, pin_memory=False)
-    preds = {}
-    pbar = tqdm(dl, desc=f"eval s{shard}/{nshards}", unit="batch")
-    for keys, pils, texts in pbar:
-        inp = proc(text=texts, images=list(pils), return_tensors="pt", padding=True).to("cuda")
-        logits = model(**inp).logits[:, -1]
-        pyes = torch.softmax(torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1)[:, 0]
-        for k, p in zip(keys, pyes.float().tolist()):
-            preds[k] = p
-        pbar.set_postfix(recs=len(preds))
-    return preds
-
-
-# ── nograph CLI main ───────────────────────────────────────────────────────────
-
-def _main_eval_lora_nograph():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="none", help="LoRA adapter dir, or none/base for zero-shot")
-    ap.add_argument("--manifest", default="")
-    ap.add_argument("--overlay_dir", default="")
-    ap.add_argument("--gtmeta", required=True, help="render-pass gtmeta .pt (GT/bbox/inout)")
-    ap.add_argument("--vlm_bs", type=int, default=64)
-    ap.add_argument("--num_workers", type=int, default=8)
-    ap.add_argument("--shard", type=int, default=0)
-    ap.add_argument("--nshards", type=int, default=1)
-    ap.add_argument("--preds_out", default="", help="save this shard's P(yes) preds here")
-    ap.add_argument("--compute_from", default="", help="glob of pred shards -> merge + compute_metrics")
-    ap.add_argument("--graph_feats", default="", help="v14graph_<split>.pt -> graph-text aug")
-    args = ap.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    # COMPUTE-ONLY: merge all pred shards + gtmeta -> metrics (CPU, fast)
-    if args.compute_from:
-        preds = {}
-        for f in sorted(glob.glob(args.compute_from)):
-            preds.update(torch.load(f, weights_only=False))
-        results = build_mtgs_dicts(args.gtmeta, preds)
-        print(f"\n===== compute from {args.compute_from}  ({len(preds)} preds, {len(results)} samples) =====",
-              flush=True)
-        compute(results, shuffle=False, thr=0.5)
-        return
-
-    # INFER (one shard) -> save preds; compute inline only if single shard
-    preds = infer(args.ckpt, args.manifest, args.overlay_dir, args.vlm_bs,
-                  args.shard, args.nshards, args.num_workers, graph_feats=args.graph_feats)
-    if args.preds_out:
-        torch.save(preds, args.preds_out)
-        print(f"[eval] shard {args.shard}/{args.nshards}: saved {len(preds)} preds -> {args.preds_out}",
-              flush=True)
-    if args.nshards == 1:
-        results = build_mtgs_dicts(args.gtmeta, preds)
-        print(f"\n===== {args.ckpt}  ({len(results)} samples) =====", flush=True)
-        compute(results, shuffle=False, thr=0.5)
-
-
-# ── token eval dataset / collate ──────────────────────────────────────────────
 
 class _TokenRecDS(Dataset):
     def __init__(self, recs, overlay_dir, gf):
@@ -611,7 +497,6 @@ if __name__ == "__main__":
     import sys
     _CMDS = {
         "blend":   _main_eval_blend,
-        "nograph": _main_eval_lora_nograph,
         "token":   _main_eval_lora_token,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in _CMDS:

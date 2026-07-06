@@ -2,17 +2,14 @@ from __future__ import annotations
 """LoRA-SFT of Qwen3-VL-8B for VLM Stage-2.
 
 Subcommands:
-  nograph  – graph-text overlay baseline (experiments B/D/E)
   token    – graph soft-token injection (experiment C)
 
 CLI:
-  python -m vlm.train nograph --manifest ... --overlay_dir ... [--graph_feats ...] --out ...
   python -m vlm.train token   --manifest ... --overlay_dir ... --graph_feats ... --out ...
 """
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import torch
@@ -23,202 +20,12 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from peft import LoraConfig, get_peft_model
 
 from vlm.cfg import QWEN
-from vlm.dataset import LoRADatasetNoGraph, TokenDS, make_collate, make_token_collate
+from vlm.dataset import TokenDS, make_token_collate
 from vlm.eval import build_mtgs_dicts, evaluate as eval_metrics
 from vlm.prompt import nograph_prompt
-from vlm.injection import (
-    graph_text_block,
-    GTOK, N_TOK, gather_feats, GraphTokenProjector, install_hook,
-)
+from vlm.injection import GTOK, N_TOK, gather_feats, GraphTokenProjector, install_hook
 
 PROJ = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
-
-
-# ---------------------------------------------------------------------------
-# nograph (experiments B / D / E)
-# ---------------------------------------------------------------------------
-
-def _cmd_train_lora_nograph():
-    """Graph-FREE LoRA SFT of Qwen3-VL-8B: overlay(all-ID, i=red/j=blue) + question
-    -> yes/no, for LAH/LAEO/SA per-pair.  Vision-only baseline (no graph context).
-    LM-only LoRA, vision frozen, (task,answer)-balanced sampler, answer-token CE.
-    """
-    _MODE = "nograph"
-
-    def eval_val(model, proc, manifest, overlay_dir, gtmeta, vlm_bs, gf=None):
-        """End-of-epoch VAL eval -> F1_LAH/F1_LAEO/AP_SA (locked graph protocol).
-        gf = graph_val dict -> prepend graph-text (matches train dataset)."""
-        model.eval()
-        old_pad = proc.tokenizer.padding_side
-        proc.tokenizer.padding_side = "left"
-        yes_id = proc.tokenizer.encode("yes", add_special_tokens=False)[0]
-        no_id = proc.tokenizer.encode("no", add_special_tokens=False)[0]
-        recs = [json.loads(l) for l in open(manifest)]
-        overlay_dir = Path(overlay_dir)
-        preds = {}
-        for b0 in range(0, len(recs), vlm_bs):
-            chunk = recs[b0:b0 + vlm_bs]
-            pils, texts = [], []
-            for r in chunk:
-                pil = Image.open(overlay_dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
-                prompt = nograph_prompt(r["task"], r["li"], r["lj"])
-                if gf is not None and r["sid"] in gf:
-                    prompt = graph_text_block(
-                        r["task"], r["i"], r["j"], gf[r["sid"]], r["li"], r["lj"],
-                        answer_blind=os.environ.get("GRAPHTEXT_BLIND") == "1",
-                    ) + "\n" + prompt
-                msgs = [{"role": "user", "content": [
-                    {"type": "image", "image": pil},
-                    {"type": "text", "text": prompt},
-                ]}]
-                texts.append(proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
-                pils.append(pil)
-            inp = proc(text=texts, images=pils, return_tensors="pt", padding=True).to("cuda")
-            logits = model(**inp).logits[:, -1]
-            pyes = torch.softmax(
-                torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1
-            )[:, 0]
-            for r, p in zip(chunk, pyes.float().tolist()):
-                preds[(r["sid"], r["task"], r["i"], r["j"])] = p
-        m = eval_metrics(build_mtgs_dicts(gtmeta, preds))
-        proc.tokenizer.padding_side = old_pad
-        model.train()
-        return m
-
-    def main():
-        import wandb
-
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--manifest", required=True)
-        ap.add_argument("--overlay_dir", required=True, help="vlm_overlays/<split>")
-        ap.add_argument("--out", default="results/vlm_lora_nograph")
-        ap.add_argument("--bs", type=int, default=2)
-        ap.add_argument("--accum", type=int, default=8)
-        ap.add_argument("--lr", type=float, default=1e-4)
-        ap.add_argument("--epochs", type=int, default=2)
-        ap.add_argument("--steps_per_epoch", type=int, default=20000)
-        ap.add_argument("--rank", type=int, default=16)
-        ap.add_argument("--num_workers", type=int, default=4)
-        ap.add_argument("--val_manifest", default="")
-        ap.add_argument("--val_overlay_dir", default="")
-        ap.add_argument("--val_gtmeta", default="")
-        ap.add_argument("--vlm_bs", type=int, default=48)
-        ap.add_argument("--graph_feats", default="", help="graph_train.pt -> graph-text aug")
-        ap.add_argument("--val_graph_feats", default="", help="graph_val.pt for per-epoch val eval")
-        ap.add_argument("--wandb_name", default="", help="W&B run name (default: out dir name)")
-        ap.add_argument("--wandb_off", action="store_true", help="disable W&B logging")
-        args = ap.parse_args()
-        device = "cuda"
-
-        use_wandb = not args.wandb_off
-        if use_wandb:
-            wandb.init(
-                project="MTGS", entity="gaze-social", group="vlm-stage2",
-                name=args.wandb_name or Path(args.out).name,
-                config={
-                    "mode": _MODE,
-                    "lr": args.lr,
-                    "rank": args.rank,
-                    "epochs": args.epochs,
-                    "graph_feats": bool(args.graph_feats),
-                },
-            )
-
-        ds = LoRADatasetNoGraph(args.manifest, args.overlay_dir, graph_feats=args.graph_feats or None)
-        val_gf = torch.load(args.val_graph_feats, weights_only=False) if args.val_graph_feats else None
-        print(f"[lora-nograph] records={len(ds)}", flush=True)
-
-        proc = AutoProcessor.from_pretrained(QWEN)
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            QWEN, dtype=torch.bfloat16, device_map=device)
-        targets = [n for n, _ in model.named_modules()
-                   if "language_model" in n and n.split(".")[-1] in PROJ]
-        lora = LoraConfig(r=args.rank, lora_alpha=2 * args.rank, lora_dropout=0.05,
-                          target_modules=targets, task_type="CAUSAL_LM")
-        model = get_peft_model(model, lora)
-        model.print_trainable_parameters()
-        model.config.use_cache = False
-        model.enable_input_require_grads()
-
-        sampler = WeightedRandomSampler(ds.sample_weights(), num_samples=args.steps_per_epoch,
-                                        replacement=True)
-        dl = DataLoader(ds, batch_size=args.bs, sampler=sampler, num_workers=args.num_workers,
-                        collate_fn=make_collate(proc), pin_memory=True)
-        opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-
-        out = Path(args.out)
-        out.mkdir(parents=True, exist_ok=True)
-        model.train()
-        step = 0
-        for ep in range(args.epochs):
-            opt.zero_grad()
-            pbar = tqdm(dl, desc=f"nograph ep{ep}")
-            run = 0.0
-            correct = 0
-            total = 0
-            for it, batch in enumerate(pbar):
-                batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-                out_ = model(**batch)
-                loss = out_.loss / args.accum
-                loss.backward()
-                run += float(out_.loss)
-                with torch.no_grad():
-                    pred = out_.logits[:, :-1].argmax(-1)
-                    lbl = batch["labels"][:, 1:]
-                    mask = lbl != -100
-                    correct += int(((pred == lbl) & mask).sum())
-                    total += int(mask.sum())
-                if (it + 1) % args.accum == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in model.parameters() if p.requires_grad], 1.0)
-                    opt.step()
-                    opt.zero_grad()
-                    step += 1
-                    pbar.set_postfix(
-                        loss=f"{run/(it+1):.3f}",
-                        acc=f"{correct/max(total,1):.3f}",
-                        step=step,
-                    )
-                    if use_wandb:
-                        wandb.log({
-                            "train/loss": run / (it + 1),
-                            "train/answer_acc": correct / max(total, 1),
-                            "step": step,
-                        })
-            model.save_pretrained(out / f"ep{ep}")
-            print(
-                f"[lora-nograph] ep{ep} mean_loss={run/max(len(dl),1):.4f} "
-                f"train_acc={correct/max(total,1):.4f} -> {out/f'ep{ep}'}",
-                flush=True,
-            )
-            # end-of-epoch VAL eval (model selection)
-            m = None
-            if args.val_manifest and Path(args.val_gtmeta).exists() and Path(args.val_manifest).exists():
-                try:
-                    m = eval_val(model, proc, args.val_manifest, args.val_overlay_dir,
-                                 args.val_gtmeta, args.vlm_bs, gf=val_gf)
-                    print(
-                        f"[lora-nograph] ep{ep} VAL  F1_LAH={m.get('F1_LAH')}  "
-                        f"F1_LAEO={m.get('F1_LAEO')}  AP_SA={m.get('AP_SA')}",
-                        flush=True,
-                    )
-                except Exception as e:
-                    print(f"[lora-nograph] ep{ep} val eval failed: {e!r}", flush=True)
-            else:
-                print(f"[lora-nograph] ep{ep} val skipped (val manifest/gtmeta not ready)", flush=True)
-            if use_wandb and m is not None:
-                wandb.log(
-                    {f"val/{k}": m[k] for k in
-                     ("Dist", "AP_IO", "F1_LAH_PP", "F1_LAEO_PP", "F1_LAH", "F1_LAEO", "AP_SA")
-                     if m.get(k) is not None}
-                    | {"epoch": ep}
-                )
-        model.save_pretrained(out / "final")
-        print(f"[lora-nograph] done -> {out/'final'}", flush=True)
-        if use_wandb:
-            wandb.finish()
-
-    main()
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +235,7 @@ def _cmd_train_lora_token():
 
 if __name__ == "__main__":
     import sys
-    _CMDS = {"nograph": _cmd_train_lora_nograph, "token": _cmd_train_lora_token}
+    _CMDS = {"token": _cmd_train_lora_token}
     if len(sys.argv) < 2 or sys.argv[1] not in _CMDS:
         sys.exit("usage: python -m vlm.train {" + "|".join(_CMDS) + "} [args]")
     _cmd = sys.argv.pop(1)
