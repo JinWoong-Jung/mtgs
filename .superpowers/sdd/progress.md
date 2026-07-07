@@ -89,3 +89,34 @@ Branch: vlm-stage2 (base: main)
 3. test 평가: MODE=eval SPLIT=test EXPERIMENT=C_token (vlm.eval token + blend α-sweep).
 - 브랜치 vlm-stage2 미병합 보존. 별개 미커밋: vlm/graph_export.py (test-split bs=1 fix).
 ## Orientation 검증 런 진행중 (job 3684, 2026-07-06): 8B 1ep 2k steps bs4 vlm_bs16 W&B(C_token_orient), val=4k subset. 목표: epoch-0 val F1_LAH ~0.82면 orientation OK.
+
+## ===== 2026-07-07 RUN: plain-image + N=all + vision-reuse (plan 2026-07-07-vlm-plain-image-nall.md) =====
+Branch: vlm-plain-nall (base: e42c7c727da239bbf3f013213e69985c72219a5a on main)
+Mode: IMPLEMENTATION-ONLY (user runs all extraction/GPU steps). Seed=101, data root=/home/jinwoongjung/MTGS/data/vlm_feature.
+- Task 1: complete (commits e42c7c7..61465e3, review clean; Spec ✅ Approved; GPU smoke deferred to user)
+- Task 2: complete (commits 61465e3..3dafadc, review clean; Spec ✅ Approved; render smoke deferred to user)
+- Task 3: complete (commits 3dafadc..90df290, review clean; Spec ✅ Approved; CPU assertion OK)
+- Task 4: complete (commits 90df290..9403024, review clean; Spec ✅ Approved; on-disk smoke deferred to user)
+- Task 5: complete (commits 9403024..b03fc51: impl 99c4faf + FIX1 assert b03fc51, review clean; Spec ✅ Approved)
+  - API adaptation (verified correct vs installed transformers source): get_image_features returns BaseModelOutputWithDeepstackFeatures; per-image embeds in .pooler_output (torch.split tuple). Implementer read .pooler_output — faithful to model's internal scatter path.
+  - Fix1: added shape-count assert before inputs_embeds splice (reviewer Important #1).
+  - DEFERRED (reviewer Important #2 → final review + user speed measure): per-record proc(images=[pil]) re-runs CPU image preprocessing (pixel_values computed but unused); GPU vision-tower reuse (primary win) IS preserved. Clean fix risks the equivalence gate → measure speed first (Task 6 Step 5), optimize only if insufficient.
+  - USER-GATED: equivalence test (vlm/tests_vision_cache.py, <1e-3) must be run on GPU after a checkpoint exists.
+- Task 6: complete (commits b03fc51..103f29b, review clean; Spec ✅ Approved; export/train/eval RUNS are user-executed)
+- Task 7: complete (commits 103f29b..cd9493e, review clean; Spec ✅ Approved; profiler run is user-executed)
+
+## FINAL REVIEW (opus, e42c7c7..cd9493e): NOT-READY → 2 Critical + 1 Important in vision-reuse (Task 5).
+##  - Critical #1: grouped forward dropped Qwen3-VL deepstack injection (deepstack_visual_indexes [8,16,24]).
+##  - Critical #2: grouped forward skipped M-RoPE 3D position_ids (model(inputs_embeds=..) w/o pixel_values).
+##  - Important #3: graph_export bs=1 guard no longer covered manual SPLIT=test w/o --num_people all.
+## FIX (opus, commit ada2579): rewrote run_token_eval_grouped — monkeypatch model.model.get_image_features with a
+##  per-frame cache and call model(**inp) NORMALLY (with pixel_values). Vision tower deduped once/frame; deepstack +
+##  M-RoPE + scatter + gtok-hook all run via the model's own forward → equivalence BY CONSTRUCTION. Restored test bs=1 guard.
+##  Controller correction: reviewer's "dead _TokenRecDS/_coll" Minor was WRONG (train.py:27,64 use them) → NOT actioned.
+## RE-REVIEW (opus, cd9493e..ada2579): Criticals #1/#2 RESOLVED, Important #3 RESOLVED. Verdict: READY TO MERGE = YES.
+## Minor roll-up (non-blocking, triage):
+##  - graph_export.py print string says "num_people=all" even when triggered by split=="test" (log-only).
+##  - vision_cache.py restore reassigns bound method instead of `del inner.get_image_features` (harmless).
+## STATUS: all 7 tasks complete + final review clean. Branch vlm-plain-nall ready.
+## USER-GATED before merge: (1) delete Phase-0 stale artifacts; (2) run export/overlays (train/val/test, N=all, seed 101);
+##  (3) run vlm/tests_vision_cache.py equivalence (<1e-3) on a trained ckpt — THE correctness gate; (4) train + test eval.
