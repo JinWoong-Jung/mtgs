@@ -24,8 +24,8 @@ def token_prompt(task, li, lj, bb_i, bb_j):
       laeo : SRC(li), SRC(lj), EDGE_FWD, EDGE_BWD   (4)
       sa   : SRC(li), SRC(lj), NULL_IN(li), NULL_IN(lj), EDGE_FWD, EDGE_BWD  (6)
     """
-    red = f"Person {li} {GTOK}, head box {_fmt_box(bb_i)}, is outlined in red. "
-    blue = f"Person {lj} {GTOK}, head box {_fmt_box(bb_j)}, is outlined in blue. "
+    red = f"Person {li} {GTOK} has head box {_fmt_box(bb_i)}. "
+    blue = f"Person {lj} {GTOK} has head box {_fmt_box(bb_j)}. "
     if task == "lah":
         return (red + blue
                 + f"Their gaze relation: {GTOK}. "
