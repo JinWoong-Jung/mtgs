@@ -25,7 +25,7 @@ from tqdm import tqdm
 from mtgs.train.dataset import build_dataset
 from mtgs.utils.image import IMG_MEAN, IMG_STD
 from vlm.cfg import make_cfg
-from vlm.overlay import denormalize_to_pil, build_overlay_pair, display_labels
+from vlm.overlay import denormalize_to_pil, display_labels
 
 
 STAGE = {"train": "fit", "val": "validate", "test": "test"}
@@ -55,9 +55,9 @@ def main():
     # The dataset enumeration order is RNG-dependent at construction; seed so that
     # sid = enum-index is reproducible across processes (render vs eval must agree,
     # and this must match graph_export.py / Task 3).
-    torch.manual_seed(0); np.random.seed(0); random.seed(0)
+    torch.manual_seed(101); np.random.seed(101); random.seed(101)
 
-    cfg = make_cfg(args.split)
+    cfg = make_cfg(args.split, num_people="all")
     cfg.device = "cpu"  # CPU-only render pass — no model inference
 
     data = build_dataset(**cfg)
@@ -134,7 +134,6 @@ def main():
         # Build records (GT != -1 only) AND the set of overlays they need —
         # one pass, so manifest and overlays can never diverge.
         frame_recs = []
-        needed: set[tuple[int, int]] = set()
         for q, (i, j) in enumerate(pairs):
             if i not in valid or j not in valid:
                 continue
@@ -144,7 +143,7 @@ def main():
                 frame_recs.append({"sid": sid, "task": "lah",
                                    "i": i, "j": j,
                                    "li": lab[i], "lj": lab[j], "ans": a})
-                needed.add((i, j)); cnt["lah"] += 1
+                cnt["lah"] += 1
             if i < j:                                         # LAEO / SA undirected
                 for task, arr in (("laeo", laeo), ("sa", coatt)):
                     v = float(arr[q])
@@ -153,7 +152,7 @@ def main():
                         frame_recs.append({"sid": sid, "task": task,
                                            "i": i, "j": j,
                                            "li": lab[i], "lj": lab[j], "ans": a})
-                        needed.add((i, j)); cnt[task] += 1
+                        cnt[task] += 1
         if not frame_recs:
             continue
 
@@ -168,18 +167,13 @@ def main():
             "dataset":           s["dataset"],
         }
 
-        boxes = bb.tolist()
         sdir = outroot / f"sample{idx:06d}"
         sdir.mkdir(parents=True, exist_ok=True)
-        pil = None
-        for (i, j) in needed:
-            fp = sdir / f"{i}_{j}.png"
-            if fp.exists():
-                skipped += 1
-                continue
-            if pil is None:
-                pil = denormalize_to_pil(s["image"][cidx], IMG_MEAN, IMG_STD)
-            build_overlay_pair(pil, i, j, boxes, lab).save(fp)
+        fp = sdir / "frame.png"
+        if fp.exists():
+            skipped += 1
+        else:
+            denormalize_to_pil(s["image"][cidx], IMG_MEAN, IMG_STD).save(fp)
             imgs += 1
 
         frames += 1
