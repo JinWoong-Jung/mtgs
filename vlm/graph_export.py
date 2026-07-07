@@ -34,19 +34,21 @@ def main():
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--save_every", type=int, default=4000)
+    ap.add_argument("--num_people", default="", help="'all' to override N (offline extraction); empty=config default")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # test split 은 num_people="all"(가변 N) → 배치 내 텐서 크기가 달라 stack 실패.
-    # train/val 은 num_people=4 고정이라 args.batch_size 그대로 안전.
-    if args.split == "test" and args.batch_size != 1:
-        print(f"[export] test split has variable N -> forcing batch_size 1 (was {args.batch_size})", flush=True)
+    cfg = make_cfg(args.split, num_people=(args.num_people or None))
+    cfg.test.batch_size = args.batch_size
+    # Variable-N (num_people="all") frames can't be stacked -> force batch_size 1.
+    if cfg.data.num_people == "all" and args.batch_size != 1:
+        print(f"[export] num_people=all -> forcing batch_size 1 (was {args.batch_size})", flush=True)
         args.batch_size = 1
-    cfg = make_cfg(args.split); cfg.test.batch_size = args.batch_size
+        cfg.test.batch_size = 1
 
     # sid = enumeration index. data_prep(Task 5)와 sid 정렬을 위해 build_dataset 전에
     # 동일 시드 고정 + train split 은 stochastic 증강 비활성화(eval transform)로 맞춘다.
-    torch.manual_seed(0); np.random.seed(0); random.seed(0)
+    torch.manual_seed(101); np.random.seed(101); random.seed(101)
     data = build_dataset(**cfg); data.setup(STAGE[args.split])
     if args.split == "train":
         eval_tf = data.val_dataset.datasets[0].transform
