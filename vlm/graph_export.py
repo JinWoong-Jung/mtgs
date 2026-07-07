@@ -41,7 +41,7 @@ def main():
     cfg = make_cfg(args.split, num_people=(args.num_people or None))
     cfg.test.batch_size = args.batch_size
     # Variable-N (num_people="all") frames can't be stacked -> force batch_size 1.
-    if cfg.data.num_people == "all" and args.batch_size != 1:
+    if (cfg.data.num_people == "all" or args.split == "test") and args.batch_size != 1:
         print(f"[export] num_people=all -> forcing batch_size 1 (was {args.batch_size})", flush=True)
         args.batch_size = 1
         cfg.test.batch_size = 1
