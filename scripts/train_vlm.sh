@@ -37,7 +37,7 @@ SPLIT=${SPLIT:-train}             # train | val | test
 CHECKPOINT=${CHECKPOINT:-experiments/V14.5/train/checkpoints/best.ckpt}
 CONFIG=${CONFIG:-mtgs/config/config_vlm.yaml}   # experiment name + all hyperparameters
 WHICH=${WHICH:-best}              # eval 대상 체크포인트: best | last
-CACHE=results/vlm_cache
+CACHE=/home/jinwoongjung/MTGS/data/vlm_feature
 
 mkdir -p "$CACHE" /home/jinwoongjung/MTGS/scripts/logs
 
@@ -70,7 +70,8 @@ case $MODE in
       --split "$SPLIT" \
       --ckpt "$CHECKPOINT" \
       --out "$CACHE/vlmgraph_${SPLIT}.pt" \
-      --batch_size 4 ;;
+      --batch_size 4 \
+      --num_people all ;;
 
   # Stage 2a: render per-frame overlays + write manifest + gtmeta cache
   overlays)

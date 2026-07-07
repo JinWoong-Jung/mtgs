@@ -6,8 +6,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 experiment:
-  name: C_token              # 실험 이름 → 저장경로 <out_root>/<name>/, W&B run 이름
-  out_root: experiments/vlm_v1  # 실험 저장 루트
+  name: C_plain_nall         # 실험 이름 → 저장경로 <out_root>/<name>/, W&B run 이름
+  out_root: experiments/vlm_plain  # 실험 저장 루트
   monitor: mean_social       # best 체크포인트 선택 지표 (클수록 좋음):
                              #   F1_LAH | F1_LAEO | AP_SA | mean_social(=셋 평균)
 
@@ -18,7 +18,7 @@ train:
   steps_per_epoch: 20000  # epoch당 추출 샘플 수 (WeightedRandomSampler num_samples)
   num_workers: 6          # DataLoader 워커 수 (train + in-training val 공용)
   rank: 32                # LoRA rank (lora_alpha = 2*rank)
-  seed: 10                # 재현성 시드
+  seed: 101               # 재현성 시드 (MTGS와 통일)
   lora_targets:           # LoRA 학습 대상 projection (LM 한정). 원하는 것만 남겨 학습범위 조절
     - q_proj
     - k_proj
