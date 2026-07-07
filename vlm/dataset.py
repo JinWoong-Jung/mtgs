@@ -75,7 +75,7 @@ class TokenDS(Dataset):
         r = self.recs[k]
         gfd = self.gf[r["sid"]]
         bb = gfd["head_bboxes"]
-        pil = Image.open(self.dir / r["sid"] / f"{r['i']}_{r['j']}.png").convert("RGB")
+        pil = Image.open(self.dir / r["sid"] / "frame.png").convert("RGB")
         prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
         feats, roles = gather_feats(gfd, r["task"], r["i"], r["j"])   # (K,256),(K,)
         return pil, prompt, r["ans"], feats, roles
