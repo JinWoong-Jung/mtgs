@@ -78,6 +78,8 @@ def run_token_eval_grouped(model, proc, proj, lm, recs, overlay_dir, gf,
             ids = inp["input_ids"]
             emb = model.model.language_model.get_input_embeddings()(ids).clone()  # (1,L,D)
             img_pos = (ids[0] == img_tok_id)
+            assert img_embeds.shape[0] == int(img_pos.sum()), \
+                f"image-embed count {img_embeds.shape[0]} != image-token slots {int(img_pos.sum())} for sid={sid}"
             emb[0, img_pos] = img_embeds.to(emb.dtype)           # splice cached vision
             feats, roles = gather_feats(gfd, r["task"], r["i"], r["j"])
             lm._gtok = {"tokens": proj(feats.to(device, torch.bfloat16), roles.to(device)),
