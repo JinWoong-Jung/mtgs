@@ -37,6 +37,11 @@ def main():
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # test split 은 num_people="all"(가변 N) → 배치 내 텐서 크기가 달라 stack 실패.
+    # train/val 은 num_people=4 고정이라 args.batch_size 그대로 안전.
+    if args.split == "test" and args.batch_size != 1:
+        print(f"[export] test split has variable N -> forcing batch_size 1 (was {args.batch_size})", flush=True)
+        args.batch_size = 1
     cfg = make_cfg(args.split); cfg.test.batch_size = args.batch_size
 
     # sid = enumeration index. data_prep(Task 5)와 sid 정렬을 위해 build_dataset 전에

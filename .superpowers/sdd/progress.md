@@ -61,3 +61,31 @@ Branch: vlm-stage2 (base: main)
 - Launcher: MODE ∈ {export, overlays, token, eval}; eval → `vlm.eval token` + blend.
 - Plan: docs/superpowers/plans/2026-07-06-vlm-token-consolidation.md
 - Orientation INVARIANT baked in: EDGE_FWD("i→j")=edge_pp[j,i]. Verify at first val eval (F1_LAH sanity).
+- Task 5: complete (commits 96371fb..76cebc8, review clean; Spec ✅ Approved)
+  - 구현자 추가수정(정당): train_vlm.sh set -e 주석의 stale `nograph`→`token`(grep 가드 통과).
+  - Minor(비이슈): 리뷰어가 progress.md 라인 변화를 "history 재작성"으로 보았으나, 실제로는 컨트롤러 원장 append가 이 커밋에 함께 커밋된 것(무손실, 의도됨).
+
+## FINAL REVIEW (opus, b790f8e..76cebc8): READY TO MERGE = YES. Critical/Important 0건. 6 invariants 정적 정확(특히 #3 flat-concat↔hook row-major 정렬: <gtok> 단일 special token → mask.sum()==ΣK 보장).
+## Minor 롤업(최종 triage):
+##  1) nograph_prompt: Task3/4 이후 완전 dead인데 Task1 계획이 보존 + test_vlm_surface가 hasattr로 보존을 강제 → 계획-충돌, 사용자 결정 필요.
+##  2) dataset.py 미사용 GTOK import
+##  3) injection.py orphan 중복 docstring(no-op)
+##  4) test_projector role 단언 vacuous(zero-init) — 테스트에서 role_emb 노이즈 주입 권장
+##  5) 두 테스트 파일 mid-file import(PEP8)
+##  post-merge GPU 검증(미룸): mask.sum()==ΣK/step, first-val F1_LAH~0.82(≈0.42면 edge orientation flip).
+
+## GPU smoke (2026-07-06, job 3677): PIPELINE ✅
+- 30-step token 학습이 lah/laeo/sa(3/4/6 토큰) 혼합 배치로 shape/hook 에러 없이 완주 → mask.sum()==ΣK 런타임 확인. gtok_id=151669 단일 토큰. LoRA 43.6M(0.50%)+projector 정상, acc≈0.73, exit 0.
+- ⚠️ 발견(실질 이슈): in-training val eval이 vlm_bs=32(기본 48)로 OOM(94.8/95GiB). 학습상태 상주+큰 vlm_bs 때문. → 실제 학습 시 val eval vlm_bs를 낮춰야(예 8) model-selection val이 동작. eval 경로 자체는 별도 job(3678, 저메모리)로 검증 중.
+## GPU smoke #2 (job 3678): EVAL PATH ✅ (부분)
+- 독립 vlm.eval token(vlm_bs=8, 저메모리)이 61배치 crash-free 처리 → Task4 재작성 가변길이 eval 경로(_TokenRecDS/_coll/gather_feats/projector/hook) 런타임 정상. 전체 metric은 미완(29.6s/배치, ETA~3.5h, 30스텝 LoRA라 F1 무의미) → 사용자 승인하 scancel.
+- orientation F1(~0.82 sanity)은 실제 학습 런에서 확인 예정(post-merge deferred 유지).
+## OOM fix 검증 (job 3682, commit 2fcd710): ✅
+- no_grad+empty_cache 적용 후 재실행: 지난번 val 첫배치 즉시 OOM('val failed')과 달리, 동일 vlm_bs=32로 val이 22분+ crash 없이 진행 → OOM 해소 관측 확정. F1 완주 대기는 무의미(30스텝)라 사용자 승인하 scancel.
+
+## NEXT STEPS (사용자: 지금은 학습 안 함, 나중에 재개)
+1. Orientation 검증 런(권장, ~1h): 8B, 1에폭 ~2k steps, bs4, vlm_bs16, W&B on → epoch-0 val F1_LAH가 ~0.82 근방이면 orientation OK / ~0.42면 gather_feats edge_pp[j,i] 방향 뒤집힘 → 수정 후 재실행.
+2. 본격 학습: MODE=token EXPERIMENT=C_token sbatch scripts/train_vlm.sh (2ep×20k≈20h, val model-selection). 필요시 launcher token) 케이스에 --vlm_bs 16, bs 조정.
+3. test 평가: MODE=eval SPLIT=test EXPERIMENT=C_token (vlm.eval token + blend α-sweep).
+- 브랜치 vlm-stage2 미병합 보존. 별개 미커밋: vlm/graph_export.py (test-split bs=1 fix).
+## Orientation 검증 런 진행중 (job 3684, 2026-07-06): 8B 1ep 2k steps bs4 vlm_bs16 W&B(C_token_orient), val=4k subset. 목표: epoch-0 val F1_LAH ~0.82면 orientation OK.

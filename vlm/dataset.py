@@ -28,22 +28,26 @@ def make_collate(processor):
     tok.padding_side = "right"
 
     def collate(batch):
-        pils, prompts, answers = zip(*batch)
-        full_texts, prompt_texts = [], []
+        pils = [b[0] for b in batch]
+        full_texts, ans_lens = [], []
         for pil, prompt, answer in batch:
             msgs = [{"role": "user", "content": [{"type": "image", "image": pil},
                                                   {"type": "text", "text": prompt}]}]
             pt = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            prompt_texts.append(pt)
             full_texts.append(pt + answer)
-        full = processor(text=list(full_texts), images=list(pils), return_tensors="pt", padding=True)
-        prm = processor(text=list(prompt_texts), images=list(pils), return_tensors="pt", padding=True)
-        plen = prm["attention_mask"].sum(1)           # prompt token counts
-        flen = full["attention_mask"].sum(1)          # full token counts
-        labels = full["input_ids"].clone()
+            ans_lens.append(len(tok(answer, add_special_tokens=False).input_ids))
+        # SINGLE processor pass. The original ran the processor a 2nd time on the SAME
+        # images (prompt-only) purely to get the prompt length for label masking — that
+        # re-did the expensive vision preprocessing every batch. Since full = prompt +
+        # answer (right-padded) the answer occupies exactly the trailing `ans_len` tokens
+        # (verified: "yes"/"no" are single tokens and tokenize identically at the prompt
+        # boundary), so we supervise only that trailing span and mask everything else.
+        full = processor(text=list(full_texts), images=pils, return_tensors="pt", padding=True)
+        flen = full["attention_mask"].sum(1)          # full (non-pad) token counts
+        labels = torch.full_like(full["input_ids"], -100)
         for i in range(labels.shape[0]):
-            labels[i, :plen[i]] = -100                # mask prompt
-            labels[i, flen[i]:] = -100                # mask right padding
+            a = ans_lens[i]
+            labels[i, flen[i] - a:flen[i]] = full["input_ids"][i, flen[i] - a:flen[i]]
         full["labels"] = labels
         return full
 

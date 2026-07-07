@@ -28,6 +28,7 @@ build/
 # 데이터셋 (대용량 이미지/어노테이션)
 data/
 docs/
+results/
 
 # 실험 결과 및 체크포인트
 experiments/

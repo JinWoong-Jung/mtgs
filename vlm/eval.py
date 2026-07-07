@@ -21,10 +21,12 @@ import itertools
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 
 import torch
 import torch.multiprocessing as _mp
+from omegaconf import OmegaConf
 from PIL import Image
 from peft import PeftModel
 from torch.utils.data import DataLoader, Dataset
@@ -39,6 +41,7 @@ from vlm.injection import (
     gather_feats,
     install_hook,
 )
+from vlm.patches import patch_qwen3vl_patch_embed
 from vlm.overlay import display_labels
 from vlm.prompt import TASKS, token_prompt
 
@@ -265,9 +268,17 @@ def inject_vlm_scores(samples, preds_by_key, tasks=("lah", "laeo", "coatt")):
 # ── LOCKED evaluate() harness (verbatim from peer sgg/eval.py lines 215-257) ──
 
 def evaluate(samples, thr=0.5):
-    """Run compute() verbatim and return {F1_LAH, F1_LAEO, AP_SA} (+ extras).
-    Parses ALL keys train.py needs: Dist, AP_IO, F1_LAH_PP, F1_LAEO_PP,
-    F1_LAH, F1_LAEO, AP_SA."""
+    """Run compute() and return a metrics dict.
+
+    Uses compute()'s RETURN dict for the authoritative per-task AP/AUC + PP/gaze
+    values (lah_ap/lah_auc/laeo_ap/laeo_auc/coatt_ap/coatt_auc/dist/ap_io/...),
+    and parses the per-target F1 (LAH/LAEO, thr=0.5) from the log (compute() does
+    not return those). Keys:
+      MAIN:   F1_LAH, F1_LAEO, AP_SA
+      PERTASK AP/AUC: {LAH,LAEO,SA}_{AP,AUC}
+      EXTRA:  F1_LAH_PP, F1_LAEO_PP, Dist, AP_IO
+      detail: full compute() text breakdown
+    """
     buf = _io.StringIO()
     handler = logging.StreamHandler(buf)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -275,39 +286,58 @@ def evaluate(samples, thr=0.5):
     old = (lg.handlers, lg.level, lg.propagate)
     lg.handlers, lg.level, lg.propagate = [handler], logging.INFO, False
     try:
-        compute(samples, shuffle=False, thr=thr)
+        ret = compute(samples, shuffle=False, thr=thr) or {}
     finally:
         lg.handlers, lg.level, lg.propagate = old
 
-    out = {"F1_LAH": None, "F1_LAEO": None, "AP_SA": None,
-           "F1_LAH_PP": None, "F1_LAEO_PP": None, "Dist": None, "AP_IO": None}
-    section = None
-
+    # per-target F1 (LAH/LAEO) is only logged, not returned -> parse it (require the
+    # "thr=" tag so we don't pick up the "F1 PP (geometric)" line in the same section)
     def num(s):
-        m = re.search(r"-?\d+\.\d+(?:[eE][-+]?\d+)?", s)
-        return float(m.group()) if m else None
-
+        mm = re.search(r"-?\d+\.\d+(?:[eE][-+]?\d+)?", s)
+        return float(mm.group()) if mm else None
+    f1 = {"LAH": None, "LAEO": None}
+    section = None
     for line in buf.getvalue().splitlines():
         s = line.strip()
-        if s.startswith("Dist "):
-            out["Dist"] = num(s)
-        elif s.startswith("AP_IO"):
-            out["AP_IO"] = num(s)
-        elif s.startswith("F1_LAH (PP)"):
-            out["F1_LAH_PP"] = num(s)
-        elif s.startswith("F1_LAEO(PP)"):
-            out["F1_LAEO_PP"] = num(s)
-        elif s.startswith("AP_SA"):
-            out["AP_SA"] = num(s)
-        elif s.startswith("----- LAEO"):
+        if s.startswith("----- LAEO"):
             section = "LAEO"
         elif s.startswith("----- LAH"):
             section = "LAH"
         elif s.startswith("----- CoAtt"):
             section = "SA"
-        elif s.startswith("F1 ") and section in ("LAH", "LAEO"):
-            out[f"F1_{section}"] = num(s)
+        elif s.startswith("F1 ") and "thr=" in s and section in ("LAH", "LAEO"):
+            f1[section] = num(s)
+
+    out = {
+        "F1_LAH": f1["LAH"], "F1_LAEO": f1["LAEO"], "AP_SA": ret.get("coatt_ap"),
+        "LAH_AP": ret.get("lah_ap"),   "LAH_AUC": ret.get("lah_auc"),
+        "LAEO_AP": ret.get("laeo_ap"), "LAEO_AUC": ret.get("laeo_auc"),
+        "SA_AP": ret.get("coatt_ap"),  "SA_AUC": ret.get("coatt_auc"),
+        "F1_LAH_PP": ret.get("f1_lah_pp"), "F1_LAEO_PP": ret.get("f1_laeo_pp"),
+        "Dist": ret.get("dist"), "AP_IO": ret.get("ap_io"),
+        "detail": buf.getvalue().rstrip(),
+    }
     return out
+
+
+def format_metrics(m, title=""):
+    """Human-readable Main + Detail block for a metrics dict from evaluate()."""
+    def f(x):
+        return f"{x:.4f}" if isinstance(x, float) else str(x)
+    lines = []
+    if title:
+        lines.append(f"===== {title} =====")
+    lines.append(f"[MAIN]   F1_LAH={f(m.get('F1_LAH'))}  F1_LAEO={f(m.get('F1_LAEO'))}  "
+                 f"AP_SA={f(m.get('AP_SA'))}")
+    lines.append(f"[DETAIL] LAH  AP={f(m.get('LAH_AP'))} AUC={f(m.get('LAH_AUC'))} | "
+                 f"LAEO AP={f(m.get('LAEO_AP'))} AUC={f(m.get('LAEO_AUC'))} | "
+                 f"SA AP={f(m.get('SA_AP'))} AUC={f(m.get('SA_AUC'))}")
+    lines.append(f"[DETAIL] Dist={f(m.get('Dist'))}  AP_IO={f(m.get('AP_IO'))}  "
+                 f"F1_LAH(PP)={f(m.get('F1_LAH_PP'))}  F1_LAEO(PP)={f(m.get('F1_LAEO_PP'))}")
+    if m.get("detail"):
+        lines.append("----- compute() full breakdown -----")
+        lines.append(m["detail"])
+    return "\n".join(lines)
 
 
 # ── build_mtgs_dicts ───────────────────────────────────────────────────────────
@@ -389,19 +419,45 @@ def _coll(b):
 
 def _main_eval_lora_token():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--ckpt", default="",
+                    help="checkpoint dir; empty -> derive from config experiment + --which")
+    ap.add_argument("--which", default="best", choices=["best", "last"],
+                    help="which trained checkpoint to eval when --ckpt is not given")
     ap.add_argument("--manifest", required=True, help="manifest_nograph_<split>.jsonl")
     ap.add_argument("--overlay_dir", required=True, help="vlm_overlays/<split>")
     ap.add_argument("--graph_feats", required=True, help="v14graph_<split>.pt")
     ap.add_argument("--gtmeta", required=True, help="gtmeta_<split>.pt")
-    ap.add_argument("--vlm_bs", type=int, default=64)
-    ap.add_argument("--num_workers", type=int, default=10)
+    ap.add_argument("--config", default="mtgs/config/config_vlm.yaml",
+                    help="config YAML; supplies eval.vlm_bs / eval.num_workers + experiment path")
+    ap.add_argument("--vlm_bs", type=int, default=None)
+    ap.add_argument("--num_workers", type=int, default=None)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--preds_out", default="")
     ap.add_argument("--compute_from", default="")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    # Config supplies test batch/workers (CLI overrides win) and, when --ckpt is empty,
+    # the trained checkpoint location: <out_root>/<name>/train/checkpoints/<which>.
+    full_cfg = OmegaConf.load(args.config) if Path(args.config).exists() else None
+    ecfg = full_cfg.get("eval") if full_cfg is not None else None
+    if args.vlm_bs is None:
+        args.vlm_bs = int(ecfg.vlm_bs) if ecfg is not None else 64
+    if args.num_workers is None:
+        args.num_workers = int(ecfg.num_workers) if ecfg is not None else 10
+    if not args.ckpt:
+        assert full_cfg is not None and "experiment" in full_cfg, \
+            "no --ckpt and no experiment section in config"
+        xc = full_cfg.experiment
+        args.ckpt = str(Path(str(xc.out_root)) / str(xc.name) / "train" / "checkpoints" / args.which)
+        print(f"[eval] ckpt (from config, which={args.which}): {args.ckpt}", flush=True)
+
+    # Fixed-shape (448x448) inputs -> let cuDNN pick fast kernels; TF32 on residual fp32
+    # matmuls. Free speedups, no effect on the bf16 model's outputs.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     if args.compute_from:
         preds = {}
@@ -422,6 +478,7 @@ def _main_eval_lora_token():
     base = Qwen3VLForConditionalGeneration.from_pretrained(QWEN, dtype=torch.bfloat16,
                                                            device_map="cuda")
     base.resize_token_embeddings(len(proc.tokenizer))
+    patch_qwen3vl_patch_embed(base)   # Blackwell slow_conv_dilated3d bypass (~48x fwd speedup)
     D = base.config.text_config.hidden_size
     model = PeftModel.from_pretrained(base, args.ckpt).merge_and_unload().eval()
     proj = GraphTokenProjector(out_dim=D).to("cuda", torch.bfloat16)
@@ -439,7 +496,7 @@ def _main_eval_lora_token():
     preds = {}
     with torch.no_grad():
         for keys, pils, prompts, feats, roles in tqdm(dl, desc=f"tok-eval s{args.shard}/{args.nshards}",
-                                                      unit="batch"):
+                                                      unit="batch", file=sys.stdout):
             msgs = [[{"role": "user", "content": [{"type": "image", "image": p},
                      {"type": "text", "text": t}]}]
                     for p, t in zip(pils, prompts)]
@@ -458,9 +515,7 @@ def _main_eval_lora_token():
     print(f"saved {len(preds)} preds -> {out_path}", flush=True)
     if args.nshards == 1:
         m = evaluate(build_mtgs_dicts(args.gtmeta, preds))
-        print(f"\n===== {args.ckpt} ({len(preds)} preds) =====", flush=True)
-        print(f"[RESULT] F1_LAH={m['F1_LAH']:.4f}  F1_LAEO={m['F1_LAEO']:.4f}  "
-              f"AP_SA={m['AP_SA']:.4f}", flush=True)
+        print("\n" + format_metrics(m, title=f"{args.ckpt} ({len(preds)} preds)"), flush=True)
 
 
 # ── blend CLI main ─────────────────────────────────────────────────────────────
@@ -482,16 +537,27 @@ def _main_eval_blend():
     print(f"\n{'config':>22} {'F1_LAH':>8} {'F1_LAEO':>8} {'AP_SA':>8}")
     g = score(build_results(feat, {}, 0.0))
     print(f"{'(a) graph-only':>22} {g['F1_LAH']:>8.4f} {g['F1_LAEO']:>8.4f} {g['AP_SA']:>8.4f}")
+    best = None   # (mean_of_3, alpha)
     for a in [float(x) for x in args.alphas.split(",")]:
         if a == 0 or not pvlm:
             continue
         m = score(build_results(feat, pvlm, a))
         print(f"{'blend a='+format(a,'.2f'):>22} {m['F1_LAH']:>8.4f} {m['F1_LAEO']:>8.4f} {m['AP_SA']:>8.4f}")
+        mean3 = (m['F1_LAH'] + m['F1_LAEO'] + m['AP_SA']) / 3
+        if best is None or mean3 > best[0]:
+            best = (mean3, a)
     if pvlm:
         orac = oracle_pvlm(feat, pvlm)
         mo = score(build_results(feat, orac, 1.0))
         print(f"{'ORACLE ceiling':>22} {mo['F1_LAH']:>8.4f} {mo['F1_LAEO']:>8.4f} {mo['AP_SA']:>8.4f}  "
               f"(perfect router, {len(orac)} overrides)")
+
+    # Full Main + Detail breakdown for the headline configs (graph-only + best blend).
+    print("\n" + format_metrics(evaluate(build_results(feat, {}, 0.0)),
+                                 title="graph-only"), flush=True)
+    if best is not None:
+        print("\n" + format_metrics(evaluate(build_results(feat, pvlm, best[1])),
+                                    title=f"best blend a={best[1]:.2f} (by mean of 3)"), flush=True)
 
 
 # ── entry point ────────────────────────────────────────────────────────────────

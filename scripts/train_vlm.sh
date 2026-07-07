@@ -10,8 +10,8 @@
 #SBATCH -c 8
 #SBATCH -p gpu
 #SBATCH --mem=96G
-#SBATCH --output=logs/vlm_%j.out
-#SBATCH --error=logs/vlm_%j.err
+#SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.out
+#SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.err
 
 # conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
 source /opt/miniconda3/etc/profile.d/conda.sh
@@ -35,11 +35,31 @@ set -e
 MODE=${MODE:-token}               # export | overlays | token | eval
 SPLIT=${SPLIT:-train}             # train | val | test
 CHECKPOINT=${CHECKPOINT:-experiments/V14.5/train/checkpoints/best.ckpt}
-EXPERIMENT=${EXPERIMENT:-C_token}   # W&B run name + output sub-dir
+CONFIG=${CONFIG:-mtgs/config/config_vlm.yaml}   # experiment name + all hyperparameters
+WHICH=${WHICH:-best}              # eval 대상 체크포인트: best | last
 CACHE=results/vlm_cache
-OUT=experiments/vlm/$EXPERIMENT
 
-mkdir -p "$CACHE" logs
+mkdir -p "$CACHE" /home/jinwoongjung/MTGS/scripts/logs
+
+# Experiment name/root come from $CONFIG (single source of truth). Used only to locate
+# the run dir for the eval-preds cache path; train/eval derive it from the config too.
+NAME=$(python -c "from omegaconf import OmegaConf;c=OmegaConf.load('$CONFIG').experiment;print(c.name)")
+
+# run_eval <split>: token eval (WHICH=best|last) + graph-VLM soft-blend sweep on <split>.
+run_eval () {
+  local sp="$1"
+  python -m vlm.eval token \
+    --config "$CONFIG" --which "$WHICH" \
+    --manifest "$CACHE/manifest_${sp}.jsonl" \
+    --overlay_dir "$CACHE/overlays/$sp" \
+    --graph_feats "$CACHE/vlmgraph_${sp}.pt" \
+    --gtmeta "$CACHE/gtmeta_${sp}.pt" \
+    --preds_out "$CACHE/preds_${NAME}_${sp}.pt"
+  python -m vlm.eval blend \
+    --feat "$CACHE/vlmgraph_${sp}.pt" \
+    --pvlm "$CACHE/preds_${NAME}_${sp}.pt" \
+    --alphas 0,0.25,0.3,0.5,1.0
+}
 
 # ── Pipeline stages ───────────────────────────────────────────────────────────
 case $MODE in
@@ -60,33 +80,25 @@ case $MODE in
       --manifest "$CACHE/manifest_${SPLIT}.jsonl" \
       --gtmeta "$CACHE/gtmeta_${SPLIT}.pt" ;;
 
-  # Stage 2b-C: graph-token LoRA fine-tuning (token injection mode)
+  # Stage 2b-C: graph-token LoRA fine-tuning (train + in-training val), then test
+  # eval in the SAME job (one-shot). Experiment name + hyperparameters come from $CONFIG;
+  # best/last saved to <out_root>/<name>/train/checkpoints/.
   token)
     python -m vlm.train token \
       --manifest "$CACHE/manifest_train.jsonl" \
       --overlay_dir "$CACHE/overlays/train" \
       --graph_feats "$CACHE/vlmgraph_train.pt" \
-      --out "$OUT" \
       --val_manifest "$CACHE/manifest_val.jsonl" \
       --val_overlay_dir "$CACHE/overlays/val" \
       --val_gtmeta "$CACHE/gtmeta_val.pt" \
       --val_graph_feats "$CACHE/vlmgraph_val.pt" \
-      --epochs 2 --bs 8 --lr 1e-4 \
-      --wandb_name "$EXPERIMENT" ;;
+      --config "$CONFIG"
+    echo "===== training done -> TEST eval (WHICH=$WHICH), one-shot ====="
+    run_eval test || echo "[warn] test eval failed; train ckpts saved, rerun: MODE=eval SPLIT=test" ;;
 
-  # Stage 3: evaluation + graph-VLM soft blend sweep
+  # Stage 3: standalone evaluation (WHICH=best|last) + graph-VLM soft blend sweep
   eval)
-    python -m vlm.eval token \
-      --ckpt "$OUT/final" \
-      --manifest "$CACHE/manifest_${SPLIT}.jsonl" \
-      --overlay_dir "$CACHE/overlays/$SPLIT" \
-      --graph_feats "$CACHE/vlmgraph_${SPLIT}.pt" \
-      --gtmeta "$CACHE/gtmeta_${SPLIT}.pt" \
-      --preds_out "$CACHE/preds_${EXPERIMENT}_${SPLIT}.pt"
-    python -m vlm.eval blend \
-      --feat "$CACHE/vlmgraph_${SPLIT}.pt" \
-      --pvlm "$CACHE/preds_${EXPERIMENT}_${SPLIT}.pt" \
-      --alphas 0,0.25,0.3,0.5,1.0 ;;
+    run_eval "$SPLIT" ;;
 
   *)
     echo "unknown MODE=$MODE (choices: export | overlays | token | eval)"
