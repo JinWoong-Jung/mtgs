@@ -509,6 +509,11 @@ class GazeGraphBlock(nn.Module):
         self.head_null_in  = _SocialReadoutHead(De)
         self.head_null_out = _SocialReadoutHead(De)
 
+        # ── Offline VLM feature export (기본 off; on일 때만 forward 끝에서 stash) ──
+        #    vlm/graph_export.py 가 이 dict 를 읽어 캐시를 만든다. off면 무영향.
+        self.export_features = False
+        self._feat = None
+
     @staticmethod
     def _safe_kpm(kpm: torch.Tensor) -> torch.Tensor:
         return kpm & ~kpm.all(dim=1, keepdim=True)
@@ -704,6 +709,23 @@ class GazeGraphBlock(nn.Module):
             ev_bool[:, :, :N],   # [N:2N]  SA proxy (same p2p mask)
             ev_bool[:, :, N:],   # [2N:2N+2] null_in + null_out
         ], dim=2)
+
+        # ── VLM offline export (플래그 on일 때만) ─────────────────────────────
+        if self.export_features:
+            # gaze_point = 히트맵 argmax (정규화 xy). 큰 히트맵 대신 좌표만 stash.
+            hm = gaze_heatmaps.detach().float()
+            idx = hm.flatten(-2).argmax(-1)                       # (B,T,N)
+            gp_y = (idx // Ww).to(hm.dtype) / max(Hh - 1, 1)
+            gp_x = (idx %  Ww).to(hm.dtype) / max(Ww - 1, 1)
+            self._feat = {
+                "lah_mat": lah_mat, "sa_mat": sa_mat,             # (B,T,N,N)
+                "laeo_mat": laeo_mat,                             # (B,T,N,N) or None
+                "null_in": null_in_out, "null_out": null_out_out, # (B,T,N)
+                "E": E, "v_src": v_src, "v_tgt": v_tgt,            # 임베딩
+                "align": align, "overlap": overlap,               # (B,T,N,N)
+                "gaze_vecs": gaze_vecs,                           # (B,T,N,2) detached
+                "gaze_point": torch.stack([gp_x, gp_y], dim=-1),  # (B,T,N,2)
+            }
 
         return (
             lah_mat.float(),

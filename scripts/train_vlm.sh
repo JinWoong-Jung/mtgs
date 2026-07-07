@@ -1,0 +1,106 @@
+#!/bin/bash
+
+# SPDX-FileCopyrightText: Copyright 2025 Idiap Research Institute <contact@idiap.ch>
+# SPDX-FileContributor: JinWoong Jung <jinwoong1010@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-only
+
+#SBATCH --job-name=vlm_stage2
+#SBATCH --gres=gpu:rtx6000:1
+#SBATCH --time=48:00:00
+#SBATCH -c 8
+#SBATCH -p gpu
+#SBATCH --mem=96G
+#SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.out
+#SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.err
+
+# conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
+source /opt/miniconda3/etc/profile.d/conda.sh
+conda activate mtgs
+export PYTHONNOUSERSITE=1
+export XFORMERS_DISABLED=1
+
+# Navigate to MTGS repo ROOT so that both `vlm` and `mtgs` packages are importable.
+# (train_vsgaze.sh cd's into scripts/; train_vlm.sh must run from the parent.)
+if [ "$(basename "$SLURM_SUBMIT_DIR")" = "scripts" ]; then
+    cd "$(dirname "$SLURM_SUBMIT_DIR")"
+else
+    cd "$SLURM_SUBMIT_DIR"
+fi
+
+# Fail fast: in multi-command modes (e.g. `eval` runs token then blend) a failed
+# first step must abort, not silently feed the next step stale/missing artifacts.
+set -e
+
+# ── Configuration (override at submission time with: MODE=export sbatch ...) ──
+MODE=${MODE:-token}               # export | overlays | token | eval
+SPLIT=${SPLIT:-train}             # train | val | test
+CHECKPOINT=${CHECKPOINT:-experiments/V14.5/train/checkpoints/best.ckpt}
+CONFIG=${CONFIG:-mtgs/config/config_vlm.yaml}   # experiment name + all hyperparameters
+WHICH=${WHICH:-best}              # eval 대상 체크포인트: best | last
+CACHE=results/vlm_cache
+
+mkdir -p "$CACHE" /home/jinwoongjung/MTGS/scripts/logs
+
+# Experiment name/root come from $CONFIG (single source of truth). Used only to locate
+# the run dir for the eval-preds cache path; train/eval derive it from the config too.
+NAME=$(python -c "from omegaconf import OmegaConf;c=OmegaConf.load('$CONFIG').experiment;print(c.name)")
+
+# run_eval <split>: token eval (WHICH=best|last) + graph-VLM soft-blend sweep on <split>.
+run_eval () {
+  local sp="$1"
+  python -m vlm.eval token \
+    --config "$CONFIG" --which "$WHICH" \
+    --manifest "$CACHE/manifest_${sp}.jsonl" \
+    --overlay_dir "$CACHE/overlays/$sp" \
+    --graph_feats "$CACHE/vlmgraph_${sp}.pt" \
+    --gtmeta "$CACHE/gtmeta_${sp}.pt" \
+    --preds_out "$CACHE/preds_${NAME}_${sp}.pt"
+  python -m vlm.eval blend \
+    --feat "$CACHE/vlmgraph_${sp}.pt" \
+    --pvlm "$CACHE/preds_${NAME}_${sp}.pt" \
+    --alphas 0,0.25,0.3,0.5,1.0
+}
+
+# ── Pipeline stages ───────────────────────────────────────────────────────────
+case $MODE in
+
+  # Stage 1: export frozen-Stage-1 graph features to disk
+  export)
+    python -m vlm.graph_export \
+      --split "$SPLIT" \
+      --ckpt "$CHECKPOINT" \
+      --out "$CACHE/vlmgraph_${SPLIT}.pt" \
+      --batch_size 4 ;;
+
+  # Stage 2a: render per-frame overlays + write manifest + gtmeta cache
+  overlays)
+    python -m vlm.data_prep overlays \
+      --split "$SPLIT" \
+      --out "$CACHE/overlays" \
+      --manifest "$CACHE/manifest_${SPLIT}.jsonl" \
+      --gtmeta "$CACHE/gtmeta_${SPLIT}.pt" ;;
+
+  # Stage 2b-C: graph-token LoRA fine-tuning (train + in-training val), then test
+  # eval in the SAME job (one-shot). Experiment name + hyperparameters come from $CONFIG;
+  # best/last saved to <out_root>/<name>/train/checkpoints/.
+  token)
+    python -m vlm.train token \
+      --manifest "$CACHE/manifest_train.jsonl" \
+      --overlay_dir "$CACHE/overlays/train" \
+      --graph_feats "$CACHE/vlmgraph_train.pt" \
+      --val_manifest "$CACHE/manifest_val.jsonl" \
+      --val_overlay_dir "$CACHE/overlays/val" \
+      --val_gtmeta "$CACHE/gtmeta_val.pt" \
+      --val_graph_feats "$CACHE/vlmgraph_val.pt" \
+      --config "$CONFIG"
+    echo "===== training done -> TEST eval (WHICH=$WHICH), one-shot ====="
+    run_eval test || echo "[warn] test eval failed; train ckpts saved, rerun: MODE=eval SPLIT=test" ;;
+
+  # Stage 3: standalone evaluation (WHICH=best|last) + graph-VLM soft blend sweep
+  eval)
+    run_eval "$SPLIT" ;;
+
+  *)
+    echo "unknown MODE=$MODE (choices: export | overlays | token | eval)"
+    exit 1 ;;
+esac
