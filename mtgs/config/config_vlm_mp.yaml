@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Experiment F: multi-person dense-head VLM (프레임당 forward 1회 → N×N social matrix).
+#   vlm/mp/train.py (학습)·vlm/mp/eval.py (평가)가 이 파일을 읽는다.
+#   데이터 경로만 런처(scripts/train_vlm_mp.sh)에서 주고, 나머지는 전부 여기서.
+# ─────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  name: VLM_MP                     # 저장경로 <out_root>/<name>/
+  out_root: experiments/vlm_mp
+  monitor: mean_social             # best 선택 지표(=F1_LAH·F1_LAEO·AP_SA 평균)
+
+data:
+  num_people: 4                    # train 고정-N 슬롯 (val/test는 전체 사용)
+
+train:
+  epochs: 3
+  bs: 8                            # 프레임 배치 (train 고정 N=4)
+  accum: 1
+  num_workers: 6
+  rank: 32                         # LoRA rank (alpha=2*rank)
+  seed: 101                        # MTGS와 통일
+  lora_targets:                    # LoRA 대상 projection (LM 한정)
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+optim:
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  scheduler: cosine                # cosine | none
+  warmup_ratio: 0.03
