@@ -24,11 +24,14 @@
 
 # ── 설정 (여기만 바꾸면 됨) ──────────────────────────────────────────────────
 MODE=train                              # train | eval
+EXP_NAME="VLM_v1"                    # 저장위치: experiments/<날짜>/<EXP_NAME>/ (train_vsgaze.sh와 동일)
 CONFIG=mtgs/config/config_vlm_mp.yaml
 WHICH=best                              # 평가 대상 체크포인트: best | last
 SPLIT=test                              # MODE=eval 일 때 평가할 split
 CACHE=/home/jinwoongjung/MTGS/data/vlm_feature
 # ─────────────────────────────────────────────────────────────────────────────
+
+RUN_DIR="experiments/$(date +%Y-%m-%d)/${EXP_NAME}"
 
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate mtgs
@@ -44,10 +47,13 @@ fi
 set -e
 mkdir -p "$CACHE" /home/jinwoongjung/MTGS/scripts/logs
 
+echo "===== 실험 F: $EXP_NAME -> $RUN_DIR ====="
 case $MODE in
   train)
     python -u -m vlm.mp.train \
       --config "$CONFIG" \
+      --run_dir "$RUN_DIR" \
+      --wandb_name "$EXP_NAME" \
       --vlmgraph_train "$CACHE/vlmgraph_train.pt" \
       --gtmeta_train   "$CACHE/gtmeta_train.pt" \
       --overlay_train  "$CACHE/overlays/train" \
@@ -55,12 +61,13 @@ case $MODE in
       --gtmeta_val     "$CACHE/gtmeta_val.pt" \
       --overlay_val    "$CACHE/overlays/val"
     echo "===== 학습 완료 -> test 평가 (WHICH=$WHICH) ====="
-    python -u -m vlm.mp.eval --config "$CONFIG" --which "$WHICH" \
+    python -u -m vlm.mp.eval --config "$CONFIG" --which "$WHICH" --run_dir "$RUN_DIR" \
       --vlmgraph "$CACHE/vlmgraph_test.pt" --gtmeta "$CACHE/gtmeta_test.pt" \
       --overlay_dir "$CACHE/overlays/test" \
       --preds_out "$CACHE/preds_mp_test.pt" || echo "[warn] test 평가 실패; 재실행: MODE=eval" ;;
   eval)
-    python -u -m vlm.mp.eval --config "$CONFIG" --which "$WHICH" \
+    python -u -m vlm.mp.eval --config "$CONFIG" --which "$WHICH" --run_dir "$RUN_DIR" \
+      --split_tag "$SPLIT" \
       --vlmgraph "$CACHE/vlmgraph_${SPLIT}.pt" --gtmeta "$CACHE/gtmeta_${SPLIT}.pt" \
       --overlay_dir "$CACHE/overlays/$SPLIT" \
       --preds_out "$CACHE/preds_mp_${SPLIT}.pt" ;;

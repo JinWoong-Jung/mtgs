@@ -50,6 +50,7 @@ def _main_eval_mp():
     ap.add_argument("--config", default="mtgs/config/config_vlm_mp.yaml")
     ap.add_argument("--which", default="best", choices=["best", "last"])
     ap.add_argument("--ckpt", default="")
+    ap.add_argument("--run_dir", default="", help="run dir (default: <out_root>/<name>)")
     ap.add_argument("--vlmgraph", required=True)
     ap.add_argument("--gtmeta", required=True)
     ap.add_argument("--overlay_dir", required=True)
@@ -64,8 +65,9 @@ def _main_eval_mp():
 
     cfg = OmegaConf.load(args.config)
     if not args.ckpt:
-        xc = cfg.experiment
-        args.ckpt = str(Path(str(xc.out_root)) / str(xc.name) / "train" / "checkpoints" / args.which)
+        base = Path(args.run_dir) if args.run_dir else \
+            Path(str(cfg.experiment.out_root)) / str(cfg.experiment.name)
+        args.ckpt = str(base / "train" / "checkpoints" / args.which)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

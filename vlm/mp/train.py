@@ -13,9 +13,10 @@ import torch.nn.functional as F
 from vlm.mp.model import symmetrize
 
 
-def social_bce(logits, lah, laeo, sa):
+def social_bce(logits, lah, laeo, sa, pos_weight=(3.0, 2.0, 2.0)):
     """logits (B,N,N,3); lah/laeo/sa (B,N,N) in {-1,0,1}. Masked BCE-with-logits:
-    LAH over all i!=j with gt!=-1; LAEO/SA over i<j with gt!=-1 (symmetric logits)."""
+    LAH over all i!=j with gt!=-1; LAEO/SA over i<j with gt!=-1 (symmetric logits).
+    pos_weight=(LAH,LAEO,SA) positive-class weights (graph baseline uses 3/2/2)."""
     N = lah.shape[1]
     device = logits.device
     eye = torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)
@@ -24,17 +25,18 @@ def social_bce(logits, lah, laeo, sa):
     lah_l = logits[..., 0].float()
     laeo_l = symmetrize(logits[..., 1]).float()
     sa_l = symmetrize(logits[..., 2]).float()
+    pw = [torch.tensor(float(w), device=device) for w in pos_weight]
 
     terms = []
     lah_m = (lah != -1) & (~eye)
     if lah_m.any():
         terms.append(F.binary_cross_entropy_with_logits(
-            lah_l[lah_m], lah[lah_m].clamp(min=0).float()))
-    for gt, lg in ((laeo, laeo_l), (sa, sa_l)):
+            lah_l[lah_m], lah[lah_m].clamp(min=0).float(), pos_weight=pw[0]))
+    for (gt, lg), w in zip(((laeo, laeo_l), (sa, sa_l)), (pw[1], pw[2])):
         m = (gt != -1) & upper
         if m.any():
             terms.append(F.binary_cross_entropy_with_logits(
-                lg[m], gt[m].clamp(min=0).float()))
+                lg[m], gt[m].clamp(min=0).float(), pos_weight=w))
     if not terms:
         return logits.sum() * 0.0
     return torch.stack(terms).mean()
@@ -64,6 +66,7 @@ def _cmd_train_mp():
     ap.add_argument("--vlmgraph_val", default="")
     ap.add_argument("--gtmeta_val", default="")
     ap.add_argument("--overlay_val", default="")
+    ap.add_argument("--run_dir", default="", help="output dir (default: <out_root>/<name>)")
     ap.add_argument("--wandb_name", default="", help="W&B run name (default: experiment.name)")
     ap.add_argument("--wandb_off", action="store_true", help="disable W&B logging")
     args = ap.parse_args()
@@ -80,6 +83,7 @@ def _cmd_train_mp():
     if num_people != "all":
         num_people = int(num_people)
     max_tokens = int(cfg.train.get("max_tokens", 3000))   # per-batch token budget (OOM guard)
+    pos_weight = tuple(float(w) for w in cfg.train.get("pos_weight", [3.0, 2.0, 2.0]))  # LAH/LAEO/SA
     lr = float(cfg.optim.lr)
     weight_decay = float(cfg.optim.weight_decay)
     grad_clip = float(cfg.optim.grad_clip)
@@ -87,23 +91,32 @@ def _cmd_train_mp():
     warmup_ratio = float(cfg.optim.warmup_ratio)
     lora_targets = set(cfg.train.get("lora_targets",
                        ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]))
+    lora_vision = bool(cfg.train.get("lora_vision", False))
+    lora_vision_targets = set(cfg.train.get("lora_vision_targets",
+                              ["qkv", "proj", "linear_fc1", "linear_fc2"]))
     torch.manual_seed(seed)
 
     exp = cfg.experiment
-    ckpt_dir = Path(str(exp.out_root)) / str(exp.name) / "train" / "checkpoints"
+    # run_dir (from launcher) mirrors train_vsgaze.sh: experiments/<date>/<EXP_NAME>/...
+    # falls back to the config's out_root/name when not given.
+    run_dir = Path(args.run_dir) if args.run_dir else Path(str(exp.out_root)) / str(exp.name)
+    ckpt_dir = run_dir / "train" / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[mp] exp={exp.name} epochs={epochs} bs={bs} accum={accum} lr={lr} "
-          f"sched={sched_name} N={num_people} -> {ckpt_dir}", flush=True)
+    run_name = args.wandb_name or run_dir.name
+    print(f"[mp] exp={run_name} epochs={epochs} bs={bs} accum={accum} lr={lr} "
+          f"sched={sched_name} N={num_people} pos_w={pos_weight} vision_lora={lora_vision} "
+          f"-> {ckpt_dir}", flush=True)
 
     use_wandb = not args.wandb_off
     if use_wandb:
         run = wandb.init(
             project="MTGS", entity="gaze-social", group="vlm-stage2",
-            name=args.wandb_name or str(exp.name),
+            name=run_name,
             config={
                 "mode": "mp", "lr": lr, "rank": rank, "epochs": epochs, "bs": bs,
                 "accum": accum, "scheduler": sched_name, "warmup_ratio": warmup_ratio,
                 "weight_decay": weight_decay, "num_people": num_people, "graph_feats": True,
+                "pos_weight": list(pos_weight), "lora_vision": lora_vision,
             },
         )
         # persist run id so the post-training test eval (separate process) can resume
@@ -121,8 +134,19 @@ def _cmd_train_mp():
     model.resize_token_embeddings(len(proc.tokenizer))
     patch_qwen3vl_patch_embed(model)
     D = model.config.text_config.hidden_size
-    targets = [n for n, _ in model.named_modules()
-               if "language_model" in n and n.split(".")[-1] in lora_targets]
+    # LoRA on LM projections; optionally on the vision tower (model.visual) too.
+    # isinstance(nn.Linear) guard excludes the Conv3d patch-embed `proj` (name collides).
+    targets = []
+    for n, mod in model.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        leaf = n.split(".")[-1]
+        if "language_model" in n and leaf in lora_targets:
+            targets.append(n)
+        elif lora_vision and "visual" in n and leaf in lora_vision_targets:
+            targets.append(n)
+    nv = sum("visual" in n for n in targets)
+    print(f"[mp] LoRA targets: {len(targets)} ({nv} vision, {len(targets)-nv} lm)", flush=True)
     model = get_peft_model(model, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.05,
                            target_modules=targets, task_type="CAUSAL_LM"))
     model.config.use_cache = False
@@ -186,7 +210,8 @@ def _cmd_train_mp():
         losses = [social_bce(logits[b].unsqueeze(0),
                              batch["lah"][b].unsqueeze(0).to(device),
                              batch["laeo"][b].unsqueeze(0).to(device),
-                             batch["sa"][b].unsqueeze(0).to(device))
+                             batch["sa"][b].unsqueeze(0).to(device),
+                             pos_weight=pos_weight)
                   for b in range(len(logits))]
         return torch.stack(losses).mean()
 

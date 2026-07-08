@@ -23,3 +23,15 @@ def test_social_bce_all_masked_returns_zero():
     g = torch.full((B, N, N), -1)
     loss = social_bce(logits, g, g.clone(), g.clone())
     assert loss.item() == 0.0
+
+
+def test_social_bce_pos_weight_scales_positive_loss():
+    B, N = 1, 2
+    logits = torch.zeros(B, N, N, 3)     # logit 0 -> p=0.5
+    lah = torch.full((B, N, N), -1)
+    lah[0, 0, 1] = 1                     # one positive LAH pair
+    laeo = torch.full((B, N, N), -1)
+    sa = torch.full((B, N, N), -1)
+    lo = social_bce(logits, lah, laeo, sa, pos_weight=(1.0, 1.0, 1.0))
+    hi = social_bce(logits, lah, laeo, sa, pos_weight=(4.0, 1.0, 1.0))
+    assert hi.item() > lo.item()         # heavier positive weight -> larger loss
