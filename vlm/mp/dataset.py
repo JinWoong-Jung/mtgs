@@ -121,23 +121,48 @@ def bucket_collate(batch):
 
 class LengthBucketSampler(Sampler):
     """Yield batches of frame indices with similar people-count N, so each batch's prompts
-    are close in length and the processor pads minimally. Shuffles within and across
-    batches each epoch for stochasticity while keeping lengths bucketed."""
-    def __init__(self, lengths, batch_size, shuffle=True, seed=101):
+    are close in length and the processor pads minimally.
+
+    `batch_size` caps frames/batch. `max_tokens` (optional) additionally caps the batch's
+    estimated token cost `(#frames × est_tokens(maxN))` — so crowded frames (long prompts)
+    form SMALLER batches, bounding activation memory (prevents OOM on 30+ person frames).
+    est_tokens(n) = base_tokens + n × tokens_per_person."""
+    def __init__(self, lengths, batch_size, max_tokens=None, base_tokens=350,
+                 tokens_per_person=20, shuffle=True, seed=101):
         self.lengths = list(lengths)
         self.bs = batch_size
+        self.max_tokens = max_tokens
+        self.base_tokens = base_tokens
+        self.tpp = tokens_per_person
         self.shuffle = shuffle
         self.rng = random.Random(seed)
 
-    def __iter__(self):
+    def _est(self, n):
+        return self.base_tokens + n * self.tpp
+
+    def _batches(self):
         idx = list(range(len(self.lengths)))
         if self.shuffle:
             self.rng.shuffle(idx)                       # break ties randomly
         idx.sort(key=lambda i: self.lengths[i])         # bucket by N
-        batches = [idx[i:i + self.bs] for i in range(0, len(idx), self.bs)]
+        if self.max_tokens is None:
+            return [idx[i:i + self.bs] for i in range(0, len(idx), self.bs)]
+        batches, cur = [], []
+        for i in idx:
+            est_i = self._est(self.lengths[i])          # sorted asc -> i is the batch max
+            if cur and (len(cur) >= self.bs or (len(cur) + 1) * est_i > self.max_tokens):
+                batches.append(cur)
+                cur = []
+            cur.append(i)
+        if cur:
+            batches.append(cur)
+        return batches
+
+    def __iter__(self):
+        batches = self._batches()
         if self.shuffle:
             self.rng.shuffle(batches)                   # random batch order (mixes N sizes)
         yield from batches
 
     def __len__(self):
-        return (len(self.lengths) + self.bs - 1) // self.bs
+        return len(self._batches())

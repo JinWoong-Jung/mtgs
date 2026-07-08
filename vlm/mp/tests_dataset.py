@@ -65,3 +65,19 @@ def test_length_bucket_sampler_covers_all_indices_uneven():
     batches = list(iter(s))
     assert len(batches) == 3
     assert sorted(i for b in batches for i in b) == [0, 1, 2, 3, 4]
+
+
+def test_length_bucket_sampler_token_budget_shrinks_crowded_batches():
+    # small frames pack up to batch_size; crowded frames capped by max_tokens
+    lengths = [2, 2, 2, 2, 30, 30]       # 4 tiny + 2 crowded
+    s = LengthBucketSampler(lengths, batch_size=8, max_tokens=1000,
+                            base_tokens=350, tokens_per_person=20, shuffle=False)
+    batches = list(iter(s))
+    assert sorted(i for b in batches for i in b) == [0, 1, 2, 3, 4, 5]
+    for b in batches:
+        maxn = max(lengths[i] for i in b)
+        est = 350 + maxn * 20
+        assert len(b) * est <= 1000 or len(b) == 1     # budget respected (or single frame)
+    # the two 30-person frames (est=950) must each be alone (2*950>1000)
+    crowded = [b for b in batches if 30 in [lengths[i] for i in b]]
+    assert all(len(b) == 1 for b in crowded)

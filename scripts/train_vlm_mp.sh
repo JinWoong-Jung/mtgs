@@ -34,6 +34,7 @@ source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate mtgs
 export PYTHONNOUSERSITE=1
 export XFORMERS_DISABLED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # 조각화 완화(OOM 방지)
 
 if [ "$(basename "$SLURM_SUBMIT_DIR")" = "scripts" ]; then
     cd "$(dirname "$SLURM_SUBMIT_DIR")"

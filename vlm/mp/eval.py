@@ -54,7 +54,8 @@ def _main_eval_mp():
     ap.add_argument("--gtmeta", required=True)
     ap.add_argument("--overlay_dir", required=True)
     ap.add_argument("--preds_out", default="")
-    ap.add_argument("--bs", type=int, default=8, help="frame batch (length-bucketed)")
+    ap.add_argument("--bs", type=int, default=8, help="frame batch cap (length-bucketed)")
+    ap.add_argument("--max_tokens", type=int, default=3000, help="per-batch token budget (OOM guard)")
     ap.add_argument("--num_workers", type=int, default=6)
     args = ap.parse_args()
     device = "cuda"
@@ -85,7 +86,7 @@ def _main_eval_mp():
     install_ptok_hook(lm)
 
     ds = FrameDS(args.vlmgraph, args.gtmeta, args.overlay_dir, split="test", num_people="all")
-    sampler = LengthBucketSampler(ds.nps, batch_size=args.bs, shuffle=False)
+    sampler = LengthBucketSampler(ds.nps, batch_size=args.bs, max_tokens=args.max_tokens, shuffle=False)
     dl = DataLoader(ds, batch_sampler=sampler, num_workers=args.num_workers, collate_fn=bucket_collate)
     preds = {}
     with torch.no_grad():
@@ -100,7 +101,7 @@ def _main_eval_mp():
             feats_all = torch.cat(batch["feats"], dim=0).to(device, torch.bfloat16)
             mask = (inp["input_ids"] == ptok_id)
             lm._ptok = {"tokens": proj(feats_all), "mask": mask}
-            out = model(**inp, output_hidden_states=True)
+            out = model(**inp, output_hidden_states=True, logits_to_keep=1)
             hs = read_person_hidden(out.hidden_states[-1], mask)
             for b in range(B):
                 logits = head(hs[b], batch["edge_pp"][b].to(device, torch.bfloat16)).float().cpu()

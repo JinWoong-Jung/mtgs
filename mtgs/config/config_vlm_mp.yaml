@@ -14,7 +14,8 @@ data:
 
 train:
   epochs: 3
-  bs: 8                            # 프레임 배치 (train 고정 N=4)
+  bs: 8                            # 프레임 배치 상한 (길이-버킷)
+  max_tokens: 3000                 # 배치당 토큰 예산: 붐비는 프레임은 배치 축소 → OOM 방지
   accum: 1
   num_workers: 6
   rank: 32                         # LoRA rank (alpha=2*rank)

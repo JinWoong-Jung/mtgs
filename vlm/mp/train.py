@@ -79,6 +79,7 @@ def _cmd_train_mp():
     num_people = cfg.data.get("num_people", "all")     # "all" (variable N) or int (legacy)
     if num_people != "all":
         num_people = int(num_people)
+    max_tokens = int(cfg.train.get("max_tokens", 3000))   # per-batch token budget (OOM guard)
     lr = float(cfg.optim.lr)
     weight_decay = float(cfg.optim.weight_decay)
     grad_clip = float(cfg.optim.grad_clip)
@@ -123,6 +124,9 @@ def _cmd_train_mp():
                            target_modules=targets, task_type="CAUSAL_LM"))
     model.config.use_cache = False
     model.enable_input_require_grads()
+    # Gradient checkpointing: recompute layer activations in backward instead of storing
+    # them — essential to fit crowded frames (up to ~830 tokens) at batch>1 in bf16.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     proj = PersonTokenProjector(out_dim=D).to(device, torch.bfloat16)
     head = SocialHead(d_model=D).to(device, torch.bfloat16)
     lm = model.base_model.model.model.language_model
@@ -130,7 +134,8 @@ def _cmd_train_mp():
 
     ds = FrameDS(args.vlmgraph_train, args.gtmeta_train, args.overlay_train,
                  split="train", num_people=num_people, seed=seed)
-    train_sampler = LengthBucketSampler(ds.nps, batch_size=bs, shuffle=True, seed=seed)
+    train_sampler = LengthBucketSampler(ds.nps, batch_size=bs, max_tokens=max_tokens,
+                                        shuffle=True, seed=seed)
     dl = DataLoader(ds, batch_sampler=train_sampler, num_workers=num_workers,
                     collate_fn=bucket_collate, pin_memory=True)
     print(f"[mp] train frames={len(ds)} batches/epoch={len(dl)}", flush=True)
@@ -167,7 +172,9 @@ def _cmd_train_mp():
         feats_all = torch.cat(batch["feats"], dim=0).to(device, torch.bfloat16)   # (sum n_b, 1024)
         mask = (inp["input_ids"] == ptok_id)
         lm._ptok = {"tokens": proj(feats_all), "mask": mask}
-        out = model(**inp, output_hidden_states=True)
+        # logits_to_keep=1: we never use vocab logits (dense head reads hidden states), so
+        # skip the (B,L,vocab~151k) lm_head tensor — big memory saving.
+        out = model(**inp, output_hidden_states=True, logits_to_keep=1)
         hs = read_person_hidden(out.hidden_states[-1], mask)     # list of (n_b, D)
         return [head(hs[b], batch["edge_pp"][b].to(device, torch.bfloat16)) for b in range(B)]
 
@@ -185,7 +192,8 @@ def _cmd_train_mp():
         if val_ds is None:
             return None
         model.eval()
-        vsampler = LengthBucketSampler(val_ds.nps, batch_size=bs, shuffle=False)
+        vsampler = LengthBucketSampler(val_ds.nps, batch_size=bs, max_tokens=max_tokens,
+                                       shuffle=False)
         vdl = DataLoader(val_ds, batch_sampler=vsampler, num_workers=num_workers,
                          collate_fn=bucket_collate)
         preds = {}
