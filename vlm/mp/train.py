@@ -54,6 +54,7 @@ def _cmd_train_mp():
     from vlm.mp.dataset import FrameDS, bucket_collate, LengthBucketSampler, _valid_people
     from vlm.mp.eval import logits_to_preds
     from vlm.eval import build_mtgs_dicts, evaluate
+    import wandb
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="mtgs/config/config_vlm_mp.yaml")
@@ -63,6 +64,8 @@ def _cmd_train_mp():
     ap.add_argument("--vlmgraph_val", default="")
     ap.add_argument("--gtmeta_val", default="")
     ap.add_argument("--overlay_val", default="")
+    ap.add_argument("--wandb_name", default="", help="W&B run name (default: experiment.name)")
+    ap.add_argument("--wandb_off", action="store_true", help="disable W&B logging")
     args = ap.parse_args()
     device = "cuda"
 
@@ -90,6 +93,18 @@ def _cmd_train_mp():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     print(f"[mp] exp={exp.name} epochs={epochs} bs={bs} accum={accum} lr={lr} "
           f"sched={sched_name} N={num_people} -> {ckpt_dir}", flush=True)
+
+    use_wandb = not args.wandb_off
+    if use_wandb:
+        wandb.init(
+            project="MTGS", entity="gaze-social", group="vlm-stage2",
+            name=args.wandb_name or str(exp.name),
+            config={
+                "mode": "mp", "lr": lr, "rank": rank, "epochs": epochs, "bs": bs,
+                "accum": accum, "scheduler": sched_name, "warmup_ratio": warmup_ratio,
+                "weight_decay": weight_decay, "num_people": num_people, "graph_feats": True,
+            },
+        )
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -207,13 +222,19 @@ def _cmd_train_mp():
                 sched.step()
                 opt.zero_grad()
                 step += 1
-                pbar.set_postfix(loss=f"{run/(it+1):.3f}", lr=f"{sched.get_last_lr()[0]:.2e}")
+                cur_lr = sched.get_last_lr()[0]
+                pbar.set_postfix(loss=f"{run/(it+1):.3f}", lr=f"{cur_lr:.2e}")
+                if use_wandb:
+                    wandb.log({"train/loss": run / (it + 1), "train/lr": cur_lr, "step": step})
         save_ckpt(ckpt_dir / "last")
         m = run_val()
         if m is not None:
             sc = (m["F1_LAH"] + m["F1_LAEO"] + m["AP_SA"]) / 3
             print(f"[mp] ep{ep} F1_LAH={m['F1_LAH']:.4f} F1_LAEO={m['F1_LAEO']:.4f} "
                   f"AP_SA={m['AP_SA']:.4f} mean={sc:.4f}", flush=True)
+            if use_wandb:
+                wandb.log({"val/F1_LAH": m["F1_LAH"], "val/F1_LAEO": m["F1_LAEO"],
+                           "val/AP_SA": m["AP_SA"], "val/mean_social": sc, "epoch": ep})
             if best is None or sc > best:
                 best = sc
                 save_ckpt(ckpt_dir / "best")
@@ -223,6 +244,9 @@ def _cmd_train_mp():
     if not (ckpt_dir / "best").exists():
         save_ckpt(ckpt_dir / "best")
     print(f"[mp] done. best mean={best}", flush=True)
+    if use_wandb:
+        wandb.summary["best_mean_social"] = best
+        wandb.finish()
 
 
 if __name__ == "__main__":
