@@ -51,7 +51,7 @@ def _cmd_train_mp():
     from vlm.mp.prompt import PTOK, frame_prompt
     from vlm.mp.model import (PersonTokenProjector, SocialHead,
                               install_ptok_hook, read_person_hidden)
-    from vlm.mp.dataset import FrameDS, frame_collate, _valid_people
+    from vlm.mp.dataset import FrameDS, bucket_collate, LengthBucketSampler, _valid_people
     from vlm.mp.eval import logits_to_preds
     from vlm.eval import build_mtgs_dicts, evaluate
 
@@ -73,7 +73,9 @@ def _cmd_train_mp():
     num_workers = int(cfg.train.num_workers)
     rank = int(cfg.train.rank)
     seed = int(cfg.train.get("seed", 101))
-    num_people = int(cfg.data.get("num_people", 4))
+    num_people = cfg.data.get("num_people", "all")     # "all" (variable N) or int (legacy)
+    if num_people != "all":
+        num_people = int(num_people)
     lr = float(cfg.optim.lr)
     weight_decay = float(cfg.optim.weight_decay)
     grad_clip = float(cfg.optim.grad_clip)
@@ -113,9 +115,10 @@ def _cmd_train_mp():
 
     ds = FrameDS(args.vlmgraph_train, args.gtmeta_train, args.overlay_train,
                  split="train", num_people=num_people, seed=seed)
-    dl = DataLoader(ds, batch_size=bs, shuffle=True, num_workers=num_workers,
-                    collate_fn=frame_collate, pin_memory=True)
-    print(f"[mp] train frames={len(ds)}", flush=True)
+    train_sampler = LengthBucketSampler(ds.nps, batch_size=bs, shuffle=True, seed=seed)
+    dl = DataLoader(ds, batch_sampler=train_sampler, num_workers=num_workers,
+                    collate_fn=bucket_collate, pin_memory=True)
+    print(f"[mp] train frames={len(ds)} batches/epoch={len(dl)}", flush=True)
 
     # Val dataset loaded ONCE (avoids reloading the ~0.5GB vlmgraph each epoch).
     val_ds = None
@@ -137,37 +140,46 @@ def _cmd_train_mp():
                                           {"type": "text", "text": prompt}]}],
             tokenize=False, add_generation_prompt=True)
 
-    def forward_frame_batch(batch):
-        """One batch of fixed-N frames -> logits (B,N,N,3)."""
-        texts = [_chat(pil, frame_prompt(labels, bb))
-                 for pil, labels, bb in zip(batch["pil"], batch["labels"], batch["bboxes"])]
+    def forward_batch(batch):
+        """One bucketed batch of variable-N frames. Batched LM forward (processor pads
+        token sequences); head runs per frame on real N. Returns list of (n_b,n_b,3)."""
+        B = len(batch["pil"])
+        texts = [_chat(batch["pil"][b], frame_prompt(batch["labels"][b], batch["bboxes"][b]))
+                 for b in range(B)]
         inp = proc(text=texts, images=list(batch["pil"]), return_tensors="pt", padding=True).to(device)
-        B, Np = batch["feats"].shape[0], batch["feats"].shape[1]
-        feats = proj(batch["feats"].to(device, torch.bfloat16).reshape(B * Np, -1))
+        # project only REAL people (concat across the batch, person-major) -> matches the
+        # row-major <ptok> mask over (B, L): frame 0's ptok first, then frame 1's, ...
+        feats_all = torch.cat(batch["feats"], dim=0).to(device, torch.bfloat16)   # (sum n_b, 1024)
         mask = (inp["input_ids"] == ptok_id)
-        lm._ptok = {"tokens": feats, "mask": mask}
+        lm._ptok = {"tokens": proj(feats_all), "mask": mask}
         out = model(**inp, output_hidden_states=True)
-        hs = read_person_hidden(out.hidden_states[-1], mask)     # list of (Np, D)
-        edge = batch["edge_pp"].to(device, torch.bfloat16)
-        return torch.stack([head(hs[b], edge[b]) for b in range(B)])   # (B,N,N,3)
+        hs = read_person_hidden(out.hidden_states[-1], mask)     # list of (n_b, D)
+        return [head(hs[b], batch["edge_pp"][b].to(device, torch.bfloat16)) for b in range(B)]
+
+    def batch_loss(logits, batch):
+        """Per-frame masked social BCE, averaged over the batch."""
+        losses = [social_bce(logits[b].unsqueeze(0),
+                             batch["lah"][b].unsqueeze(0).to(device),
+                             batch["laeo"][b].unsqueeze(0).to(device),
+                             batch["sa"][b].unsqueeze(0).to(device))
+                  for b in range(len(logits))]
+        return torch.stack(losses).mean()
 
     @torch.no_grad()
     def run_val():
         if val_ds is None:
             return None
         model.eval()
+        vsampler = LengthBucketSampler(val_ds.nps, batch_size=bs, shuffle=False)
+        vdl = DataLoader(val_ds, batch_sampler=vsampler, num_workers=num_workers,
+                         collate_fn=bucket_collate)
         preds = {}
-        for k in tqdm(range(len(val_ds)), desc="val", unit="frame", file=sys.stdout, leave=False):
-            it = val_ds[k]
-            inp = proc(text=[_chat(it["pil"], frame_prompt(it["labels"], it["bboxes"]))],
-                       images=[it["pil"]], return_tensors="pt", padding=True).to(device)
-            mask = (inp["input_ids"] == ptok_id)
-            lm._ptok = {"tokens": proj(it["feats"].to(device, torch.bfloat16)), "mask": mask}
-            out = model(**inp, output_hidden_states=True)
-            h = read_person_hidden(out.hidden_states[-1], mask)[0]
-            logits = head(h, it["edge_pp"].to(device, torch.bfloat16)).float().cpu()
-            valid = _valid_people(val_ds.gt[it["sid"]]["head_bboxes"].float())
-            preds.update(logits_to_preds(it["sid"], logits, valid))
+        for batch in tqdm(vdl, desc="val", unit="batch", file=sys.stdout, leave=False):
+            logits = forward_batch(batch)
+            for b in range(len(logits)):
+                sid = batch["sid"][b]
+                valid = _valid_people(val_ds.gt[sid]["head_bboxes"].float())
+                preds.update(logits_to_preds(sid, logits[b].float().cpu(), valid))
         model.train()
         return evaluate(build_mtgs_dicts(args.gtmeta_val, preds))
 
@@ -184,9 +196,8 @@ def _cmd_train_mp():
         run = 0.0
         pbar = tqdm(dl, desc=f"mp ep{ep}", unit="batch", file=sys.stdout)
         for it, batch in enumerate(pbar):
-            logits = forward_frame_batch(batch)
-            loss = social_bce(logits, batch["lah"].to(device),
-                              batch["laeo"].to(device), batch["sa"].to(device)) / accum
+            logits = forward_batch(batch)
+            loss = batch_loss(logits, batch) / accum
             loss.backward()
             run += float(loss) * accum
             if (it + 1) % accum == 0:

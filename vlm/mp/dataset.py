@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 def gt_matrices(gtmeta_entry, n):
@@ -43,8 +43,11 @@ def _valid_people(bb):
 
 
 class FrameDS(Dataset):
+    """Per-frame items with variable N (all valid people). `num_people="all"` (default)
+    uses every valid person; an int keeps only the fixed-N subsample path (legacy). With
+    N=all, batch via LengthBucketSampler + bucket_collate (variable-length lists)."""
     def __init__(self, vlmgraph_path, gtmeta_path, overlay_dir, split,
-                 num_people=4, seed=101):
+                 num_people="all", seed=101):
         self.gf = torch.load(vlmgraph_path, weights_only=False)
         self.gt = torch.load(gtmeta_path, weights_only=False)
         self.dir = Path(overlay_dir)
@@ -53,19 +56,22 @@ class FrameDS(Dataset):
         self.rng = random.Random(seed)
         # frames present in BOTH files with >=2 valid people
         self.sids = []
+        self.nps = []          # valid-people count per frame (for LengthBucketSampler)
         for sid in self.gf:
             if sid not in self.gt:
                 continue
-            if len(_valid_people(self.gt[sid]["head_bboxes"].float())) >= 2:
+            nv = len(_valid_people(self.gt[sid]["head_bboxes"].float()))
+            if nv >= 2:
                 self.sids.append(sid)
+                self.nps.append(nv)
 
     def __len__(self):
         return len(self.sids)
 
     def _select(self, valid, n):
-        """train: exactly num_people slots (subsample valid, pad from invalid);
-        val/test: all valid people."""
-        if self.split != "train":
+        """N=all: every valid person. Int num_people: fixed-N slots (subsample valid,
+        pad from invalid — legacy path, masked by GT=-1)."""
+        if self.num_people == "all":
             return valid
         pool = list(valid)
         self.rng.shuffle(pool)
@@ -103,16 +109,35 @@ class FrameDS(Dataset):
         }
 
 
-def frame_collate(batch):
-    """train collate: fixed num_people per item -> stack. Keeps pil/labels as lists."""
-    return {
-        "sid":    [b["sid"] for b in batch],
-        "pil":    [b["pil"] for b in batch],
-        "labels": [b["labels"] for b in batch],
-        "bboxes": torch.stack([b["bboxes"] for b in batch]),
-        "feats":  torch.stack([b["feats"] for b in batch]),
-        "edge_pp": torch.stack([b["edge_pp"] for b in batch]),
-        "lah":    torch.stack([b["lah"] for b in batch]),
-        "laeo":   torch.stack([b["laeo"] for b in batch]),
-        "sa":     torch.stack([b["sa"] for b in batch]),
-    }
+_KEYS = ("sid", "pil", "labels", "bboxes", "feats", "edge_pp", "lah", "laeo", "sa")
+
+
+def bucket_collate(batch):
+    """Variable-N collate: keep every field as a per-frame list (no stacking). The LM
+    forward is still batched (processor pads token sequences); the head + loss run per
+    frame on that frame's real N, so no padded-person slots are ever created."""
+    return {k: [b[k] for b in batch] for k in _KEYS}
+
+
+class LengthBucketSampler(Sampler):
+    """Yield batches of frame indices with similar people-count N, so each batch's prompts
+    are close in length and the processor pads minimally. Shuffles within and across
+    batches each epoch for stochasticity while keeping lengths bucketed."""
+    def __init__(self, lengths, batch_size, shuffle=True, seed=101):
+        self.lengths = list(lengths)
+        self.bs = batch_size
+        self.shuffle = shuffle
+        self.rng = random.Random(seed)
+
+    def __iter__(self):
+        idx = list(range(len(self.lengths)))
+        if self.shuffle:
+            self.rng.shuffle(idx)                       # break ties randomly
+        idx.sort(key=lambda i: self.lengths[i])         # bucket by N
+        batches = [idx[i:i + self.bs] for i in range(0, len(idx), self.bs)]
+        if self.shuffle:
+            self.rng.shuffle(batches)                   # random batch order (mixes N sizes)
+        yield from batches
+
+    def __len__(self):
+        return (len(self.lengths) + self.bs - 1) // self.bs

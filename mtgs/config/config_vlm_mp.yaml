@@ -10,7 +10,7 @@ experiment:
   monitor: mean_social             # best 선택 지표(=F1_LAH·F1_LAEO·AP_SA 평균)
 
 data:
-  num_people: 4                    # train 고정-N 슬롯 (val/test는 전체 사용)
+  num_people: all                  # all: 전 인원 가변 N (길이-버킷 배치). 정수면 고정-N(legacy)
 
 train:
   epochs: 3

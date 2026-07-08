@@ -35,7 +35,6 @@ def logits_to_preds(sid, logits, idxs):
 
 def _main_eval_mp():
     from omegaconf import OmegaConf
-    from PIL import Image
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
     from peft import PeftModel
     from vlm.cfg import QWEN
@@ -43,8 +42,9 @@ def _main_eval_mp():
     from vlm.mp.prompt import PTOK, frame_prompt
     from vlm.mp.model import (PersonTokenProjector, SocialHead,
                               install_ptok_hook, read_person_hidden)
-    from vlm.mp.dataset import person_feats, _valid_people
+    from vlm.mp.dataset import FrameDS, bucket_collate, LengthBucketSampler, _valid_people
     from vlm.eval import build_mtgs_dicts, evaluate
+    from torch.utils.data import DataLoader
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="mtgs/config/config_vlm_mp.yaml")
@@ -54,6 +54,8 @@ def _main_eval_mp():
     ap.add_argument("--gtmeta", required=True)
     ap.add_argument("--overlay_dir", required=True)
     ap.add_argument("--preds_out", default="")
+    ap.add_argument("--bs", type=int, default=8, help="frame batch (length-bucketed)")
+    ap.add_argument("--num_workers", type=int, default=6)
     args = ap.parse_args()
     device = "cuda"
 
@@ -82,35 +84,29 @@ def _main_eval_mp():
     lm = model.model.language_model
     install_ptok_hook(lm)
 
-    gf = torch.load(args.vlmgraph, weights_only=False)
-    gt = torch.load(args.gtmeta, weights_only=False)
-    overlay = Path(args.overlay_dir)
+    ds = FrameDS(args.vlmgraph, args.gtmeta, args.overlay_dir, split="test", num_people="all")
+    sampler = LengthBucketSampler(ds.nps, batch_size=args.bs, shuffle=False)
+    dl = DataLoader(ds, batch_sampler=sampler, num_workers=args.num_workers, collate_fn=bucket_collate)
     preds = {}
     with torch.no_grad():
-        for sid in tqdm([s for s in gf if s in gt], desc="mp-eval", unit="frame", file=sys.stdout):
-            m = gt[sid]
-            g = gf[sid]
-            bb = m["head_bboxes"].float()
-            valid = _valid_people(bb)
-            if len(valid) < 2:
-                continue
-            vidx = torch.as_tensor(valid)
-            labels = [f"P{p+1}" for p in range(len(valid))]
-            prompt = frame_prompt(labels, bb[vidx])
-            pil = Image.open(overlay / sid / "frame.png").convert("RGB")
-            txt = proc.apply_chat_template(
-                [{"role": "user", "content": [{"type": "image", "image": pil},
-                                              {"type": "text", "text": prompt}]}],
-                tokenize=False, add_generation_prompt=True)
-            inp = proc(text=[txt], images=[pil], return_tensors="pt", padding=True).to(device)
-            feats = person_feats(g, valid).to(device, torch.bfloat16)
+        for batch in tqdm(dl, desc="mp-eval", unit="batch", file=sys.stdout):
+            B = len(batch["pil"])
+            texts = [proc.apply_chat_template(
+                        [{"role": "user", "content": [
+                            {"type": "image", "image": batch["pil"][b]},
+                            {"type": "text", "text": frame_prompt(batch["labels"][b], batch["bboxes"][b])}]}],
+                        tokenize=False, add_generation_prompt=True) for b in range(B)]
+            inp = proc(text=texts, images=list(batch["pil"]), return_tensors="pt", padding=True).to(device)
+            feats_all = torch.cat(batch["feats"], dim=0).to(device, torch.bfloat16)
             mask = (inp["input_ids"] == ptok_id)
-            lm._ptok = {"tokens": proj(feats), "mask": mask}
+            lm._ptok = {"tokens": proj(feats_all), "mask": mask}
             out = model(**inp, output_hidden_states=True)
-            h = read_person_hidden(out.hidden_states[-1], mask)[0]      # (len(valid), D)
-            edge = g["edge_pp"].float()[vidx][:, vidx].to(device, torch.bfloat16)
-            logits = head(h, edge).float().cpu()
-            preds.update(logits_to_preds(sid, logits, valid))
+            hs = read_person_hidden(out.hidden_states[-1], mask)
+            for b in range(B):
+                logits = head(hs[b], batch["edge_pp"][b].to(device, torch.bfloat16)).float().cpu()
+                sid = batch["sid"][b]
+                valid = _valid_people(ds.gt[sid]["head_bboxes"].float())
+                preds.update(logits_to_preds(sid, logits, valid))
 
     out_path = args.preds_out or f"preds_mp_{Path(args.ckpt).name}.pt"
     torch.save(preds, out_path)
