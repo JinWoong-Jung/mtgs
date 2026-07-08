@@ -97,7 +97,7 @@ def _cmd_train_mp():
 
     use_wandb = not args.wandb_off
     if use_wandb:
-        wandb.init(
+        run = wandb.init(
             project="MTGS", entity="gaze-social", group="vlm-stage2",
             name=args.wandb_name or str(exp.name),
             config={
@@ -106,6 +106,9 @@ def _cmd_train_mp():
                 "weight_decay": weight_decay, "num_people": num_people, "graph_feats": True,
             },
         )
+        # persist run id so the post-training test eval (separate process) can resume
+        # this SAME run and log test/* metrics alongside train/val.
+        (ckpt_dir / "wandb_run_id.txt").write_text(run.id)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

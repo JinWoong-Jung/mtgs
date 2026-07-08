@@ -57,6 +57,8 @@ def _main_eval_mp():
     ap.add_argument("--bs", type=int, default=8, help="frame batch cap (length-bucketed)")
     ap.add_argument("--max_tokens", type=int, default=3000, help="per-batch token budget (OOM guard)")
     ap.add_argument("--num_workers", type=int, default=6)
+    ap.add_argument("--split_tag", default="test", help="W&B metric prefix (test/val)")
+    ap.add_argument("--wandb_off", action="store_true", help="disable W&B logging")
     args = ap.parse_args()
     device = "cuda"
 
@@ -112,7 +114,24 @@ def _main_eval_mp():
     out_path = args.preds_out or f"preds_mp_{Path(args.ckpt).name}.pt"
     torch.save(preds, out_path)
     m = evaluate(build_mtgs_dicts(args.gtmeta, preds))
-    print(f"[mp-eval] F1_LAH={m['F1_LAH']:.4f} F1_LAEO={m['F1_LAEO']:.4f} AP_SA={m['AP_SA']:.4f}", flush=True)
+    sc = (m["F1_LAH"] + m["F1_LAEO"] + m["AP_SA"]) / 3
+    print(f"[mp-eval] F1_LAH={m['F1_LAH']:.4f} F1_LAEO={m['F1_LAEO']:.4f} "
+          f"AP_SA={m['AP_SA']:.4f} mean={sc:.4f}", flush=True)
+
+    # Log to W&B: resume the training run (id saved by train.py) so test/* lands next to
+    # train/val on the same run; fall back to a standalone run if no id file is present.
+    if not args.wandb_off:
+        import wandb
+        tag = args.split_tag
+        rid_file = Path(args.ckpt).parent / "wandb_run_id.txt"
+        rid = rid_file.read_text().strip() if rid_file.exists() else None
+        wandb.init(project="MTGS", entity="gaze-social", group="vlm-stage2",
+                   id=rid, resume="allow" if rid else None,
+                   name=None if rid else f"{Path(args.ckpt).parents[2].name}-{tag}")
+        wandb.log({f"{tag}/F1_LAH": m["F1_LAH"], f"{tag}/F1_LAEO": m["F1_LAEO"],
+                   f"{tag}/AP_SA": m["AP_SA"], f"{tag}/mean_social": sc})
+        wandb.summary[f"{tag}_mean_social"] = sc
+        wandb.finish()
 
 
 if __name__ == "__main__":
