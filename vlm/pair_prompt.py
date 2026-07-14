@@ -426,7 +426,7 @@ def _text_evidence_block(evidence) -> str:
         for name, person in (("Person A", evidence.person_a), ("Person B", evidence.person_b)):
             if person.third_bbox is not None:
                 lines.append(
-                    f"- {name} most likely gazes at the person at {list(person.third_bbox)} "
+                    f"- {name} most likely gazes at the person at {_coords(list(person.third_bbox))} "
                     f"(probability {_fmt_prob(person.third_prob)}); probability of gazing at a "
                     f"non-person location instead: {_fmt_prob(person.nonperson_prob)}"
                 )

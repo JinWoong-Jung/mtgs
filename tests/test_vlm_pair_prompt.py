@@ -195,12 +195,14 @@ def test_text_prompt_laeo_shows_both_directions():
 def test_text_prompt_sa_includes_third_person_bbox_and_nonperson():
     ev = TextGraphEvidence(
         task="sa",
-        person_a=PersonGazeText((0.6, 0.1, 0.7, 0.3), 0.35, 0.58),
+        person_a=PersonGazeText((0.123456, 0.1, 0.7, 0.3), 0.35, 0.58),
         person_b=PersonGazeText((0.05, 0.3, 0.16, 0.4), 0.20, 0.71),
     )
     text = compose_text_prompt("sa", BOX_A, BOX_B, ev, rng=random.Random(0))
     assert "0.35" in text and "0.58" in text and "0.20" in text and "0.71" in text
-    assert "0.6" in text                          # third-person bbox coordinate
+    # Verify that third-person bbox coords are rounded to 2 decimals via _coords
+    assert "0.12" in text                         # rounded form should be present
+    assert "0.123456" not in text                 # unrounded form must NOT be present
 
 
 def test_text_prompt_sa_without_third_person_omits_that_clause():
