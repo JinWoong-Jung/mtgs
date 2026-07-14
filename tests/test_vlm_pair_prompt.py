@@ -175,13 +175,24 @@ BOX_A = [0.12, 0.18, 0.26, 0.42]
 BOX_B = [0.58, 0.21, 0.73, 0.46]
 
 
+def test_text_prompt_no_longer_claims_the_graph_is_unconfident():
+    ev = TextGraphEvidence(task="lah", p_ab=0.95)   # a HIGH-confidence estimate on purpose
+    text = compose_text_prompt("lah", [0.1, 0.1, 0.2, 0.2], [0.5, 0.1, 0.6, 0.2], ev,
+                               rng=random.Random(0))
+    assert "not confident" not in text.lower()
+    assert "uncertain" not in text.lower()
+    # still frames the graph's number as evidence the VLM must weigh, not blindly trust
+    assert "0.95" in text
+    assert "final" in text.lower() or "determine" in text.lower() or "your own" in text.lower()
+
+
 def test_text_prompt_lah_has_ab_labels_prob_and_correction_framing():
     ev = TextGraphEvidence(task="lah", p_ab=0.82)
     text = compose_text_prompt("lah", BOX_A, BOX_B, ev, rng=random.Random(0))
     assert "Person A" in text and "Person B" in text
     assert "0.82" in text                       # rendered probability
     assert "0.12" in text and "0.58" in text    # both bboxes present
-    assert "not confident" in text.lower() or "uncertain" in text.lower()
+    assert "weigh" in text.lower() or "evidence" in text.lower()  # frames graph output as evidence to weigh
     assert "yes" in text.lower() and "no" in text.lower()   # output instruction
     validate_text_pair_prompt("lah", BOX_A, BOX_B, ev)
 

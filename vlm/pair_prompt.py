@@ -369,16 +369,17 @@ def validate_tokenized_pair_prompt(tokenizer: Any, text: str) -> None:
 # ── Natural-language graph-evidence prompt (text mode) + yes/no answer ────────────────────
 TEXT_ROLE = (
     "You are a vision assistant specializing in human gaze analysis, working alongside a "
-    "pretrained social-gaze graph model. The graph already produced the estimate(s) below, "
-    "but it was NOT confident — that is exactly why your visual judgment is needed here."
+    "pretrained social-gaze graph model. The graph has independently estimated the "
+    "probability below from its own analysis of the scene. Use it as evidence together "
+    "with the image, and determine the final answer yourself."
 )
 TEXT_MARKED_IDENTITY = (
     "In this image Person A is marked with a RED box and Person B is marked with a BLUE box."
 )
 TEXT_CORRECTION = (
-    "Do not simply repeat the graph's estimate(s). Inspect the image and the head bounding "
-    "boxes yourself, and decide whether the relation actually holds — confirm, correct, or "
-    "override the graph's prediction as your visual evidence dictates."
+    "Do not assume the graph's estimate is correct or incorrect without checking. Inspect "
+    "the image and the head bounding boxes yourself, weigh them against the graph's "
+    "estimate, and decide whether the relation actually holds."
 )
 TEXT_OUTPUT_INSTRUCTION = 'Answer with a single word, "yes" or "no".'
 
@@ -422,15 +423,15 @@ def _fmt_box(box) -> str:
 def _text_evidence_block(evidence) -> str:
     task = evidence.task
     if task == "lah":
-        return f"Graph's uncertain estimate: P(Person A looks at Person B) = {_fmt_prob(evidence.p_ab)}"
+        return f"Graph's estimate: P(Person A looks at Person B) = {_fmt_prob(evidence.p_ab)}"
     if task == "laeo":
         return "\n".join((
-            "Graph's uncertain estimates:",
+            "Graph's estimates:",
             f"- P(Person A looks at Person B) = {_fmt_prob(evidence.p_ab)}",
             f"- P(Person B looks at Person A) = {_fmt_prob(evidence.p_ba)}",
         ))
     if task == "sa":
-        lines = ["Graph's uncertain estimates:"]
+        lines = ["Graph's estimates:"]
         for name, person in (("Person A", evidence.person_a), ("Person B", evidence.person_b)):
             if person.third_bbox is not None:
                 lines.append(
