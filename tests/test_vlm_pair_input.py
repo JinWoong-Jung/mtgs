@@ -5,6 +5,7 @@ import torch
 from PIL import Image
 
 from vlm.overlay import build_canonical_pair_overlay
+from vlm.pair_features import TextGraphEvidence
 from vlm.pair_input import (
     GraphControlDataset,
     GraphFeatureControlDataset,
@@ -57,6 +58,31 @@ def _write_manifest(path):
         {"sid": "s0", "task": "sa", "i": 0, "j": 1, "ans": "no"},
     ]
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+
+def _make_generative_dataset(tmp_path, *, graph_evidence="gtoken", draw_bboxes=True):
+    frame_root = tmp_path / "frames"
+    _write_frame(frame_root, "s0")
+    manifest = tmp_path / "manifest.jsonl"
+    _write_manifest(manifest)
+    graph = {"s0": _fake_graph_cache()}
+    return PairInputDataset(
+        manifest,
+        frame_root,
+        graph,
+        output_mode="generative",
+        graph_evidence=graph_evidence,
+        draw_bboxes=draw_bboxes,
+    )
+
+
+def test_text_mode_builds_text_prompt_and_text_evidence(tmp_path):
+    ds = _make_generative_dataset(tmp_path, graph_evidence="text", draw_bboxes=True)
+    item = ds[0]
+    assert isinstance(item.evidence, TextGraphEvidence)
+    assert "Person A" in item.prompt and "Person B" in item.prompt
+    assert item.prompt.rstrip().endswith('Answer with a single word, "yes" or "no".')
+    assert item.draw_bboxes is True     # overlay enabled in text mode
 
 
 def test_canonical_overlay_does_not_mutate_raw_image():

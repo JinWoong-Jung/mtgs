@@ -25,9 +25,14 @@ from vlm.pair_features import (
     PairGraphEvidence,
     assemble_generative_graph,
     assemble_pair_graph_evidence,
+    assemble_text_graph_evidence,
     stack_pair_graph_evidence,
 )
-from vlm.pair_prompt import compose_generative_prompt, task_conditioned_pair_prompt
+from vlm.pair_prompt import (
+    compose_generative_prompt,
+    compose_text_prompt,
+    task_conditioned_pair_prompt,
+)
 
 
 FrameCacheInfo = namedtuple("FrameCacheInfo", "hits misses max_items curr_items")
@@ -105,10 +110,14 @@ class PairInputDataset(Dataset):
         raw_image_cache_size: int = 32,
         draw_bboxes: bool = True,
         output_mode: str = "yesno",
+        graph_evidence: str = "gtoken",
         generative_prompt_seed: int | None = None,
     ):
         if output_mode not in ("yesno", "generative"):
             raise ValueError(f"output_mode must be yesno/generative, got {output_mode!r}")
+        if graph_evidence not in ("gtoken", "text"):
+            raise ValueError(f"graph_evidence must be gtoken/text, got {graph_evidence!r}")
+        self.graph_evidence = graph_evidence
         self.annotations = (
             manifest if isinstance(manifest, PairAnnotationDataset)
             else PairAnnotationDataset(manifest)
@@ -121,8 +130,11 @@ class PairInputDataset(Dataset):
         )
         # Generative (EyeVLM-style) identifies people by text bbox coordinates, so the
         # image remains unmodified.  Cross-pair vision reuse is a separate collate feature.
-
-        self.draw_bboxes = bool(draw_bboxes) and output_mode != "generative"
+        # gtoken generative uses text bbox coords on an unmodified image; text mode uses the
+        # red/blue A/B overlay so the model can bind "Person A"/"Person B" visually.
+        self.draw_bboxes = bool(draw_bboxes) and not (
+            output_mode == "generative" and graph_evidence == "gtoken"
+        )
 
         required_sids = {sample.sid for sample in self.annotations}
         missing = sorted(required_sids.difference(graph_cache))
@@ -150,8 +162,12 @@ class PairInputDataset(Dataset):
     def __getitem__(self, index: int) -> PairVLMInput:
         sample = self.annotations[index]
         cache = self.graph_cache[sample.sid]
+        text_mode = self.output_mode == "generative" and self.graph_evidence == "text"
         if self.output_mode == "generative":
-            evidence = assemble_generative_graph(sample, cache)
+            evidence = (
+                assemble_text_graph_evidence(sample, cache) if text_mode
+                else assemble_generative_graph(sample, cache)
+            )
         else:
             evidence = assemble_pair_graph_evidence(sample, cache)
 
@@ -183,7 +199,12 @@ class PairInputDataset(Dataset):
             # RawFrameCache images are immutable by contract. Returning the shared
             # object lets the collator deduplicate image preprocessing by frame id.
             image = raw
-        if self.output_mode == "generative":
+        if text_mode:
+            prompt = compose_text_prompt(
+                sample.task, box_a.tolist(), box_b.tolist(), evidence,
+                draw_bboxes=self.draw_bboxes, rng=self._generative_rng(sample),
+            )
+        elif self.output_mode == "generative":
             prompt = compose_generative_prompt(
                 sample.task, box_a.tolist(), box_b.tolist(), rng=self._generative_rng(sample)
             )
