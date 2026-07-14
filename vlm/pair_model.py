@@ -12,6 +12,7 @@ import torch.nn as nn
 from vlm.pair_dataset import SOCIAL_TASK_ID
 from vlm.pair_features import PairGraphBatch, stack_pair_graph_evidence
 from vlm.pair_input import PairVLMInput
+from vlm.vision_cache import VisionDiskCache
 from vlm.pair_projection import PairEvidenceProjector
 from vlm.pair_prompt import (
     GRAPH_TOKENS,
@@ -676,13 +677,22 @@ class _VisionReuseMixin:
     must set ``self.backbone`` before calling ``_init_vision_reuse``.
     """
 
-    def _init_vision_reuse(self, vision_cache_size: int) -> None:
+    def _init_vision_reuse(
+        self,
+        vision_cache_size: int,
+        vision_disk_cache: str | None = None,
+        vision_disk_metadata: Mapping[str, str] | None = None,
+    ) -> None:
         if vision_cache_size < 0:
             raise ValueError(
                 f"vision_cache_size must be non-negative, got {vision_cache_size}"
             )
         self.vision_cache_size = int(vision_cache_size)
         self._vision_cache: OrderedDict[str, _CachedVisionFrame] = OrderedDict()
+        self._vision_disk_cache = (
+            VisionDiskCache(vision_disk_cache, vision_disk_metadata)
+            if vision_disk_cache else None
+        )
         self._vision_cache_hits = 0
         self._vision_cache_misses = 0
         self._multimodal_model: nn.Module | None = None
@@ -753,7 +763,22 @@ class _VisionReuseMixin:
                 resolved[index] = cached
             else:
                 self._vision_cache_misses += 1
-                missing_indices.append(index)
+                disk_frame = (
+                    None if self._vision_disk_cache is None
+                    else self._vision_disk_cache.get(sid)
+                )
+                if disk_frame is not None:
+                    if not torch.equal(disk_frame.grid_thw.cpu(), unique_grid_thw[index].cpu()):
+                        raise ValueError(f"disk vision grid changed for frame {sid!r}")
+                    value = _CachedVisionFrame(
+                        grid_thw=disk_frame.grid_thw,
+                        pooler_output=disk_frame.pooler_output,
+                        deepstack_features=disk_frame.deepstack_features,
+                    )
+                    resolved[index] = value
+                    self._remember_vision_frame(sid, value)
+                else:
+                    missing_indices.append(index)
 
         vision_model = self._vision_model()
         if missing_indices:
@@ -881,10 +906,18 @@ class TextGenerativeVLMOutput:
 class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
     """Text-evidence generative VLM with optional cross-pair vision reuse."""
 
-    def __init__(self, backbone: nn.Module, vision_cache_size: int = 0):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        vision_cache_size: int = 0,
+        vision_disk_cache: str | None = None,
+        vision_disk_metadata: Mapping[str, str] | None = None,
+    ):
         super().__init__()
         self.backbone = backbone
-        self._init_vision_reuse(vision_cache_size)
+        self._init_vision_reuse(
+            vision_cache_size, vision_disk_cache, vision_disk_metadata
+        )
 
     def close(self) -> None:
         self.clear_vision_cache()

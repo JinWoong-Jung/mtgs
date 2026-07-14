@@ -513,7 +513,17 @@ def build_generative_objective(cfg, processor, device: torch.device, resume: Pat
             if builders.reuse_vision
             else 0
         )
-        vlm = TextGenerativeVLM(backbone, vision_cache_size=cache_size)
+        disk_cache = str(cfg.get("input", {}).get("vision_disk_cache", "")) or None
+        disk_metadata = None if disk_cache is None else {
+            "qwen": str(cfg.model.get("qwen", QWEN)),
+            "max_pixels": str(int(cfg.model.get("max_pixels", 200704))),
+        }
+        vlm = TextGenerativeVLM(
+            backbone,
+            vision_cache_size=cache_size,
+            vision_disk_cache=disk_cache,
+            vision_disk_metadata=disk_metadata,
+        )
     else:
         vlm = PairGenerativeVLM(
             backbone,
