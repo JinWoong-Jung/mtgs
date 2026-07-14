@@ -100,6 +100,34 @@ def build_pointer_image(image_pil, task, i, j, cand_slots, bboxes_norm,
     return overlay
 
 
+def build_token_overlay(image_pil, task, a, b, bboxes_norm, labels):
+    """Query overlay for the token path: draw ONLY the queried pair's head boxes —
+    A = red box, B = blue box. No gaze markers (gaze location is supplied as the
+    <hmtok> heatmap soft-token instead). Other people stay un-boxed to avoid clutter
+    on crowd frames. (a, b) = injection.query_slots(rec); labels = {slot: label}."""
+    overlay = image_pil.convert("RGB").copy()
+    W, H = overlay.size
+    draw = ImageDraw.Draw(overlay)
+    _draw(draw, bboxes_norm[a], W, H, SOURCE_COLOR, labels[a], 4)    # red  = A
+    _draw(draw, bboxes_norm[b], W, H, PARTNER_COLOR, labels[b], 4)   # blue = B
+    return overlay
+
+
+def build_canonical_pair_overlay(image_pil, bbox_a, bbox_b):
+    """Draw the new pair pipeline's task-independent Person A/B overlay.
+
+    Person A is always RED and Person B is always BLUE. Directional semantics have
+    already been canonicalised by :class:`vlm.pair_dataset.PairSample`, so this helper
+    never receives a task and never swaps the boxes. The source image is not mutated.
+    """
+    overlay = image_pil.convert("RGB").copy()
+    W, H = overlay.size
+    draw = ImageDraw.Draw(overlay)
+    _draw(draw, bbox_a, W, H, SOURCE_COLOR, "A", 4)
+    _draw(draw, bbox_b, W, H, PARTNER_COLOR, "B", 4)
+    return overlay
+
+
 def build_overlay_pair(image_pil, i, j, bboxes_norm, labels):
     """Graph-FREE overlay: draw ONLY the query pair — source i=red, target j=blue.
     Other people stay un-boxed (the full scene is still visible in the photo).
@@ -111,6 +139,23 @@ def build_overlay_pair(image_pil, i, j, bboxes_norm, labels):
     draw = ImageDraw.Draw(overlay)
     _draw(draw, bboxes_norm[i], W, H, SOURCE_COLOR, labels[i], 4)    # red  = source
     _draw(draw, bboxes_norm[j], W, H, PARTNER_COLOR, labels[j], 4)   # blue = target
+    return overlay
+
+
+FRAME_PALETTE = ["red", "blue", "green", "gold", "magenta", "cyan", "orange",
+                 "lime", "purple", "brown", "pink", "teal"]
+
+
+def build_frame_overlay(image_pil, slots, bboxes_norm, labels):
+    """Frame pipeline overlay: draw ALL listed persons' head boxes with P1..PK labels,
+    cycling a colour palette. (slots) = ordered valid slot indices; labels = {slot: name}.
+    The plain frame.png (no boxes) is reused; boxing happens here at load time."""
+    overlay = image_pil.convert("RGB").copy()
+    W, H = overlay.size
+    draw = ImageDraw.Draw(overlay)
+    for k, slot in enumerate(slots):
+        _draw(draw, bboxes_norm[slot], W, H, FRAME_PALETTE[k % len(FRAME_PALETTE)],
+              labels[slot], 3, font_size=20)
     return overlay
 
 

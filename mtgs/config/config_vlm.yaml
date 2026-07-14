@@ -1,21 +1,34 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# VLM Stage-2 (graph-token 주입 LoRA) 하이퍼파라미터
-#   scripts/train_vlm.sh 의 token(학습)·eval(테스트) 모드가 이 파일을 읽는다.
+# VLM Stage-2 (graph + heatmap soft-token 주입 LoRA) 하이퍼파라미터
+#   scripts/train_vlm.sh 의 학습(train)·평가(eval) 모드가 이 파일을 읽는다.
 #   데이터 경로만 런처에서 주고, 실험이름·배치·lr·scheduler·epoch 등은 전부 여기서.
 #   다른 설정으로 돌리려면 이 파일을 복사해 CONFIG=경로 sbatch train_vlm.sh 로 지정.
 # ─────────────────────────────────────────────────────────────────────────────
 
 experiment:
-  name: C_plain_nall         # 실험 이름 → 저장경로 <out_root>/<name>/, W&B run 이름
-  out_root: experiments/vlm_plain  # 실험 저장 루트
-  monitor: mean_social       # best 체크포인트 선택 지표 (클수록 좋음):
-                             #   F1_LAH | F1_LAEO | AP_SA | mean_social(=셋 평균)
+  name: VLM_Training         # 실험 이름 → 저장경로 <out_root>/<name>/, W&B run 이름
+  out_root: experiments/vlm_v1  # 실험 저장 루트
+  monitor: social_ap         # best 체크포인트 선택 지표 (클수록 좋음):
+                             #   social_ap(=LAH/LAEO/SA AP 평균, graph run과 동일 축) |
+                             #   social_auc | F1_LAH | F1_LAEO | AP_SA | mean_social(=F1 셋 평균)
+
+# 입력 구성 (고정): 이미지=A(red)/B(blue) head box만, gaze 마커 없음.
+#   latent 토큰 = graph node/edge(<gtok>) + 예측 gaze heatmap(<hmtok>).
+#   heatmap 토큰을 쓰려면 graph_extract 를 다시 돌려 vlmgraph_*.pt 에 gaze_heatmap 이
+#   포함돼 있어야 함(구 캐시는 미포함 → 재추출 필요).
+
+sampler:                   # hard-example 가중 샘플링
+  hard_weight: true        # (task,ans) 균형 가중 × (hard_floor + |gt − p_graph|)
+  hard_floor: 0.25         # graph 가 확신하며 맞히는 레코드의 최저 상대가중
+                           #   (graph 오답/불확실 레코드 = oracle-router 헤드룸에 학습 집중)
 
 train:
   epochs: 3               # 전체 epoch 수
   bs: 8                   # per-step 배치 크기(샘플). GPU 메모리 여유 크면 12~16 권장
   accum: 1                # gradient accumulation 스텝 (유효배치 = bs * accum)
-  steps_per_epoch: 20000  # epoch당 추출 샘플 수 (WeightedRandomSampler num_samples)
+  steps_per_epoch: 60000  # epoch당 추출 샘플 수 (WeightedRandomSampler num_samples).
+                          #   train manifest ~254k: 60k*3ep = 180k draw로 커버리지 확보
+                          #   (기존 20k*3ep = 60k, 전체의 ~24%만 노출됨)
   num_workers: 6          # DataLoader 워커 수 (train + in-training val 공용)
   rank: 32                # LoRA rank (lora_alpha = 2*rank)
   seed: 101               # 재현성 시드 (MTGS와 통일)
@@ -29,7 +42,9 @@ train:
     - down_proj
 
 optim:
-  lr: 1.0e-4              # 최대 학습률(peak LR)
+  lr: 1.0e-4              # 최대 학습률(peak LR) — LoRA 어댑터 param group
+  new_module_lr: 1.0e-3   # from-scratch 모듈(GraphTokenProjector/HeatmapEncoder) 전용 LR
+                          #   (무작위 초기화라 LoRA의 10배; 스케줄 내내 10× 비율 유지)
   weight_decay: 0.01      # AdamW weight decay
   grad_clip: 1.0          # gradient clipping max-norm (<=0 이면 비활성)
   scheduler: cosine       # none | constant | linear | cosine
@@ -37,6 +52,8 @@ optim:
 
 val:
   vlm_bs: 48              # in-training val forward 배치 (매 epoch, no_grad)
+  limit: 24000            # 모델선택용 val 레코드 상한 (프레임 단위 고정 서브샘플, 0=전체 185k).
+                          #   매 epoch 동일 subset이라 epoch 간 비교 가능; full 지표는 test가 담당
 
 eval:
   vlm_bs: 64              # test(standalone) forward 배치

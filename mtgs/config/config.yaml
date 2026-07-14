@@ -121,7 +121,7 @@ train:
   matmul_precision: medium # highest, high, medium
   precision: bf16-mixed  # 64 (double), 32 (full), 16 (16bit mixed), bf16-mixed (bfloat16 mixed). Defaults to 32.
   epochs: 20
-  batch_size: 8
+  batch_size: 16
   accumulate_grad_batches: 1
   resume: False
   resume_from: null
@@ -140,21 +140,16 @@ train:
     all_but_gaze_graph: False
   checkpoint_monitor: "metric/val/dist"
   checkpoint_mode: "min"
-  swa:
-    use: False   # disabled: LR now follows linear-warmup → full cosine decay over all epochs
-    lr: [1e-6, 1e-6, 1e-6, 3e-7]  # (dormant) 4 param groups (gaze-encoder-temporal, people-temporal, gaze-graph-block, base)
-    epoch_start: 12
-    annealing_epochs: 6
 
 val:
-  batch_size: 8
+  batch_size: 16
 
 test:
   checkpoint: null
   batch_size: 1
 
 optimizer:
-  lr: 1e-6
+  lr: 2e-6
   weight_decay: 1e-3
 
 scheduler:

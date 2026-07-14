@@ -126,6 +126,10 @@ class MTGS(nn.Module):
                     num_heads=encoder_num_heads,
                     drop_path=0.3,
                     cffn_ratio=0.25,
+                    # checkpoint the frozen DINOv2 blocks run inside each stage:
+                    # identical math, ~10 GB less stored activations at train
+                    # shape for one extra encoder forward in backward.
+                    with_vit_cp=True,
                 )
                 for i in range(len(self.interaction_indexes))
             ]
@@ -611,9 +615,16 @@ class ConditionalDPTDecoder(nn.Module):
             }
         )
 
+        # The finest (last-applied) fusion stage skips its 2x upsample: the final
+        # heatmap is only 64x64, so refining at 2x the finest reassemble
+        # resolution (e.g. 256^2 for 448 input) is pure activation-memory waste
+        # (~11 GB at train shape). Interpolate/Identity hold no parameters, so
+        # checkpoints trained with the upsampling layout still load unchanged.
         self.fusion_blocks = nn.ModuleDict(
             {
-                f"f{factor}": FusionBlock(feature_dim, use_bn=use_bn)
+                f"f{factor}": FusionBlock(
+                    feature_dim, use_bn=use_bn, upsample=(factor != self.factors[0])
+                )
                 for idx, factor in enumerate(self.factors)
             }
         )
@@ -665,9 +676,10 @@ class ConditionalDPTDecoder(nn.Module):
             else:
                 z = self.fusion_blocks[f"f{factor}"](f, z)  # (b*n, d', H/16, W/16)
 
-        # Apply prediction head and downscale (224 > 64)
-        z = self.head(z)  # (b*n, d', H/2, W/2) > (b*n, 1, H/2, W/2)
-        # (b*n, 1, H, W) > (b*n, 1, 64, 64)
+        # Apply prediction head and rescale to the 64x64 output heatmap.
+        # z stays at the finest reassemble resolution (H/4 for patch 14 @ 448)
+        # since the last fusion stage no longer upsamples.
+        z = self.head(z)  # (b*n, d', h, w) > (b*n, 1, h, w)
         z = F.interpolate(z, size=(64, 64), mode="bilinear", align_corners=False)
         z = z.view(b, n, 64, 64)  # (b*n, 1, 64, 64) > (b, n, 64, 64)
         return z
@@ -1384,7 +1396,7 @@ class ResidualConvUnit(nn.Module):
 
 
 class FusionBlock(nn.Module):
-    def __init__(self, feature_dim, use_bn=False):
+    def __init__(self, feature_dim, use_bn=False, upsample=True):
         super().__init__()
 
         self.feature_dim = feature_dim
@@ -1392,7 +1404,11 @@ class FusionBlock(nn.Module):
 
         self.rcu1 = ResidualConvUnit(feature_dim, use_bn=use_bn)
         self.rcu2 = ResidualConvUnit(feature_dim, use_bn=use_bn)
-        self.resample = Interpolate(2, "bilinear", align_corners=True)
+        # upsample=False keeps the input resolution (used for the finest DPT
+        # stage, whose 2x upsample is wasted on a 64x64 output heatmap).
+        self.resample = (
+            Interpolate(2, "bilinear", align_corners=True) if upsample else nn.Identity()
+        )
         self.proj = nn.Conv2d(
             feature_dim, feature_dim, kernel_size=1, stride=1, padding=0, bias=True
         )

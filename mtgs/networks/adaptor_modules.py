@@ -160,8 +160,16 @@ class InteractionBlock(nn.Module):
         init_values=0.0,
         extra_extractor=False,
         with_cp=False,
+        with_vit_cp=False,
     ):
         super().__init__()
+
+        # Gradient-checkpoint the (frozen) ViT blocks run inside this
+        # interaction stage: their weights get no gradients, but activations
+        # are otherwise stored because grads flow through them
+        # (injector -> ViT -> extractor/DPT). Checkpointing the whole group
+        # keeps only its input and recomputes the blocks in backward.
+        self.with_vit_cp = with_vit_cp
 
         self.injector = Injector(
             dim=dim,
@@ -202,8 +210,18 @@ class InteractionBlock(nn.Module):
 
     def forward(self, x, c, blocks, num_valid_people):
         x = self.injector(query=x, feat=c)
-        for idx, blk in enumerate(blocks):
-            x = blk(x)
+
+        def _run_blocks(t):
+            for blk in blocks:
+                t = blk(t)
+            return t
+
+        # Only checkpoint when a backward will actually happen; in eval / fully
+        # frozen trunks x carries no grad and checkpointing is pure overhead.
+        if self.with_vit_cp and self.training and x.requires_grad:
+            x = cp.checkpoint(_run_blocks, x, use_reentrant=False)
+        else:
+            x = _run_blocks(x)
         c = self.extractor(query=c, feat=x)
         if self.extra_extractors is not None:
             for extractor in self.extra_extractors:
@@ -504,7 +522,7 @@ class GazeGraphBlock(nn.Module):
         # ── Readout heads ─────────────────────────────────────────────────────
         self.head_lah      = _SocialReadoutHead(De)
         self.head_laeo     = _SocialReadoutHead(2 * De)   # cat(E[i→j], E[j→i])
-        # SA: edge-based, cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
+        # SA: edge+null_in based, cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
         self.head_sa       = _SocialReadoutHead(5 * De)
         self.head_null_in  = _SocialReadoutHead(De)
         self.head_null_out = _SocialReadoutHead(De)
@@ -684,11 +702,15 @@ class GazeGraphBlock(nn.Module):
         else:
             laeo_mat = None
 
-        # SA: edge-based, cat(ni_i, ni_j, |diff|, E[i→j], E[j→i])
+        # SA: cat(ni_i, ni_j, |diff|, E[i→j], E[j→i]) — null_in scene-gaze channels
+        # PLUS the person↔person edges. E[i→j] carries the refined "who each looks at"
+        # context (row-attn over all of i's outgoing edges) needed for person-target SA
+        # (85% of positives) and the mutual-look exclusion for negatives; null_in alone
+        # only covers scene-target SA (~15%). Symmetrised by averaging (i,j) and (j,i).
         ni     = E[:, :, :, N, :]                                          # (B,T,N,De) null_in edge per person
         ni_i   = ni.unsqueeze(3).expand(B, T, N, N, De)
         ni_j   = ni.unsqueeze(2).expand(B, T, N, N, De)
-        E_ji   = E_pp.transpose(2, 3)
+        E_ji   = E_pp.transpose(2, 3)                                       # E[j→i]
         sa_mat = self.head_sa(
             torch.cat([ni_i, ni_j, (ni_i - ni_j).abs(), E_pp, E_ji], dim=-1)
             .reshape(B * T * N * N, 5 * De)
@@ -725,6 +747,7 @@ class GazeGraphBlock(nn.Module):
                 "align": align, "overlap": overlap,               # (B,T,N,N)
                 "gaze_vecs": gaze_vecs,                           # (B,T,N,2) detached
                 "gaze_point": torch.stack([gp_x, gp_y], dim=-1),  # (B,T,N,2)
+                "gaze_heatmap": hm,                               # (B,T,N,Hh,Ww) raw logits
             }
 
         return (

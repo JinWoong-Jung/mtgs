@@ -1,10 +1,8 @@
 from __future__ import annotations
-"""LoRA training datasets for VLM Stage-2 (token path: graph soft-token injection).
+"""LoRA training dataset for VLM Stage-2 (social-gaze specialist).
 
-TokenDS: loads PRE-RENDERED overlay PNGs + graph soft-token features (experiment C).
-
-Ported from peer sgg/datasets.py (make_collate) and
-peer sgg/train.py (_cmd_train_lora_token: TokenDS + make_token_collate).
+TokenDS: loads pre-rendered frame PNGs + per-frame graph features, and builds one
+(image, prompt, graph soft-tokens, heatmap soft-tokens) example per manifest record.
 """
 
 import json
@@ -15,8 +13,32 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from vlm.injection import gather_feats
+from vlm.injection import gather_feats, gather_heatmaps, query_slots
+from vlm.overlay import build_token_overlay
 from vlm.prompt import token_prompt
+
+
+# ---------------------------------------------------------------------------
+# Shared example builder (train TokenDS + eval _TokenRecDS use the SAME path)
+# ---------------------------------------------------------------------------
+
+def build_example(rec, gfd, overlay_dir):
+    """Render one (image, prompt, feats, roles, hms) example for a manifest record.
+
+    Query orientation, overlay roles, graph soft-tokens and heatmap soft-tokens all
+    go through injection.query_slots so they stay consistent by construction.
+      pil   : frame with ONLY the A(red)/B(blue) head boxes
+      feats : (K,256) graph node/edge embeddings   + roles (K,)
+      hms   : (M,Hh,Ww) predicted gaze heatmaps for the queried persons
+    """
+    a, b, la, lb = query_slots(rec)
+    bb = gfd["head_bboxes"].float()
+    pil = Image.open(Path(overlay_dir) / rec["sid"] / "frame.png").convert("RGB")
+    pil = build_token_overlay(pil, rec["task"], a, b, bb, {a: la, b: lb})
+    prompt = token_prompt(rec["task"], la, lb, bb[a], bb[b])
+    feats, roles = gather_feats(gfd, rec["task"], a, b)        # (K,256),(K,)
+    hms = gather_heatmaps(gfd, rec["task"], a, b)              # (M,Hh,Ww)
+    return pil, prompt, feats, roles, hms
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +77,7 @@ def make_collate(processor):
 
 
 # ---------------------------------------------------------------------------
-# Dataset: graph soft-tokens (experiment C)
+# Dataset: graph + heatmap soft-tokens
 # ---------------------------------------------------------------------------
 
 class TokenDS(Dataset):
@@ -67,18 +89,31 @@ class TokenDS(Dataset):
     def __len__(self):
         return len(self.recs)
 
-    def sample_weights(self):
+    def sample_weights(self, hard_floor=None):
+        """(task, ans)-balanced weights, optionally scaled by graph hardness.
+
+        hard_floor=None keeps the original pure class balance. Otherwise each
+        record is scaled by (hard_floor + |gt - p_graph|) in [floor, floor+1]:
+        records the graph already gets right with confidence contribute ~floor,
+        graph-wrong/uncertain records (the oracle-router headroom) dominate.
+        p_graph is the graph readout probability (input feature, not GT)."""
         cnt = Counter((r["task"], r["ans"]) for r in self.recs)
-        return torch.tensor([1.0 / cnt[(r["task"], r["ans"])] for r in self.recs])
+        w = torch.tensor([1.0 / cnt[(r["task"], r["ans"])] for r in self.recs])
+        if hard_floor is None:
+            return w
+        from vlm.injection import pair_belief
+        hard = torch.empty(len(self.recs))
+        for k, r in enumerate(self.recs):
+            a, b, _, _ = query_slots(r)
+            p = pair_belief(self.gf[r["sid"]], r["task"], a, b)["p"]
+            y = 1.0 if r["ans"] == "yes" else 0.0
+            hard[k] = abs(y - p)
+        return w * (float(hard_floor) + hard)
 
     def __getitem__(self, k):
         r = self.recs[k]
-        gfd = self.gf[r["sid"]]
-        bb = gfd["head_bboxes"]
-        pil = Image.open(self.dir / r["sid"] / "frame.png").convert("RGB")
-        prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
-        feats, roles = gather_feats(gfd, r["task"], r["i"], r["j"])   # (K,256),(K,)
-        return pil, prompt, r["ans"], feats, roles
+        pil, prompt, feats, roles, hms = build_example(r, self.gf[r["sid"]], self.dir)
+        return pil, prompt, r["ans"], feats, roles, hms
 
 
 # ---------------------------------------------------------------------------
@@ -86,15 +121,17 @@ class TokenDS(Dataset):
 # ---------------------------------------------------------------------------
 
 def make_token_collate(processor):
-    """Variable-length token collate: base SFT batch + flat concatenated graph feats/roles.
-    <gtok> positions are filled by the hook in row-major (sample, seq) order, so the flat
-    concat order (sample-major, then in-prompt order) matches exactly."""
+    """Variable-length token collate: base SFT batch + flat concatenated graph
+    feats/roles + heatmaps. <gtok>/<hmtok> positions are filled by the hook in
+    row-major (sample, seq) order, so each modality's sample-major flat concat
+    (then in-prompt order) matches its placeholder order exactly."""
     base = make_collate(processor)
 
     def collate(batch):
         out = base([(b[0], b[1], b[2]) for b in batch])
         out["graph_feats"] = torch.cat([b[3] for b in batch], dim=0)       # (ΣK, 256)
         out["graph_role_ids"] = torch.cat([b[4] for b in batch], dim=0)    # (ΣK,)
+        out["hm_feats"] = torch.cat([b[5] for b in batch], dim=0)          # (ΣM, Hh, Ww)
         return out
 
     return collate

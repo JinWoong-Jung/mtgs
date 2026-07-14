@@ -4,12 +4,16 @@ import importlib
 import inspect
 
 
-def test_train_exposes_only_token():
+def test_train_is_single_pipeline():
     train = importlib.import_module("vlm.train")
     src = inspect.getsource(train)
+    # No leftover mode-switching / alternative experiment paths.
     assert "_cmd_train_lora_nograph" not in src
-    # _CMDS must map exactly {"token": ...}
-    assert '"token"' in src and '"nograph"' not in src
+    assert "nograph" not in src
+    assert "experiment C" not in src.lower() and "experiment c" not in src.lower()
+    # single entry point, no subcommand verb
+    assert "def train_lora(" in src
+    assert "_CMDS" not in src
 
 
 def test_eval_exposes_only_blend_and_token():

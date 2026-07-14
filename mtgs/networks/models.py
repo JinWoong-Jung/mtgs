@@ -312,11 +312,10 @@ class MTGSModel(pl.LightningModule):
 
     def configure_optimizers(self):
         # Fixed interaction trunk (people_interaction + people_temporal); the social
-        # head is gaze_graph_block (highest LR). 4 param groups → 4-entry train.swa.lr.
+        # head is gaze_graph_block (highest LR). 4 param groups total.
         base_lr = self.cfg.optimizer.lr
         # Social head param group: GazeGraphBlock (use=True) or the original
-        # per-pair decoders (use=False). ×3 keeps the same 4-group structure/LR
-        # → original scheduler/LR + 4-entry train.swa.lr preserved.
+        # per-pair decoders (use=False). ×3 keeps the same 4-group structure/LR.
         if self.cfg.gaze_graph.use:
             social_head_group = {
                 "params": self.model.gaze_graph_block.parameters(),
@@ -417,13 +416,6 @@ class MTGSModel(pl.LightningModule):
         if self.current_epoch == self.trainer.max_epochs - 1:
             # Workaround to always save the last epoch until the bug is fixed in lightning (https://github.com/Lightning-AI/lightning/issues/4539)
             self.trainer.check_val_every_n_epoch = 1
-
-            # Disable backward ONLY when SWA is active (it just recomputes BN stats
-            # over the averaged weights on the final epoch, see lightning#17245).
-            # With SWA off, the last epoch must train normally so the cosine schedule
-            # reaches its final low LR.
-            if self.cfg.train.swa.use:
-                self.automatic_optimization = False
 
         # Post-training: keep the ENTIRE frozen trunk in eval mode so its BatchNorm
         # running stats stay fixed — otherwise heatmap/in-out drift from the original

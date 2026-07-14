@@ -13,95 +13,92 @@
 #SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.out
 #SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.err
 
-# conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
+# ─────────────────────────────────────────────────────────────────────────────
+# VLM Stage-2 학습/평가 런처.
+#   전제: graph 피처 + frame 이미지가 CACHE 에 미리 추출돼 있어야 함
+#         (오프라인 추출은 scripts/graph_extract.sh 담당).
+#   실험이름·배치·lr·epoch 등 하이퍼파라미터는 전부 CONFIG(yaml)에.
+#
+#   MODE=train : 학습(+RUN_TEST=true 면 BEST ckpt 로 test 자동평가) → blend 분석.
+#                test/* 는 train.py 가 같은 W&B run 에 직접 기록.
+#   MODE=eval  : 학습 없이 저장된 체크포인트로 SPLIT 평가만 (token → blend).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 설정 (여기만 바꾸면 됨) ──────────────────────────────────────────────────
+MODE=train                            # train | eval
+CONFIG=mtgs/config/config_vlm.yaml    # 실험이름 + 모든 하이퍼파라미터
+WHICH=best                            # 평가 대상 체크포인트: best | last
+SPLIT=test                            # MODE=eval 일 때 평가할 split: train | val | test
+RUN_TEST=true                         # MODE=train 종료 후 test 자동평가 (866k, 수 시간).
+                                      #   하이퍼파라미터 탐색 런은 false 로 두고 val 만 확인.
+CACHE=/home/jinwoongjung/MTGS/data/vlm_feature   # graph_extract.sh 산출물 위치
+# ─────────────────────────────────────────────────────────────────────────────
+
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate mtgs
-export PYTHONNOUSERSITE=1
+export PYTHONNOUSERSITE=1              # ~/.local 사용자 패키지 무시
 export XFORMERS_DISABLED=1
 
-# Navigate to MTGS repo ROOT so that both `vlm` and `mtgs` packages are importable.
-# (train_vsgaze.sh cd's into scripts/; train_vlm.sh must run from the parent.)
+# repo ROOT 로 이동 (vlm/mtgs 패키지 import). scripts/ 에서 제출하면 부모로.
 if [ "$(basename "$SLURM_SUBMIT_DIR")" = "scripts" ]; then
     cd "$(dirname "$SLURM_SUBMIT_DIR")"
 else
     cd "$SLURM_SUBMIT_DIR"
 fi
 
-# Fail fast: in multi-command modes (e.g. `eval` runs token then blend) a failed
-# first step must abort, not silently feed the next step stale/missing artifacts.
-set -e
-
-# ── Configuration (override at submission time with: MODE=export sbatch ...) ──
-MODE=${MODE:-token}               # export | overlays | token | eval
-SPLIT=${SPLIT:-train}             # train | val | test
-CHECKPOINT=${CHECKPOINT:-experiments/V14.5/train/checkpoints/best.ckpt}
-CONFIG=${CONFIG:-mtgs/config/config_vlm.yaml}   # experiment name + all hyperparameters
-WHICH=${WHICH:-best}              # eval 대상 체크포인트: best | last
-CACHE=/home/jinwoongjung/MTGS/data/vlm_feature
-
+set -e   # 단계 하나라도 실패하면 즉시 중단
 mkdir -p "$CACHE" /home/jinwoongjung/MTGS/scripts/logs
 
-# Experiment name/root come from $CONFIG (single source of truth). Used only to locate
-# the run dir for the eval-preds cache path; train/eval derive it from the config too.
-NAME=$(python -c "from omegaconf import OmegaConf;c=OmegaConf.load('$CONFIG').experiment;print(c.name)")
+# 실험 이름(CONFIG 단일 소스) — preds 캐시 파일명 구성에만 사용.
+NAME=$(python -c "from omegaconf import OmegaConf; print(OmegaConf.load('$CONFIG').experiment.name)")
 
-# run_eval <split>: token eval (WHICH=best|last) + graph-VLM soft-blend sweep on <split>.
-run_eval () {
-  local sp="$1"
-  python -m vlm.eval token \
-    --config "$CONFIG" --which "$WHICH" \
-    --manifest "$CACHE/manifest_${sp}.jsonl" \
-    --overlay_dir "$CACHE/overlays/$sp" \
-    --graph_feats "$CACHE/vlmgraph_${sp}.pt" \
-    --gtmeta "$CACHE/gtmeta_${sp}.pt" \
-    --preds_out "$CACHE/preds_${NAME}_${sp}.pt"
+# graph⊕VLM soft-blend α-스윕 (분석용). preds_${NAME}_<split>.pt 가 있어야 함.
+run_blend () {
   python -m vlm.eval blend \
-    --feat "$CACHE/vlmgraph_${sp}.pt" \
-    --pvlm "$CACHE/preds_${NAME}_${sp}.pt" \
+    --feat "$CACHE/vlmgraph_$1.pt" \
+    --pvlm "$CACHE/preds_${NAME}_$1.pt" \
     --alphas 0,0.25,0.3,0.5,1.0
 }
 
-# ── Pipeline stages ───────────────────────────────────────────────────────────
 case $MODE in
 
-  # Stage 1: export frozen-Stage-1 graph features to disk
-  export)
-    python -m vlm.graph_export \
-      --split "$SPLIT" \
-      --ckpt "$CHECKPOINT" \
-      --out "$CACHE/vlmgraph_${SPLIT}.pt" \
-      --batch_size 4 \
-      --num_people all ;;
-
-  # Stage 2a: render per-frame overlays + write manifest + gtmeta cache
-  overlays)
-    python -m vlm.data_prep overlays \
-      --split "$SPLIT" \
-      --out "$CACHE/overlays" \
-      --manifest "$CACHE/manifest_${SPLIT}.jsonl" \
-      --gtmeta "$CACHE/gtmeta_${SPLIT}.pt" ;;
-
-  # Stage 2b-C: graph-token LoRA fine-tuning (train + in-training val), then test
-  # eval in the SAME job (one-shot). Experiment name + hyperparameters come from $CONFIG;
-  # best/last saved to <out_root>/<name>/train/checkpoints/.
-  token)
-    python -m vlm.train token \
-      --manifest "$CACHE/manifest_train.jsonl" \
-      --overlay_dir "$CACHE/overlays/train" \
-      --graph_feats "$CACHE/vlmgraph_train.pt" \
-      --val_manifest "$CACHE/manifest_val.jsonl" \
+  train)
+    TEST_ARGS=()
+    [ "$RUN_TEST" = "true" ] && TEST_ARGS=(
+      --test_manifest    "$CACHE/manifest_test.jsonl"
+      --test_overlay_dir "$CACHE/overlays/test"
+      --test_gtmeta      "$CACHE/gtmeta_test.pt"
+      --test_graph_feats "$CACHE/vlmgraph_test.pt"
+      --test_preds_out   "$CACHE/preds_${NAME}_test.pt"
+    )
+    python -m vlm.train \
+      --config          "$CONFIG" \
+      --manifest        "$CACHE/manifest_train.jsonl" \
+      --overlay_dir     "$CACHE/overlays/train" \
+      --graph_feats     "$CACHE/vlmgraph_train.pt" \
+      --val_manifest    "$CACHE/manifest_val.jsonl" \
       --val_overlay_dir "$CACHE/overlays/val" \
-      --val_gtmeta "$CACHE/gtmeta_val.pt" \
+      --val_gtmeta      "$CACHE/gtmeta_val.pt" \
       --val_graph_feats "$CACHE/vlmgraph_val.pt" \
-      --config "$CONFIG"
-    echo "===== training done -> TEST eval (WHICH=$WHICH), one-shot ====="
-    run_eval test || echo "[warn] test eval failed; train ckpts saved, rerun: MODE=eval SPLIT=test" ;;
+      "${TEST_ARGS[@]}"
+    if [ "$RUN_TEST" = "true" ]; then
+      echo "===== 학습+test 완료 → graph⊕VLM blend 분석 ====="
+      run_blend test || echo "[warn] blend 실패 (test/* 는 W&B 에 이미 기록됨)"
+    else
+      echo "===== 학습 완료 (test 생략; 필요시 MODE=eval SPLIT=test 로 별도 실행) ====="
+    fi ;;
 
-  # Stage 3: standalone evaluation (WHICH=best|last) + graph-VLM soft blend sweep
   eval)
-    run_eval "$SPLIT" ;;
+    python -m vlm.eval token \
+      --config      "$CONFIG" --which "$WHICH" \
+      --manifest    "$CACHE/manifest_${SPLIT}.jsonl" \
+      --overlay_dir "$CACHE/overlays/$SPLIT" \
+      --graph_feats "$CACHE/vlmgraph_${SPLIT}.pt" \
+      --gtmeta      "$CACHE/gtmeta_${SPLIT}.pt" \
+      --preds_out   "$CACHE/preds_${NAME}_${SPLIT}.pt"
+    run_blend "$SPLIT" ;;
 
   *)
-    echo "unknown MODE=$MODE (choices: export | overlays | token | eval)"
-    exit 1 ;;
+    echo "unknown MODE=$MODE (choices: train | eval)"; exit 1 ;;
+
 esac

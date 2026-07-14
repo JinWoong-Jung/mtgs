@@ -123,6 +123,7 @@ def main():
                 "overlap": f["overlap"][b, c].half().cpu(),
                 "gaze_vecs":  f["gaze_vecs"][b, c].float().cpu(),
                 "gaze_point": f["gaze_point"][b, c].float().cpu(),
+                "gaze_heatmap": f["gaze_heatmap"][b, c].half().cpu(),   # (N,Hh,Ww) for <hmtok>
                 "head_bboxes": bbc[b],
                 "lah_gt": lah_gt[b], "laeo_gt": laeo_gt[b], "sa_gt": sa_gt[b], "inout_gt": inout_gt[b],
                 "person_mask": pmask[b], "vis_mask": vis[b], "num_persons": int(pmask[b].sum()),

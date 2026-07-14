@@ -3,8 +3,9 @@ from __future__ import annotations
 graph baseline (F1_LAH / F1_LAEO / AP_SA via per-target-argmax, thr=0.5).
 
 Two CLI subcommands:
-  token    — LoRA + GraphTokenProjector soft-token inference -> compute_metrics
-  blend    — soft-blend alpha-sweep using a cached feat + optional pvlm .pt
+  token    — LoRA + soft-token (graph + heatmap) inference -> compute_metrics
+  blend    — post-hoc graph⊕VLM soft-blend alpha-sweep (analysis; graph-only baseline
+             + best blend + oracle ceiling) using a cached feat + optional pvlm .pt
 
 Public API (imported by vlm.train):
   build_mtgs_dicts(gtmeta_path, preds) -> list[dict]
@@ -35,15 +36,17 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 from mtgs.performance.compute_metrics import CPU_Unpickler, compute
 from vlm.cfg import QWEN
+from vlm.dataset import build_example
 from vlm.injection import (
     GTOK,
+    HMTOK,
     GraphTokenProjector,
-    gather_feats,
+    HeatmapEncoder,
     install_hook,
 )
 from vlm.patches import patch_qwen3vl_patch_embed
 from vlm.overlay import display_labels
-from vlm.prompt import TASKS, token_prompt
+from vlm.prompt import TASKS
 
 # ── Local constants (replaces sgg.hgr.train_phase1 / sgg.hgr.eval_softblend) ─
 
@@ -342,17 +345,21 @@ def format_metrics(m, title=""):
 
 # ── build_mtgs_dicts ───────────────────────────────────────────────────────────
 
-def build_mtgs_dicts(gtmeta_path, preds):
+def build_mtgs_dicts(gtmeta_path, preds, restrict_sids=None):
     """Phase 2: per-sample MTGS dicts from the render-pass gtmeta (GT/bbox/inout)
     + the VLM P(yes). Reads gtmeta (authoritative, written in the same pass as the
     overlays) — never re-iterates the dataset (whose __getitem__ is RNG/worker
     dependent and would diverge from what the VLM was evaluated on).
 
     preds: {(sid, task, i, j): P(yes)}  LAEO/SA keys with i<j (canonical).
+    restrict_sids: optional sid set — evaluate only these frames (used by the
+    in-training val subset; frames without preds would otherwise score 0 everywhere).
     """
     gtmeta = torch.load(gtmeta_path, weights_only=False)
     out = []
     for sid, m in gtmeta.items():
+        if restrict_sids is not None and sid not in restrict_sids:
+            continue
         bb = m["head_bboxes"].float()
         n = bb.shape[0]
         pairs = list(itertools.permutations(range(n), 2))
@@ -401,18 +408,132 @@ class _TokenRecDS(Dataset):
 
     def __getitem__(self, k):
         r = self.recs[k]
-        gfd = self.gf[r["sid"]]
-        bb = gfd["head_bboxes"]
-        pil = Image.open(self.dir / r["sid"] / "frame.png").convert("RGB")
-        prompt = token_prompt(r["task"], r["li"], r["lj"], bb[r["i"]], bb[r["j"]])
-        feats, roles = gather_feats(gfd, r["task"], r["i"], r["j"])
-        return (r["sid"], r["task"], r["i"], r["j"]), pil, prompt, feats, roles
+        # SAME builder as training (query_slots orientation + overlay + soft-tokens).
+        pil, prompt, feats, roles, hms = build_example(r, self.gf[r["sid"]], self.dir)
+        return (r["sid"], r["task"], r["i"], r["j"]), pil, prompt, feats, roles, hms
 
 
 def _coll(b):
-    keys, pils, prompts, feats, roles = zip(*b)
+    keys, pils, prompts, feats, roles, hms = zip(*b)
     return (list(keys), list(pils), list(prompts),
-            torch.cat(feats, dim=0), torch.cat(roles, dim=0))
+            torch.cat(feats, dim=0), torch.cat(roles, dim=0), torch.cat(hms, dim=0))
+
+
+@torch.no_grad()
+def run_token_eval_batched(model, proc, proj, hmenc, lm, recs, overlay_dir, gf,
+                           gtok_id, hmtok_id, yes_id, no_id, device, vlm_bs, num_workers):
+    """Batched token eval: DataLoader (bs=vlm_bs) overlaps CPU-side PIL decode + graph
+    gather with the GPU forward. Records are NOT grouped by frame — each record re-encodes
+    its frame image, but the LM runs at full batch (bs=vlm_bs), which on Blackwell (vision
+    ~20% of the forward, LM ~80%) is faster than per-frame vision reuse at bs=1.
+    Returns preds keyed by (sid, task, i, j). LEFT padding so logits[:, -1] is each
+    sequence's true last token."""
+    old = proc.tokenizer.padding_side
+    proc.tokenizer.padding_side = "left"
+    dl = DataLoader(_TokenRecDS(recs, overlay_dir, gf),
+                    batch_size=vlm_bs,
+                    num_workers=num_workers, collate_fn=_coll, pin_memory=False)
+    preds = {}
+    for keys, pils, prompts, feats, roles, hms in tqdm(dl, desc="eval", unit="batch",
+                                                       leave=False, file=sys.stdout):
+        texts = [proc.apply_chat_template(
+                    [{"role": "user", "content": [
+                        {"type": "image", "image": p},
+                        {"type": "text", "text": t}]}],
+                    tokenize=False, add_generation_prompt=True)
+                 for p, t in zip(pils, prompts)]
+        inp = proc(text=texts, images=list(pils), return_tensors="pt", padding=True).to(device)
+        gtokens = proj(feats.to(device, torch.bfloat16), roles.to(device))
+        lm._gtok = {"tokens": gtokens, "mask": (inp["input_ids"] == gtok_id)}
+        hmtokens = hmenc(hms.to(device, torch.bfloat16))
+        lm._hmtok = {"tokens": hmtokens, "mask": (inp["input_ids"] == hmtok_id)}
+        logits = model(**inp).logits[:, -1]
+        pyes = torch.softmax(
+            torch.stack([logits[:, yes_id], logits[:, no_id]], -1), -1
+        )[:, 0]
+        for k, p in zip(keys, pyes.float().tolist()):
+            preds[k] = p
+    proc.tokenizer.padding_side = old
+    return preds
+
+
+# ── frame pipeline: shared forward + batched eval ──────────────────────────────
+
+def install_norm_hook(lm):
+    """Capture the final-norm output (the per-position hidden state feeding lm_head)
+    so the frame head can read anchor tokens. Returns a dict updated each forward;
+    the captured tensor stays in the autograd graph so head grads flow into the LM."""
+    cap = {}
+
+    def hook(_mod, _inp, out):
+        cap["h"] = out[0] if isinstance(out, tuple) else out
+
+    lm.norm.register_forward_hook(hook)
+    return cap
+
+
+def frame_forward(model, lm, head, proj, hmenc, batch, gtok_id, hmtok_id, panc_id,
+                  device, cap):
+    """One frame-pipeline forward: inject per-person <gtok>/<hmtok>, run the VLM once,
+    read <panc> anchor hidden states, and apply the PairwiseSocialHead per task.
+    Returns {task: {"logit": (R,), "y": (R,), "keys": [...]}}. Pops its own keys from
+    `batch`; the remaining tensor keys are the model inputs."""
+    feats = batch.pop("graph_feats").to(device)
+    roles = batch.pop("graph_role_ids").to(device)
+    hms = batch.pop("hm_feats").to(device)
+    frame_K = batch.pop("frame_K")
+    records = batch.pop("records")
+
+    model_inputs = {k: (v.to(device) if torch.is_tensor(v) else v)
+                    for k, v in batch.items()}
+    input_ids = model_inputs["input_ids"]
+    lm._gtok = {"tokens": proj(feats.to(torch.bfloat16), roles),
+                "mask": (input_ids == gtok_id)}
+    lm._hmtok = {"tokens": hmenc(hms.to(torch.bfloat16)),
+                 "mask": (input_ids == hmtok_id)}
+
+    try:
+        model(**model_inputs, logits_to_keep=1)   # skip most lm_head compute; unused
+    except TypeError:
+        model(**model_inputs)
+    hidden = cap["h"]                              # (B, L, D)
+    anchors = hidden[input_ids == panc_id].float()  # (ΣK, D) row-major == person order
+    nK = int(frame_K.sum())
+    assert anchors.shape[0] == nK, f"anchor/panc mismatch: {anchors.shape[0]} vs {nK}"
+
+    offsets = torch.zeros(len(frame_K), dtype=torch.long, device=device)
+    if len(frame_K) > 1:
+        offsets[1:] = torch.cumsum(frame_K.to(device), 0)[:-1]
+
+    out = {}
+    for t, s in records.items():
+        fr = s["frame"].to(device)
+        ga = offsets[fr] + s["la"].to(device)
+        gb = offsets[fr] + s["lb"].to(device)
+        edges = {k: v.to(device).float() for k, v in s["edges"].items()}
+        glogit = s["glogit"].to(device).float()
+        final, vlm_logit, alpha = head(t, anchors[ga], anchors[gb], edges, glogit)
+        out[t] = {"logit": final, "vlm_logit": vlm_logit, "alpha": alpha,
+                  "y": s["y"].to(device), "keys": s["keys"]}
+    return out
+
+
+@torch.no_grad()
+def run_frame_eval_batched(model, proc, proj, hmenc, head, lm, ds, gtok_id, hmtok_id,
+                           panc_id, device, vlm_bs, num_workers, cap):
+    """Frame-pipeline batched eval over a FrameDS. Returns preds {(sid,task,i,j): P(yes)}
+    in the SAME convention as the token path (build_mtgs_dicts reads it unchanged)."""
+    from vlm.frame_dataset import make_frame_collate
+    dl = DataLoader(ds, batch_size=vlm_bs, shuffle=False, num_workers=num_workers,
+                    collate_fn=make_frame_collate(proc), pin_memory=False)
+    preds = {}
+    for batch in tqdm(dl, desc="eval", unit="batch", leave=False, file=sys.stdout):
+        out = frame_forward(model, lm, head, proj, hmenc, batch, gtok_id, hmtok_id,
+                            panc_id, device, cap)
+        for t, o in out.items():
+            for key, pv in zip(o["keys"], torch.sigmoid(o["logit"]).float().tolist()):
+                preds[key] = pv
+    return preds
 
 
 # ── token CLI main ─────────────────────────────────────────────────────────────
@@ -423,9 +544,9 @@ def _main_eval_lora_token():
                     help="checkpoint dir; empty -> derive from config experiment + --which")
     ap.add_argument("--which", default="best", choices=["best", "last"],
                     help="which trained checkpoint to eval when --ckpt is not given")
-    ap.add_argument("--manifest", required=True, help="manifest_nograph_<split>.jsonl")
-    ap.add_argument("--overlay_dir", required=True, help="vlm_overlays/<split>")
-    ap.add_argument("--graph_feats", required=True, help="v14graph_<split>.pt")
+    ap.add_argument("--manifest", required=True, help="manifest_<split>.jsonl")
+    ap.add_argument("--overlay_dir", required=True, help="overlays/<split>")
+    ap.add_argument("--graph_feats", required=True, help="vlmgraph_<split>.pt")
     ap.add_argument("--gtmeta", required=True, help="gtmeta_<split>.pt")
     ap.add_argument("--config", default="mtgs/config/config_vlm.yaml",
                     help="config YAML; supplies eval.vlm_bs / eval.num_workers + experiment path")
@@ -471,8 +592,9 @@ def _main_eval_lora_token():
 
     proc = AutoProcessor.from_pretrained(QWEN)
     proc.tokenizer.padding_side = "left"
-    proc.tokenizer.add_special_tokens({"additional_special_tokens": [GTOK]})
+    proc.tokenizer.add_special_tokens({"additional_special_tokens": [GTOK, HMTOK]})
     gtok_id = proc.tokenizer.convert_tokens_to_ids(GTOK)
+    hmtok_id = proc.tokenizer.convert_tokens_to_ids(HMTOK)
     yes_id = proc.tokenizer.encode("yes", add_special_tokens=False)[0]
     no_id = proc.tokenizer.encode("no", add_special_tokens=False)[0]
     base = Qwen3VLForConditionalGeneration.from_pretrained(QWEN, dtype=torch.bfloat16,
@@ -484,6 +606,9 @@ def _main_eval_lora_token():
     proj = GraphTokenProjector(out_dim=D).to("cuda", torch.bfloat16)
     proj.load_state_dict(torch.load(Path(args.ckpt) / "projector.pt", weights_only=True))
     proj.eval()
+    hmenc = HeatmapEncoder(out_dim=D).to("cuda", torch.bfloat16)
+    hmenc.load_state_dict(torch.load(Path(args.ckpt) / "hmencoder.pt", weights_only=True))
+    hmenc.eval()
     lm = model.model.language_model
     install_hook(lm)
 
@@ -491,9 +616,9 @@ def _main_eval_lora_token():
     if args.nshards > 1:
         recs = recs[args.shard::args.nshards]
     gf = torch.load(args.graph_feats, weights_only=False)
-    from vlm.vision_cache import run_token_eval_grouped
-    preds = run_token_eval_grouped(model, proc, proj, lm, recs, args.overlay_dir, gf,
-                                   gtok_id, yes_id, no_id, "cuda")
+    preds = run_token_eval_batched(model, proc, proj, hmenc, lm, recs, args.overlay_dir, gf,
+                                   gtok_id, hmtok_id, yes_id, no_id, "cuda",
+                                   args.vlm_bs, args.num_workers)
 
     out_path = args.preds_out or f"preds_token_{Path(args.ckpt).name}.pt"
     torch.save(preds, out_path)

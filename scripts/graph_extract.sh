@@ -23,12 +23,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── 설정 (여기만 바꾸면 됨. 환경변수로도 덮어쓰기 가능) ────────────────────────
-SPLIT=${SPLIT:-train}                              # train | val | test
-STAGE=${STAGE:-both}                               # export | overlays | both
-CHECKPOINT=${CHECKPOINT:-weights/mtgs-vsgaze.ckpt} # graph 피처 추출용 체크포인트 (repo root 기준)
-NUM_PEOPLE=${NUM_PEOPLE:-all}                       # all(가변 N) | <정수>. all이면 export bs=1 강제
-BATCH_SIZE=${BATCH_SIZE:-4}                         # export 배치 (NUM_PEOPLE=all 이면 코드가 1로 강제)
-CACHE=${CACHE:-/home/jinwoongjung/MTGS/data/vlm_feature}   # 산출물 저장 루트
+SPLITS="train val test"              # 공백 구분 목록 → 하나의 GPU에서 순차 추출
+STAGE=both                               # export | overlays | both
+CHECKPOINT=/home/jinwoongjung/MTGS/experiments/2026-07-10/V18/train/checkpoints/best.ckpt # graph 피처 추출용 체크포인트 (repo root 기준)
+NUM_PEOPLE=all                       # all(가변 N) | <정수>. all이면 export bs=1 강제
+BATCH_SIZE=4                         # export 배치 (NUM_PEOPLE=all 이면 코드가 1로 강제)
+CACHE=/home/jinwoongjung/MTGS/data/vlm_feature   # 산출물 저장 루트
 # ─────────────────────────────────────────────────────────────────────────────
 
 # conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
@@ -49,35 +49,41 @@ set -e
 
 mkdir -p "$CACHE" /home/jinwoongjung/MTGS/scripts/logs
 
-echo "===== graph_extract: SPLIT=$SPLIT STAGE=$STAGE CKPT=$CHECKPOINT NUM_PEOPLE=$NUM_PEOPLE bs=$BATCH_SIZE ====="
+echo "===== graph_extract: SPLITS=($SPLITS) STAGE=$STAGE CKPT=$CHECKPOINT NUM_PEOPLE=$NUM_PEOPLE bs=$BATCH_SIZE ====="
 echo "===== out -> $CACHE ====="
 
 run_export () {
-  echo "----- [export] graph features: split=$SPLIT -----"
+  local split="$1"
+  echo "----- [export] graph features: split=$split -----"
   python -u -m vlm.graph_export \
-    --split "$SPLIT" \
+    --split "$split" \
     --ckpt "$CHECKPOINT" \
-    --out "$CACHE/vlmgraph_${SPLIT}.pt" \
+    --out "$CACHE/vlmgraph_${split}.pt" \
     --batch_size "$BATCH_SIZE" \
     --num_people "$NUM_PEOPLE"
-  echo "----- [export] done -> $CACHE/vlmgraph_${SPLIT}.pt -----"
+  echo "----- [export] done -> $CACHE/vlmgraph_${split}.pt -----"
 }
 
 run_overlays () {
-  echo "----- [overlays] plain frame.png + manifest + gtmeta: split=$SPLIT (CPU) -----"
+  local split="$1"
+  echo "----- [overlays] plain frame.png + manifest + gtmeta: split=$split (CPU) -----"
   python -u -m vlm.data_prep overlays \
-    --split "$SPLIT" \
+    --split "$split" \
     --out "$CACHE/overlays" \
-    --manifest "$CACHE/manifest_${SPLIT}.jsonl" \
-    --gtmeta "$CACHE/gtmeta_${SPLIT}.pt"
-  echo "----- [overlays] done -> $CACHE/overlays/$SPLIT, manifest_${SPLIT}.jsonl, gtmeta_${SPLIT}.pt -----"
+    --manifest "$CACHE/manifest_${split}.jsonl" \
+    --gtmeta "$CACHE/gtmeta_${split}.pt"
+  echo "----- [overlays] done -> $CACHE/overlays/$split, manifest_${split}.jsonl, gtmeta_${split}.pt -----"
 }
 
-case $STAGE in
-  export)   run_export ;;
-  overlays) run_overlays ;;                # 주의: overlays 는 CPU 전용. GPU 슬롯을 놀리므로 export 없이 단독이면 CPU 파티션 권장.
-  both)     run_export; run_overlays ;;
-  *)        echo "unknown STAGE=$STAGE (choices: export | overlays | both)"; exit 1 ;;
-esac
+for split in $SPLITS; do
+  echo "===== [split=$split] start ====="
+  case $STAGE in
+    export)   run_export "$split" ;;
+    overlays) run_overlays "$split" ;;      # 주의: overlays 는 CPU 전용. GPU 슬롯을 놀리므로 export 없이 단독이면 CPU 파티션 권장.
+    both)     run_export "$split"; run_overlays "$split" ;;
+    *)        echo "unknown STAGE=$STAGE (choices: export | overlays | both)"; exit 1 ;;
+  esac
+  echo "===== [split=$split] done ====="
+done
 
-echo "===== graph_extract DONE (SPLIT=$SPLIT STAGE=$STAGE) ====="
+echo "===== graph_extract DONE (SPLITS=($SPLITS) STAGE=$STAGE) ====="
