@@ -85,6 +85,17 @@ def test_text_mode_builds_text_prompt_and_text_evidence(tmp_path):
     assert item.draw_bboxes is True     # overlay enabled in text mode
 
 
+def test_text_mode_default_config_uses_plain_unmarked_images(tmp_path):
+    from vlm.pair_prompt import TEXT_MARKED_IDENTITY
+
+    ds = _make_generative_dataset(tmp_path, graph_evidence="text", draw_bboxes=False)
+    item = ds[0]
+
+    assert item.draw_bboxes is False
+    assert TEXT_MARKED_IDENTITY not in item.prompt
+    assert item.image.getpixel((70, 85)) == (0, 0, 0)
+
+
 def test_canonical_overlay_does_not_mutate_raw_image():
     raw = Image.new("RGB", (100, 100), "black")
     overlay = build_canonical_pair_overlay(

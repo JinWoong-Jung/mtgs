@@ -35,12 +35,11 @@ model:
     targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 input:
-  # text graph_evidence mode enables the red/blue A/B bbox overlay so the model can bind
-  # "Person A"/"Person B" visually. gtoken generative forces this off internally regardless
-  # of this setting (see PairInputDataset.draw_bboxes).
-  draw_bboxes: true
-  # Cross-pair vision reuse is implemented only for the legacy yesno collate.
-  # Disable these fields so experiment metadata does not imply it was used here.
+  # Plain (unmarked) images are required for cross-pair vision-encoding reuse: a red/blue
+  # A/B overlay changes the pixels for every pair. Person identity remains explicit through
+  # the normalized text bbox coordinates in each prompt.
+  draw_bboxes: false
+  # Reuse stays disabled until the text-generative path wires it end-to-end (Tasks 5-7).
   reuse_frozen_vision: false
   group_by_frame: false
   vision_cache_size: 0
