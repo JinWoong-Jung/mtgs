@@ -606,21 +606,14 @@ class _CachedVisionFrame:
     deepstack_features: tuple[torch.Tensor, ...]
 
 
-class PairSocialVLM(nn.Module):
-    """Qwen forward with six graph slots and one learned social-query readout token."""
+class _VisionReuseMixin:
+    """Reuse frozen per-frame Qwen vision features across pair text sequences.
 
-    def __init__(
-        self,
-        backbone: nn.Module,
-        token_ids: Mapping[str, int],
-        graph_dim: int = 256,
-        graph_hidden_dim: int = 1024,
-        heatmap_conv_dim: int = 128,
-        vision_cache_size: int = 0,
-    ):
-        super().__init__()
-        self.backbone = backbone
-        self.token_ids = dict(token_ids)
+    The cache and masked-scatter forward path require unmodified images. A subclass
+    must set ``self.backbone`` before calling ``_init_vision_reuse``.
+    """
+
+    def _init_vision_reuse(self, vision_cache_size: int) -> None:
         if vision_cache_size < 0:
             raise ValueError(
                 f"vision_cache_size must be non-negative, got {vision_cache_size}"
@@ -629,37 +622,7 @@ class PairSocialVLM(nn.Module):
         self._vision_cache: OrderedDict[str, _CachedVisionFrame] = OrderedDict()
         self._vision_cache_hits = 0
         self._vision_cache_misses = 0
-        hidden_dim = int(backbone.config.text_config.hidden_size)
-        embeddings = backbone.get_input_embeddings().weight
-        self.projector = PairEvidenceProjector(
-            graph_dim,
-            hidden_dim,
-            graph_hidden_dim=graph_hidden_dim,
-            heatmap_conv_dim=heatmap_conv_dim,
-        ).to(device=embeddings.device, dtype=embeddings.dtype)
-        with torch.no_grad():
-            text_rms = embeddings.float().pow(2).mean(-1).sqrt().mean().item()
-            social_id = self.token_ids[SOCIAL_RELATION_TOKEN]
-            social_init = embeddings[social_id].detach().clone()
-        self.projector.set_output_gain(text_rms)
-        self.social_query = nn.Parameter(social_init)
-        language_model = _find_language_model(backbone)
         self._multimodal_model: nn.Module | None = None
-        self._injector = _PairInjectionHook(language_model)
-        self._readout = _SocialReadoutHook(language_model)
-
-    def close(self) -> None:
-        self.clear_vision_cache()
-        self._injector.close()
-        self._readout.close()
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        # Cached outputs must not depend on dropout/stochastic training state. The
-        # vision tower is frozen by contract, so eval mode is correct in both phases.
-        if self.vision_cache_size:
-            self._vision_model().visual.eval()
-        return self
 
     def clear_vision_cache(self) -> None:
         self._vision_cache.clear()
@@ -841,6 +804,54 @@ class PairSocialVLM(nn.Module):
             deepstack_visual_embeds=deepstack,
             **kwargs,
         )
+
+
+class PairSocialVLM(_VisionReuseMixin, nn.Module):
+    """Qwen forward with six graph slots and one learned social-query readout token."""
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        token_ids: Mapping[str, int],
+        graph_dim: int = 256,
+        graph_hidden_dim: int = 1024,
+        heatmap_conv_dim: int = 128,
+        vision_cache_size: int = 0,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.token_ids = dict(token_ids)
+        self._init_vision_reuse(vision_cache_size)
+        hidden_dim = int(backbone.config.text_config.hidden_size)
+        embeddings = backbone.get_input_embeddings().weight
+        self.projector = PairEvidenceProjector(
+            graph_dim,
+            hidden_dim,
+            graph_hidden_dim=graph_hidden_dim,
+            heatmap_conv_dim=heatmap_conv_dim,
+        ).to(device=embeddings.device, dtype=embeddings.dtype)
+        with torch.no_grad():
+            text_rms = embeddings.float().pow(2).mean(-1).sqrt().mean().item()
+            social_id = self.token_ids[SOCIAL_RELATION_TOKEN]
+            social_init = embeddings[social_id].detach().clone()
+        self.projector.set_output_gain(text_rms)
+        self.social_query = nn.Parameter(social_init)
+        language_model = _find_language_model(backbone)
+        self._injector = _PairInjectionHook(language_model)
+        self._readout = _SocialReadoutHook(language_model)
+
+    def close(self) -> None:
+        self.clear_vision_cache()
+        self._injector.close()
+        self._readout.close()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Cached outputs must not depend on dropout/stochastic training state. The
+        # vision tower is frozen by contract, so eval mode is correct in both phases.
+        if self.vision_cache_size:
+            self._vision_model().visual.eval()
+        return self
 
     def get_output_embeddings(self) -> nn.Module:
         """Return Qwen's pretrained LM head for optional one-token supervision."""
