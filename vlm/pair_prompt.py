@@ -366,6 +366,118 @@ def validate_tokenized_pair_prompt(tokenizer: Any, text: str) -> None:
         raise ValueError("tokenized pair placeholders are out of fixed order")
 
 
+# ── Natural-language graph-evidence prompt (text mode) + yes/no answer ────────────────────
+TEXT_ROLE = (
+    "You are a vision assistant specializing in human gaze analysis, working alongside a "
+    "pretrained social-gaze graph model. The graph already produced the estimate(s) below, "
+    "but it was NOT confident — that is exactly why your visual judgment is needed here."
+)
+TEXT_MARKED_IDENTITY = (
+    "In this image Person A is marked with a RED box and Person B is marked with a BLUE box."
+)
+TEXT_CORRECTION = (
+    "Do not simply repeat the graph's estimate(s). Inspect the image and the head bounding "
+    "boxes yourself, and decide whether the relation actually holds — confirm, correct, or "
+    "override the graph's prediction as your visual evidence dictates."
+)
+TEXT_OUTPUT_INSTRUCTION = 'Answer with a single word, "yes" or "no".'
+
+TEXT_TASK_QUESTIONS = {
+    "lah": [
+        "Is Person A, located at {a}, looking at Person B, located at {b}?",
+        "Does Person A ({a}) appear to be looking at Person B ({b})?",
+        "Is Person A at {a} directing their gaze toward Person B at {b}?",
+    ],
+    "laeo": [
+        "Are Person A, located at {a}, and Person B, located at {b}, looking at one another?",
+        "Are Person A ({a}) and Person B ({b}) making eye contact?",
+        "Do Person A at {a} and Person B at {b} appear to look at each other?",
+    ],
+    "sa": [
+        "Are Person A, located at {a}, and Person B, located at {b}, looking at the same target?",
+        "Do Person A ({a}) and Person B ({b}) share attention on a common target?",
+        "Are Person A at {a} and Person B at {b} jointly attending to the same target?",
+    ],
+}
+
+_YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
+
+
+def _fmt_prob(p: float) -> str:
+    return f"{float(p):.2f}"
+
+
+def _fmt_box(box) -> str:
+    return str(_coords(box))
+
+
+def _text_evidence_block(evidence) -> str:
+    task = evidence.task
+    if task == "lah":
+        return f"Graph's uncertain estimate: P(Person A looks at Person B) = {_fmt_prob(evidence.p_ab)}"
+    if task == "laeo":
+        return "\n".join((
+            "Graph's uncertain estimates:",
+            f"- P(Person A looks at Person B) = {_fmt_prob(evidence.p_ab)}",
+            f"- P(Person B looks at Person A) = {_fmt_prob(evidence.p_ba)}",
+        ))
+    if task == "sa":
+        lines = ["Graph's uncertain estimates:"]
+        for name, person in (("Person A", evidence.person_a), ("Person B", evidence.person_b)):
+            if person.third_bbox is not None:
+                lines.append(
+                    f"- {name} most likely gazes at the person at {list(person.third_bbox)} "
+                    f"(probability {_fmt_prob(person.third_prob)}); probability of gazing at a "
+                    f"non-person location instead: {_fmt_prob(person.nonperson_prob)}"
+                )
+            else:
+                lines.append(
+                    f"- {name}: no other person is a likely gaze target; probability of gazing "
+                    f"at a non-person location: {_fmt_prob(person.nonperson_prob)}"
+                )
+        return "\n".join(lines)
+    raise ValueError(f"unknown social task {task!r}")
+
+
+def compose_text_prompt(task, box_a, box_b, evidence, *, draw_bboxes: bool = True, rng=None) -> str:
+    """Render the graph's predictions as natural-language sentences (text evidence mode)."""
+    if task not in TEXT_TASK_QUESTIONS:
+        raise ValueError(f"unknown social task {task!r}")
+    if evidence.task != task:
+        raise ValueError(f"evidence task {evidence.task!r} != prompt task {task!r}")
+    r = rng if rng is not None else random
+    question = r.choice(TEXT_TASK_QUESTIONS[task]).format(a=_fmt_box(box_a), b=_fmt_box(box_b))
+    parts = [TEXT_ROLE]
+    if draw_bboxes:
+        parts.append(TEXT_MARKED_IDENTITY)
+    parts.extend([question, _text_evidence_block(evidence), TEXT_CORRECTION, TEXT_OUTPUT_INSTRUCTION])
+    return "\n".join(parts)
+
+
+def generative_answer_yesno(label: int) -> str:
+    if label not in (0, 1):
+        raise ValueError(f"label must be 0 or 1, got {label!r}")
+    return "yes" if label == 1 else "no"
+
+
+def parse_yesno_probability(text: str, default: float = 0.5) -> float:
+    match = _YESNO_RE.search(text or "")
+    if match is None:
+        return float(default)
+    return 1.0 if match.group(1).lower() == "yes" else 0.0
+
+
+def validate_text_pair_prompt(task, box_a, box_b, evidence, *, draw_bboxes: bool = True) -> None:
+    text = compose_text_prompt(task, box_a, box_b, evidence, draw_bboxes=draw_bboxes,
+                               rng=random.Random(0))
+    if "Person A" not in text or "Person B" not in text:
+        raise ValueError("text prompt must name Person A and Person B")
+    if not text.rstrip().endswith(TEXT_OUTPUT_INSTRUCTION):
+        raise ValueError("text prompt must end with the yes/no output instruction")
+    if draw_bboxes and TEXT_MARKED_IDENTITY not in text:
+        raise ValueError("text prompt with draw_bboxes must include the red/blue identity line")
+
+
 for _task in SOCIAL_TASKS:
     validate_pair_prompt(_task)
     validate_pair_prompt(_task, draw_bboxes=False)

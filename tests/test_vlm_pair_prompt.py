@@ -159,3 +159,64 @@ def test_local_qwen_chat_template_preserves_all_pair_tokens():
     assert rendered.endswith(SOCIAL_RELATION_TOKEN)
     encoded = tokenizer.encode(rendered, add_special_tokens=False)
     assert encoded[-1] == pair_special_token_ids(tokenizer)[SOCIAL_RELATION_TOKEN]
+
+
+# ── Text prompt composition + yes/no answer (Task 2) ────────────────────────────
+import random
+from vlm.pair_features import TextGraphEvidence, PersonGazeText
+from vlm.pair_prompt import (
+    compose_text_prompt,
+    generative_answer_yesno,
+    parse_yesno_probability,
+    validate_text_pair_prompt,
+)
+
+BOX_A = [0.12, 0.18, 0.26, 0.42]
+BOX_B = [0.58, 0.21, 0.73, 0.46]
+
+
+def test_text_prompt_lah_has_ab_labels_prob_and_correction_framing():
+    ev = TextGraphEvidence(task="lah", p_ab=0.82)
+    text = compose_text_prompt("lah", BOX_A, BOX_B, ev, rng=random.Random(0))
+    assert "Person A" in text and "Person B" in text
+    assert "0.82" in text                       # rendered probability
+    assert "0.12" in text and "0.58" in text    # both bboxes present
+    assert "not confident" in text.lower() or "uncertain" in text.lower()
+    assert "yes" in text.lower() and "no" in text.lower()   # output instruction
+    validate_text_pair_prompt("lah", BOX_A, BOX_B, ev)
+
+
+def test_text_prompt_laeo_shows_both_directions():
+    ev = TextGraphEvidence(task="laeo", p_ab=0.82, p_ba=0.61)
+    text = compose_text_prompt("laeo", BOX_A, BOX_B, ev, rng=random.Random(0))
+    assert "0.82" in text and "0.61" in text
+
+
+def test_text_prompt_sa_includes_third_person_bbox_and_nonperson():
+    ev = TextGraphEvidence(
+        task="sa",
+        person_a=PersonGazeText((0.6, 0.1, 0.7, 0.3), 0.35, 0.58),
+        person_b=PersonGazeText((0.05, 0.3, 0.16, 0.4), 0.20, 0.71),
+    )
+    text = compose_text_prompt("sa", BOX_A, BOX_B, ev, rng=random.Random(0))
+    assert "0.35" in text and "0.58" in text and "0.20" in text and "0.71" in text
+    assert "0.6" in text                          # third-person bbox coordinate
+
+
+def test_text_prompt_sa_without_third_person_omits_that_clause():
+    ev = TextGraphEvidence(
+        task="sa",
+        person_a=PersonGazeText(None, None, 0.58),
+        person_b=PersonGazeText(None, None, 0.71),
+    )
+    text = compose_text_prompt("sa", BOX_A, BOX_B, ev, rng=random.Random(0))
+    assert "0.58" in text and "0.71" in text
+    validate_text_pair_prompt("sa", BOX_A, BOX_B, ev)
+
+
+def test_yesno_answer_and_parser():
+    assert generative_answer_yesno(1) == "yes"
+    assert generative_answer_yesno(0) == "no"
+    assert parse_yesno_probability("yes") == 1.0
+    assert parse_yesno_probability("no") == 0.0
+    assert parse_yesno_probability("maybe", default=0.5) == 0.5
