@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from vlm.pair_head import PairGenerativeObjective, answer_loglik
-from vlm.pair_model import GraphTokenProjector, graph_token_masks
+from vlm.pair_model import GraphTokenProjector, TextGenerativeVLM, graph_token_masks
 from vlm.pair_prompt import (
     FINAL_PROBABILITY_QUESTION,
     GRAPH_EVIDENCE_INTRO,
@@ -85,3 +85,43 @@ def test_answer_loglik_and_score():
     prob = obj.score({"labels": lab}, num_pairs)
     assert prob.shape == (num_pairs,)
     assert bool(((prob >= 0) & (prob <= 1)).all())
+
+
+class _StubBackbone(torch.nn.Module):
+    """Minimal backbone: returns .loss and .logits, ignores vision/graph kwargs."""
+    def __init__(self, vocab=32):
+        super().__init__()
+        self.vocab = vocab
+        self.lin = torch.nn.Embedding(vocab, vocab)
+
+    def forward(self, input_ids=None, labels=None, **kw):
+        logits = self.lin(input_ids)                      # [B,L,V]
+        out = type("O", (), {})()
+        out.logits = logits
+        out.loss = None
+        if labels is not None:
+            shift = logits[:, :-1].reshape(-1, self.vocab)
+            tgt = labels[:, 1:].reshape(-1)
+            out.loss = torch.nn.functional.cross_entropy(shift, tgt.clamp_min(0),
+                                                          ignore_index=-100)
+        return out
+
+
+def test_text_generative_vlm_runs_without_graph_features():
+    vlm = TextGenerativeVLM(_StubBackbone())
+    inp = {"input_ids": torch.randint(0, 32, (2, 6)),
+           "labels": torch.randint(0, 32, (2, 6))}
+    out = vlm(inp)
+    assert out.logits.shape == (2, 6, 32)
+    assert out.loss is not None
+
+
+def test_text_objective_score_returns_probability_per_pair():
+    vlm = TextGenerativeVLM(_StubBackbone())
+    obj = PairGenerativeObjective(vlm)
+    # 2 pairs -> [2B]=4 rows: pos_0,pos_1,neg_0,neg_1
+    inp = {"input_ids": torch.randint(0, 32, (4, 6)),
+           "labels": torch.randint(0, 32, (4, 6))}
+    prob = obj.score(inp, num_pairs=2)
+    assert prob.shape == (2,)
+    assert torch.all((prob >= 0) & (prob <= 1))

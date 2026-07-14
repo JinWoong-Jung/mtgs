@@ -20,6 +20,7 @@ from vlm.pair_prompt import (
     SOCIAL_RELATION_TOKEN,
     add_pair_special_tokens,
     generative_answer_json,
+    generative_answer_yesno,
     pair_special_token_ids,
     social_readout_prompt,
     task_conditioned_pair_instruction,
@@ -364,6 +365,97 @@ class PairGenerativeVLM(nn.Module):
         if self._injector.calls != 1:
             raise RuntimeError(f"pair injection hook ran {self._injector.calls} times, expected once")
         return output
+
+
+def _text_generative_collate(processor: Any, answers_for):
+    """Shared body for text-mode SFT / eval collates. ``answers_for(items)`` yields the
+    ordered (answer_text, item) pairs to teacher-force; no graph feature tensors are added."""
+    processor.tokenizer.padding_side = "right"
+
+    def collate(items: Sequence[PairVLMInput]) -> dict[str, Any]:
+        if not items:
+            raise ValueError("cannot collate an empty pair batch")
+        images, prompt_texts, full_texts = [], [], []
+        for answer, item in answers_for(items):
+            user = _user_message(item)
+            images.append(item.image)
+            prompt_texts.append(processor.apply_chat_template(
+                [user], tokenize=False, add_generation_prompt=True))
+            full_texts.append(processor.apply_chat_template(
+                [user, {"role": "assistant", "content": [{"type": "text", "text": answer}]}],
+                tokenize=False))
+        prompt_enc = processor(text=prompt_texts, images=images, return_tensors="pt", padding=True)
+        prompt_lens = prompt_enc["attention_mask"].sum(dim=1)
+        encoded = processor(text=full_texts, images=images, return_tensors="pt", padding=True)
+        out = dict(encoded)
+        labels = out["input_ids"].clone()
+        labels[out["attention_mask"] == 0] = -100
+        for i, plen in enumerate(prompt_lens.tolist()):
+            labels[i, :plen] = -100
+        out["labels"] = labels
+        return out
+
+    return collate
+
+
+def make_text_generative_collate(processor: Any):
+    """Text-mode SFT: one sequence per pair, target = the pair's own yes/no answer."""
+    base = _text_generative_collate(
+        processor, lambda items: [(generative_answer_yesno(int(it.annotation.label)), it)
+                                  for it in items])
+
+    def collate(items: Sequence[PairVLMInput]) -> dict[str, Any]:
+        out = base(items)
+        out["task_ids"] = torch.tensor(
+            [SOCIAL_TASK_ID[it.annotation.task] for it in items], dtype=torch.long)
+        out["pair_labels"] = torch.tensor(
+            [it.annotation.label for it in items], dtype=torch.float32)
+        out["eval_keys"] = [it.annotation.eval_key for it in items]
+        return out
+
+    return collate
+
+
+def make_text_generative_eval_collate(processor: Any):
+    """Text-mode eval: [2B] rows = yes-candidate for every pair, then no-candidate."""
+    def answers_for(items):
+        return ([("yes", it) for it in items] + [("no", it) for it in items])
+    base = _text_generative_collate(processor, answers_for)
+
+    def collate(items: Sequence[PairVLMInput]) -> dict[str, Any]:
+        out = base(items)
+        out["pair_labels"] = torch.tensor(
+            [it.annotation.label for it in items], dtype=torch.float32)
+        out["eval_keys"] = [it.annotation.eval_key for it in items]
+        out["num_pairs"] = len(items)
+        return out
+
+    return collate
+
+
+class TextGenerativeVLM(nn.Module):
+    """Generative pair model with NO graph soft-token injection: the graph evidence is
+    already natural-language text inside the prompt. Wraps the frozen+LoRA backbone so
+    ``PairGenerativeObjective`` can SFT it to emit yes/no and score candidates."""
+
+    def __init__(self, backbone: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+
+    def close(self) -> None:
+        pass
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.backbone.get_output_embeddings()
+
+    def forward(self, model_inputs: Mapping[str, torch.Tensor]):
+        device = next(self.backbone.parameters()).device
+        kwargs = {
+            key: (value.to(device) if torch.is_tensor(value) else value)
+            for key, value in model_inputs.items() if key not in _NON_MODEL_KEYS
+        }
+        kwargs.update({"output_hidden_states": False, "return_dict": True, "use_cache": False})
+        return self.backbone(**kwargs)
 
 
 def placeholder_masks(
