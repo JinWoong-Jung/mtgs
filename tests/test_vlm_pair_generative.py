@@ -125,3 +125,38 @@ def test_text_objective_score_returns_probability_per_pair():
     prob = obj.score(inp, num_pairs=2)
     assert prob.shape == (2,)
     assert torch.all((prob >= 0) & (prob <= 1))
+
+
+def test_text_score_prefers_yes_when_backbone_prefers_yes():
+    """logP(yes)-logP(no) sign wiring: a backbone that always emits high logit for a fixed
+    'yes' token id must score the yes-candidate above the no-candidate."""
+    import torch
+    from vlm.pair_head import PairGenerativeObjective
+    from vlm.pair_model import TextGenerativeVLM
+
+    YES_ROW, NO_ROW = 5, 6      # pretend token ids; yes-candidate label row uses YES_ROW
+
+    class Prefer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # TextGenerativeVLM.forward resolves the target device via
+            # next(self.backbone.parameters()); real backbones (Qwen etc.) always have
+            # parameters, so give the stub one inert buffer-like param to match that contract.
+            self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, input_ids=None, labels=None, **kw):
+            B, L = input_ids.shape
+            logits = torch.zeros(B, L, 8)
+            logits[..., YES_ROW] = 3.0        # always confident about the yes token
+            out = type("O", (), {})()
+            out.logits, out.loss = logits, None
+            return out
+
+    obj = PairGenerativeObjective(TextGenerativeVLM(Prefer()))
+    # pair 0: yes-candidate labels point at YES_ROW; no-candidate at NO_ROW
+    labels = torch.full((2, 4), -100)
+    labels[0, 1:] = YES_ROW      # positive (yes) candidate
+    labels[1, 1:] = NO_ROW       # negative (no) candidate
+    inp = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "labels": labels}
+    prob = obj.score(inp, num_pairs=1)
+    assert prob.item() > 0.5

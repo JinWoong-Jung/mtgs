@@ -4,11 +4,12 @@ import torch
 from vlm.pair_head import (
     GraphFeatureMLPControl,
     GraphLogitMLPControl,
+    PairGenerativeObjective,
     PairSocialObjective,
     PairTaskBCELoss,
     PairTaskResidualDecoder,
 )
-from vlm.pair_model import PairSocialVLM
+from vlm.pair_model import PairSocialVLM, TextGenerativeVLM
 from vlm.pair_features import PairGraphBatch
 from vlm.pair_eval import PairPredictionCollector
 from vlm.pair_prompt import PAIR_SPECIAL_TOKENS
@@ -371,6 +372,33 @@ def test_actual_tiny_qwen_peft_keeps_only_lora_and_new_modules_trainable():
         )
     finally:
         objective.close()
+
+
+def test_partition_vlm_parameters_text_mode_has_empty_new_group_and_no_overlap():
+    """Text graph-evidence mode has no soft-token projector: partition_vlm_parameters must
+    special-case TextGenerativeVLM to an empty 'new' group (see vlm/train_pair.py branch on
+    isinstance(objective.vlm, TextGenerativeVLM)), with only LoRA-tagged params trainable."""
+
+    class _LoraStubBackbone(torch.nn.Module):
+        """Minimal frozen-base + LoRA-tagged-param backbone; mirrors how peft names LoRA
+        adapter params (substring 'lora_') which partition_vlm_parameters keys off of."""
+
+        def __init__(self):
+            super().__init__()
+            self.base = torch.nn.Linear(4, 4)
+            self.base.requires_grad_(False)
+            self.lora_A = torch.nn.Parameter(torch.randn(4, 2))
+            self.lora_B = torch.nn.Parameter(torch.randn(2, 4))
+
+        def forward(self, input_ids=None, labels=None, **kw):
+            raise NotImplementedError("partition_vlm_parameters never calls forward")
+
+    vlm = TextGenerativeVLM(_LoraStubBackbone())
+    objective = PairGenerativeObjective(vlm)
+    lora, new = partition_vlm_parameters(objective)
+    assert len(lora) == 2
+    assert new == []
+    assert not ({id(parameter) for parameter in lora} & {id(parameter) for parameter in new})
 
 
 def test_graph_evidence_config_selects_text_collate(monkeypatch):
