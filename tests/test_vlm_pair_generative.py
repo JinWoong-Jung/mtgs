@@ -277,3 +277,89 @@ def test_text_score_prefers_yes_when_backbone_prefers_yes():
     inp = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "labels": labels}
     prob = obj.score(inp, num_pairs=1)
     assert prob.item() > 0.5
+
+
+def test_text_generative_vlm_reuse_matches_no_reuse_numerically():
+    """Frozen-vision reuse must preserve answer-position logits exactly enough."""
+    transformers = pytest.importorskip("transformers")
+    peft = pytest.importorskip("peft")
+    model_root = Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct"
+    snapshots = sorted((model_root / "snapshots").glob("*"))
+    if not snapshots:
+        pytest.skip("local Qwen3-VL processor cache is unavailable")
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        snapshots[-1], local_files_only=True
+    )
+    base_config = transformers.AutoConfig.from_pretrained(
+        snapshots[-1], local_files_only=True
+    )
+    config = transformers.Qwen3VLConfig(
+        text_config={
+            "vocab_size": len(processor.tokenizer),
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "head_dim": 8,
+            "max_position_embeddings": 2048,
+            "pad_token_id": processor.tokenizer.pad_token_id,
+        },
+        vision_config={
+            "depth": 2,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_heads": 4,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "out_hidden_size": 32,
+            "num_position_embeddings": 2304,
+            "deepstack_visual_indexes": (0, 1),
+        },
+        image_token_id=base_config.image_token_id,
+        video_token_id=base_config.video_token_id,
+        vision_start_token_id=base_config.vision_start_token_id,
+        vision_end_token_id=base_config.vision_end_token_id,
+    )
+    model = transformers.Qwen3VLForConditionalGeneration(config)
+    model.requires_grad_(False)
+    targets = [
+        name
+        for name, _ in model.named_modules()
+        if "language_model" in name
+        and name.rsplit(".", 1)[-1] in {"q_proj", "v_proj"}
+    ]
+    backbone = peft.get_peft_model(
+        model,
+        peft.LoraConfig(
+            r=2,
+            lora_alpha=4,
+            lora_dropout=0.0,
+            target_modules=targets,
+            task_type="CAUSAL_LM",
+        ),
+    )
+    wrapper = TextGenerativeVLM(backbone, vision_cache_size=4).eval()
+    items = [_unmarked_text_item(), _unmarked_text_item()]
+    plain_batch = make_text_generative_collate(processor, reuse_vision=False)(items)
+    reused_batch = make_text_generative_collate(processor, reuse_vision=True)(items)
+
+    try:
+        assert torch.equal(plain_batch["input_ids"], reused_batch["input_ids"])
+        assert torch.equal(plain_batch["labels"], reused_batch["labels"])
+        with torch.no_grad():
+            plain = wrapper(plain_batch)
+            reused = wrapper(reused_batch)
+
+        # Causal logits at t-1 predict the supervised answer token at t.
+        answer_mask = plain_batch["labels"][:, 1:] != -100
+        plain_answer_logits = plain.logits[:, :-1][answer_mask]
+        reused_answer_logits = reused.logits[:, :-1][answer_mask]
+        torch.testing.assert_close(
+            reused_answer_logits, plain_answer_logits, rtol=1e-4, atol=1e-4
+        )
+        assert wrapper.vision_cache_info() == (0, 1, 4, 1)
+    finally:
+        wrapper.close()
