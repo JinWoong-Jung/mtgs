@@ -400,6 +400,14 @@ TEXT_TASK_QUESTIONS = {
     ],
 }
 
+# Repeating the task immediately before the answer instruction keeps the final readout
+# anchored on the requested relation after the longer graph-evidence block.
+TEXT_FINAL_QUESTIONS = {
+    "lah": "Final question: Is Person A looking at Person B?",
+    "laeo": "Final question: Are Person A and Person B looking at one another?",
+    "sa": "Final question: Are Person A and Person B looking at the same target?",
+}
+
 _YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 
 
@@ -450,7 +458,13 @@ def compose_text_prompt(task, box_a, box_b, evidence, *, draw_bboxes: bool = Tru
     parts = [TEXT_ROLE]
     if draw_bboxes:
         parts.append(TEXT_MARKED_IDENTITY)
-    parts.extend([question, _text_evidence_block(evidence), TEXT_CORRECTION, TEXT_OUTPUT_INSTRUCTION])
+    parts.extend([
+        question,
+        _text_evidence_block(evidence),
+        TEXT_CORRECTION,
+        TEXT_FINAL_QUESTIONS[task],
+        TEXT_OUTPUT_INSTRUCTION,
+    ])
     return "\n".join(parts)
 
 
@@ -474,6 +488,8 @@ def validate_text_pair_prompt(task, box_a, box_b, evidence, *, draw_bboxes: bool
         raise ValueError("text prompt must name Person A and Person B")
     if not text.rstrip().endswith(TEXT_OUTPUT_INSTRUCTION):
         raise ValueError("text prompt must end with the yes/no output instruction")
+    if f"{TEXT_FINAL_QUESTIONS[task]}\n{TEXT_OUTPUT_INSTRUCTION}" not in text:
+        raise ValueError("text prompt must repeat the final task question before answering")
     if draw_bboxes and TEXT_MARKED_IDENTITY not in text:
         raise ValueError("text prompt with draw_bboxes must include the red/blue identity line")
 

@@ -190,6 +190,10 @@ def test_text_prompt_laeo_shows_both_directions():
     ev = TextGraphEvidence(task="laeo", p_ab=0.82, p_ba=0.61)
     text = compose_text_prompt("laeo", BOX_A, BOX_B, ev, rng=random.Random(0))
     assert "0.82" in text and "0.61" in text
+    assert text.endswith(
+        'Final question: Are Person A and Person B looking at one another?\n'
+        'Answer with a single word, "yes" or "no".'
+    )
 
 
 def test_text_prompt_sa_includes_third_person_bbox_and_nonperson():
