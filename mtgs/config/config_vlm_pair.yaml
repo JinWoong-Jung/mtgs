@@ -54,12 +54,11 @@ loss:
   lm_aux_weight: 0.0
 
 routing:
-  # Confidence-gated routing: the frozen graph answers high-confidence pairs directly and the
-  # VLM is queried only on the low-confidence remainder. Confidence is max(p, 1-p) of the frozen
-  # graph logit. On VSGaze test ~63% of pairs are conf>=0.9 at 96-99% accuracy, so this cuts
-  # VLM forwards (train sampling + val/test eval) ~63% with negligible metric loss.
-  use: true
-  threshold: 0.9      # max(p,1-p) scale, in [0.5, 1]; lower = more pairs sent to the VLM
+  # Confidence-gated routing is OFF for training and evaluation: the VLM scores every pair,
+  # so reported metrics come from one calibrated source. Mixing graph logits and VLM margins
+  # is reserved for a future serving-time cost optimization evaluated separately.
+  use: false
+  threshold: 0.8      # retained for optional future serving-time routing
 
 sampler:
   # EyeVLM-style balanced re-sampling: task_label makes pos/neg EVEN across the 3 tasks.
@@ -75,9 +74,8 @@ train:
   # Effective batch = 16. Increase only after the first forward/backward confirms memory headroom.
   bs: 16
   accum: 1
-  # Routing removes the easy high-confidence majority from training, so a smaller budget keeps
-  # the same information per epoch. Set back to 60000 to keep full epoch time (option A).
-  samples_per_epoch: 30000
+  # Routing no longer shrinks the training population, so restore the full epoch budget.
+  samples_per_epoch: 60000
   num_workers: 6
   raw_image_cache_size: 16
   seed: 101

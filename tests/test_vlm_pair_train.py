@@ -81,6 +81,13 @@ def test_optimizer_step_count_handles_partial_accumulation_group():
     assert optimizer_steps_per_epoch(8, batch_size=4, accumulation=2) == 1
 
 
+def test_route_threshold_none_when_routing_disabled():
+    from vlm.train_pair import _route_threshold
+
+    cfg = {"routing": {"use": False, "threshold": 0.8}}
+    assert _route_threshold(cfg) is None
+
+
 def test_epoch_sampler_is_deterministic_per_seed_and_epoch():
     dataset = _TinyControlDataset()
     weights = torch.ones(len(dataset), dtype=torch.double)

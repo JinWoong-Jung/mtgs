@@ -233,6 +233,35 @@ def test_sampler_balance_hardness_and_pos_weights(tmp_path):
     }
 
 
+def test_pair_sample_weights_task_label_balance_unaffected_by_route_threshold_none(
+    tmp_path,
+):
+    manifest = tmp_path / "manifest.jsonl"
+    records = [
+        {"sid": "s0", "task": "lah", "i": 0, "j": 1, "ans": "yes"},
+        {"sid": "s0", "task": "lah", "i": 1, "j": 0, "ans": "no"},
+        {"sid": "s0", "task": "laeo", "i": 0, "j": 1, "ans": "yes"},
+        {"sid": "s0", "task": "laeo", "i": 1, "j": 0, "ans": "no"},
+        {"sid": "s0", "task": "sa", "i": 0, "j": 1, "ans": "yes"},
+        {"sid": "s0", "task": "sa", "i": 1, "j": 0, "ans": "no"},
+    ]
+    manifest.write_text("".join(json.dumps(record) + "\n" for record in records))
+    dataset = GraphControlDataset(manifest, {"s0": _fake_graph_cache()})
+
+    default_weights = pair_sample_weights(
+        dataset.annotations,
+        dataset.graph_cache,
+        balance_mode="task_label",
+    )
+    explicit_none_weights = pair_sample_weights(
+        dataset.annotations,
+        dataset.graph_cache,
+        balance_mode="task_label",
+        route_threshold=None,
+    )
+    torch.testing.assert_close(default_weights, explicit_none_weights)
+
+
 def test_confidence_routing_partitions_and_zeroes_high_confidence_weights(tmp_path):
     manifest = tmp_path / "manifest.jsonl"
     # lah(0,1) logit=1.0 -> conf 0.73 (low). sa/laeo symmetrize to logit>=11.5 -> conf ~1 (high).
