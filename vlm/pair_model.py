@@ -459,17 +459,66 @@ def make_text_generative_collate(processor: Any, *, reuse_vision: bool = False):
     return collate
 
 
-def make_text_generative_eval_collate(processor: Any):
-    """Text-mode eval: [2B] rows = yes-candidate for every pair, then no-candidate."""
-    def answers_for(items):
-        return ([("yes", it) for it in items] + [("no", it) for it in items])
-    base = _text_generative_collate(processor, answers_for)
+def make_text_generative_eval_collate(
+    processor: Any, *, reuse_vision: bool = False
+):
+    """Build [yes_0..yes_B-1, no_0..no_B-1], optionally reusing each frame once."""
+    processor.tokenizer.padding_side = "right"
 
     def collate(items: Sequence[PairVLMInput]) -> dict[str, Any]:
-        out = base(items)
+        if not items:
+            raise ValueError("cannot collate an empty pair batch")
+        ordered = (
+            [("yes", item) for item in items]
+            + [("no", item) for item in items]
+        )
+        expanded_items = [item for _, item in ordered]
+        prompt_texts, full_texts = [], []
+        for answer, item in ordered:
+            user = _user_message(item)
+            prompt_texts.append(
+                processor.apply_chat_template(
+                    [user], tokenize=False, add_generation_prompt=True
+                )
+            )
+            full_texts.append(
+                processor.apply_chat_template(
+                    [
+                        user,
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": answer}],
+                        },
+                    ],
+                    tokenize=False,
+                )
+            )
+        if reuse_vision:
+            prompt_enc = _encode_reused_frame_batch(
+                processor, prompt_texts, expanded_items
+            )
+            encoded = _encode_reused_frame_batch(
+                processor, full_texts, expanded_items
+            )
+        else:
+            images = [item.image for item in expanded_items]
+            prompt_enc = processor(
+                text=prompt_texts, images=images, return_tensors="pt", padding=True
+            )
+            encoded = processor(
+                text=full_texts, images=images, return_tensors="pt", padding=True
+            )
+        prompt_lens = prompt_enc["attention_mask"].sum(dim=1)
+        out = dict(encoded)
+        labels = out["input_ids"].clone()
+        labels[out["attention_mask"] == 0] = -100
+        for index, prompt_len in enumerate(prompt_lens.tolist()):
+            labels[index, :prompt_len] = -100
+        out["labels"] = labels
         out["pair_labels"] = torch.tensor(
-            [it.annotation.label for it in items], dtype=torch.float32)
-        out["eval_keys"] = [it.annotation.eval_key for it in items]
+            [item.annotation.label for item in items], dtype=torch.float32
+        )
+        out["eval_keys"] = [item.annotation.eval_key for item in items]
         out["num_pairs"] = len(items)
         return out
 

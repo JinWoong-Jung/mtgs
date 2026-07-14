@@ -16,6 +16,7 @@ from vlm.pair_model import (
     TextGenerativeVLM,
     graph_token_masks,
     make_text_generative_collate,
+    make_text_generative_eval_collate,
 )
 from vlm.pair_prompt import (
     FINAL_PROBABILITY_QUESTION,
@@ -180,16 +181,19 @@ def test_text_generative_reuse_forward_returns_logits_and_next_token_ce():
         vlm.close()
 
 
-def test_make_text_generative_collate_reuse_flag_produces_vision_reuse_keys():
+def _local_qwen_processor():
     transformers = pytest.importorskip("transformers")
     model_root = Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct"
     snapshots = sorted((model_root / "snapshots").glob("*"))
     if not snapshots:
         pytest.skip("local Qwen3-VL processor cache is unavailable")
-    processor = transformers.AutoProcessor.from_pretrained(
+    return transformers.AutoProcessor.from_pretrained(
         snapshots[-1], local_files_only=True
     )
-    item = PairVLMInput(
+
+
+def _unmarked_text_item():
+    return PairVLMInput(
         annotation=PairSample(
             sid="tiny",
             task="lah",
@@ -206,9 +210,26 @@ def test_make_text_generative_collate_reuse_flag_produces_vision_reuse_keys():
         vision_cache_key="/split/tiny/frame.png",
     )
 
+
+def test_make_text_generative_collate_reuse_flag_produces_vision_reuse_keys():
+    processor = _local_qwen_processor()
+    item = _unmarked_text_item()
+
     batch = make_text_generative_collate(processor, reuse_vision=True)([item, item])
 
     assert batch["vision_reuse_indices"].tolist() == [0, 0]
+    assert batch["vision_unique_grid_thw"].shape == (1, 3)
+    assert batch["vision_frame_ids"] == ("/split/tiny/frame.png",)
+
+
+def test_make_text_generative_eval_collate_reuse_dedups_across_2b_candidates():
+    processor = _local_qwen_processor()
+    item = _unmarked_text_item()
+
+    batch = make_text_generative_eval_collate(processor, reuse_vision=True)([item, item])
+
+    assert batch["num_pairs"] == 2
+    assert batch["vision_reuse_indices"].tolist() == [0, 0, 0, 0]
     assert batch["vision_unique_grid_thw"].shape == (1, 3)
     assert batch["vision_frame_ids"] == ("/split/tiny/frame.png",)
 
