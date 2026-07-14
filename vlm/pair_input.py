@@ -274,8 +274,8 @@ def partition_by_graph_confidence(
 ) -> tuple[list[int], list[int]]:
     """Split pair indices into ``(high_confidence, low_confidence)`` by graph confidence.
 
-    High-confidence pairs (``conf >= threshold``) are answered by the frozen graph, so the
-    VLM is queried only on the low-confidence remainder. ``threshold`` is on the ``max(p,1-p)``
+    Pairs with ``conf > threshold`` are answered by the frozen graph, so the VLM is queried
+    for the ``conf <= threshold`` remainder. ``threshold`` is on the ``max(p,1-p)``
     scale, hence in [0.5, 1].
     """
     if not 0.5 <= threshold <= 1.0:
@@ -283,7 +283,7 @@ def partition_by_graph_confidence(
     high: list[int] = []
     low: list[int] = []
     for index, sample in enumerate(annotations):
-        if graph_confidence(sample, graph_cache[sample.sid]) >= threshold:
+        if graph_confidence(sample, graph_cache[sample.sid]) > threshold:
             high.append(index)
         else:
             low.append(index)

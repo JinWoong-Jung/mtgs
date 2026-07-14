@@ -262,3 +262,17 @@ def test_confidence_routing_partitions_and_zeroes_high_confidence_weights(tmp_pa
         )
     with pytest.raises(ValueError, match="threshold must be in"):
         partition_by_graph_confidence(dataset.annotations, dataset.graph_cache, 1.5)
+
+
+def test_confidence_routing_sends_exact_threshold_to_vlm(tmp_path):
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("{\"sid\":\"s0\",\"task\":\"lah\",\"i\":0,\"j\":1,\"ans\":\"yes\"}\n")
+    cache = _fake_graph_cache()
+    dataset = GraphControlDataset(manifest, {"s0": cache})
+    cache["lah_logits"].zero_()  # conf = 0.5 exactly, so this pair goes to the VLM.
+
+    high, low = partition_by_graph_confidence(
+        dataset.annotations, dataset.graph_cache, 0.5
+    )
+    assert high == []
+    assert low == [0]
