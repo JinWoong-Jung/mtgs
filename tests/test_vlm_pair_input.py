@@ -4,7 +4,6 @@ import pytest
 import torch
 from PIL import Image
 
-from vlm.overlay import build_canonical_pair_overlay
 from vlm.pair_features import TextGraphEvidence
 from vlm.pair_input import (
     GraphControlDataset,
@@ -60,7 +59,7 @@ def _write_manifest(path):
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
 
-def _make_generative_dataset(tmp_path, *, graph_evidence="gtoken", draw_bboxes=True):
+def _make_generative_dataset(tmp_path, *, graph_evidence="gtoken"):
     frame_root = tmp_path / "frames"
     _write_frame(frame_root, "s0")
     manifest = tmp_path / "manifest.jsonl"
@@ -72,38 +71,20 @@ def _make_generative_dataset(tmp_path, *, graph_evidence="gtoken", draw_bboxes=T
         graph,
         output_mode="generative",
         graph_evidence=graph_evidence,
-        draw_bboxes=draw_bboxes,
     )
 
 
-def test_text_mode_builds_text_prompt_and_text_evidence(tmp_path):
-    ds = _make_generative_dataset(tmp_path, graph_evidence="text", draw_bboxes=True)
+def test_text_mode_builds_text_prompt_and_evidence_on_plain_image(tmp_path):
+    ds = _make_generative_dataset(tmp_path, graph_evidence="text")
     item = ds[0]
+
     assert isinstance(item.evidence, TextGraphEvidence)
     assert "Person A" in item.prompt and "Person B" in item.prompt
-    assert item.prompt.rstrip().endswith('Answer with a single word, "yes" or "no".')
-    assert item.draw_bboxes is True     # overlay enabled in text mode
-
-
-def test_text_mode_default_config_uses_plain_unmarked_images(tmp_path):
-    from vlm.pair_prompt import TEXT_MARKED_IDENTITY
-
-    ds = _make_generative_dataset(tmp_path, graph_evidence="text", draw_bboxes=False)
-    item = ds[0]
-
-    assert item.draw_bboxes is False
-    assert TEXT_MARKED_IDENTITY not in item.prompt
-    assert item.image.getpixel((70, 85)) == (0, 0, 0)
-
-
-def test_canonical_overlay_does_not_mutate_raw_image():
-    raw = Image.new("RGB", (100, 100), "black")
-    overlay = build_canonical_pair_overlay(
-        raw, [0.60, 0.60, 0.85, 0.85], [0.10, 0.10, 0.35, 0.35]
+    assert item.prompt.rstrip().endswith(
+        'Answer with a single word, "yes" or "no".'
     )
-    assert raw.getpixel((70, 85)) == (0, 0, 0)
-    assert overlay.getpixel((70, 85)) == (255, 0, 0)
-    assert overlay.getpixel((35, 30)) == (0, 0, 255)
+    assert "marked with a RED box" not in item.prompt
+    assert item.image.getpixel((70, 85)) == (0, 0, 0)
 
 
 def test_pair_dataset_uses_task_text_canonical_boxes_and_raw_lru(tmp_path):
@@ -123,35 +104,14 @@ def test_pair_dataset_uses_task_text_canonical_boxes_and_raw_lru(tmp_path):
     assert lah.prompt != sa.prompt
     assert TASK_DEFINITIONS["lah"] in lah.prompt
     assert TASK_DEFINITIONS["sa"] in sa.prompt
-    assert lah.image.getpixel((70, 85)) == (255, 0, 0)  # LAH looker 1 = A/red
-    assert lah.image.getpixel((35, 30)) == (0, 0, 255)  # LAH target 0 = B/blue
+    assert lah.image.getpixel((70, 85)) == (0, 0, 0)
+    assert lah.image.getpixel((35, 30)) == (0, 0, 0)
     assert lah.evidence.task == "lah" and sa.evidence.task == "sa"
-    assert lah.image is not sa.image
+    assert lah.image is sa.image
     assert dataset.frames.cache_info() == (1, 1, 2, 1)
     assert dataset.raw_frame_path(0) == frame_root / "s0" / "frame.png"
     with Image.open(dataset.raw_frame_path(0)) as raw:
         assert raw.convert("RGB").getpixel((70, 85)) == (0, 0, 0)
-
-
-def test_unmarked_pair_dataset_reuses_the_raw_frame_object(tmp_path):
-    frame_root = tmp_path / "frames"
-    _write_frame(frame_root, "s0")
-    manifest = tmp_path / "manifest.jsonl"
-    _write_manifest(manifest)
-    dataset = PairInputDataset(
-        manifest,
-        frame_root,
-        {"s0": _fake_graph_cache()},
-        raw_image_cache_size=2,
-        draw_bboxes=False,
-    )
-    lah = dataset[0]
-    sa = dataset[1]
-    assert not lah.draw_bboxes and not sa.draw_bboxes
-    assert lah.image is sa.image
-    assert lah.image.getpixel((70, 85)) == (0, 0, 0)
-    assert "image is unmodified" in lah.prompt
-    assert lah.vision_cache_key == sa.vision_cache_key
 
 
 def test_raw_frame_lru_is_bounded_and_can_be_disabled(tmp_path):

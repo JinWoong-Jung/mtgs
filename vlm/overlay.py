@@ -113,21 +113,6 @@ def build_token_overlay(image_pil, task, a, b, bboxes_norm, labels):
     return overlay
 
 
-def build_canonical_pair_overlay(image_pil, bbox_a, bbox_b):
-    """Draw the new pair pipeline's task-independent Person A/B overlay.
-
-    Person A is always RED and Person B is always BLUE. Directional semantics have
-    already been canonicalised by :class:`vlm.pair_dataset.PairSample`, so this helper
-    never receives a task and never swaps the boxes. The source image is not mutated.
-    """
-    overlay = image_pil.convert("RGB").copy()
-    W, H = overlay.size
-    draw = ImageDraw.Draw(overlay)
-    _draw(draw, bbox_a, W, H, SOURCE_COLOR, "A", 4)
-    _draw(draw, bbox_b, W, H, PARTNER_COLOR, "B", 4)
-    return overlay
-
-
 def build_overlay_pair(image_pil, i, j, bboxes_norm, labels):
     """Graph-FREE overlay: draw ONLY the query pair — source i=red, target j=blue.
     Other people stay un-boxed (the full scene is still visible in the photo).

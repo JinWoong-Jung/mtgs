@@ -45,9 +45,7 @@ def _pair_chat_text(processor: Any, item: PairVLMInput) -> str:
                 {"type": "image", "image": item.image},
                 {
                     "type": "text",
-                    "text": task_conditioned_pair_instruction(
-                        task, draw_bboxes=item.draw_bboxes
-                    ),
+                    "text": task_conditioned_pair_instruction(task),
                 },
             ],
         },
@@ -76,8 +74,6 @@ def _encode_reused_frame_batch(
     sid_to_index: dict[str, int] = {}
     reuse_indices = []
     for item in items:
-        if item.draw_bboxes:
-            raise ValueError("vision reuse requires unmodified images (draw_bboxes=false)")
         sid = item.vision_cache_key or item.annotation.sid
         unique_index = sid_to_index.get(sid)
         if unique_index is None:

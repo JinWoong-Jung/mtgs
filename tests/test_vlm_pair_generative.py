@@ -206,7 +206,6 @@ def _unmarked_text_item():
         image=Image.new("RGB", (56, 56), "black"),
         prompt="Is Person A looking at Person B? Answer yes or no.",
         evidence=TextGraphEvidence(task="lah", p_ab=0.5),
-        draw_bboxes=False,
         vision_cache_key="/split/tiny/frame.png",
     )
 

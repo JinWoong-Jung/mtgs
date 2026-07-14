@@ -345,9 +345,8 @@ def test_actual_tiny_qwen_reuses_unmarked_vision_with_deepstack_and_mrope():
     unmarked = PairVLMInput(
         annotation=source.annotation,
         image=source.image,
-        prompt=task_conditioned_pair_prompt("lah", draw_bboxes=False),
+        prompt=task_conditioned_pair_prompt("lah"),
         evidence=source.evidence,
-        draw_bboxes=False,
         vision_cache_key="/split/tiny/frame.png",
     )
     batch = make_pair_collate(processor, reuse_vision=True)([unmarked, unmarked])

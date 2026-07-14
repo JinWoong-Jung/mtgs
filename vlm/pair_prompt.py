@@ -27,9 +27,6 @@ PAIR_EVIDENCE_TOKENS = tuple(f"<{name}>" for name in SLOT_NAMES)
 SOCIAL_RELATION_TOKEN = "<social_relation>"
 PAIR_SPECIAL_TOKENS = PAIR_EVIDENCE_TOKENS + (SOCIAL_RELATION_TOKEN,)
 
-MARKED_PAIR_IDENTITY = (
-    "Person A is marked with a RED box and Person B is marked with a BLUE box."
-)
 UNMARKED_PAIR_IDENTITY = (
     "The image is unmodified; Person A and Person B are identified by their supplied "
     "latent evidence."
@@ -265,36 +262,26 @@ def validate_generative_pair_prompt(task: str, box_a, box_b) -> None:
         raise ValueError("composed prompt still contains an unresolved placeholder")
 
 
-def task_conditioned_pair_instruction(task: str, *, draw_bboxes: bool = True) -> str:
-    """User-side instruction: fixed schema with one plain-text task definition."""
+def task_conditioned_pair_instruction(task: str) -> str:
+    """User-side instruction for a plain image and fixed evidence-slot schema."""
     try:
         task_definition = TASK_DEFINITIONS[task]
     except KeyError as exc:
         raise ValueError(f"unknown social task {task!r}") from exc
     return PAIR_INSTRUCTION_TEMPLATE.format(
         task_definition=task_definition,
-        pair_identity=MARKED_PAIR_IDENTITY if draw_bboxes else UNMARKED_PAIR_IDENTITY,
+        pair_identity=UNMARKED_PAIR_IDENTITY,
     )
 
 
-def task_conditioned_pair_prompt(task: str, *, draw_bboxes: bool = True) -> str:
+def task_conditioned_pair_prompt(task: str) -> str:
     """Human-readable whole prompt; chat collation puts its final line in assistant."""
-    return (
-        task_conditioned_pair_instruction(task, draw_bboxes=draw_bboxes)
-        + "\n"
-        + social_readout_prompt(task)
-    )
+    return task_conditioned_pair_instruction(task) + "\n" + social_readout_prompt(task)
 
 
-def validate_pair_prompt(
-    task: str, prompt: str | None = None, *, draw_bboxes: bool = True
-) -> None:
+def validate_pair_prompt(task: str, prompt: str | None = None) -> None:
     """Fail if task text or a placeholder is duplicated, missing, or reordered."""
-    prompt = (
-        task_conditioned_pair_prompt(task, draw_bboxes=draw_bboxes)
-        if prompt is None
-        else prompt
-    )
+    prompt = task_conditioned_pair_prompt(task) if prompt is None else prompt
     for token in PAIR_SPECIAL_TOKENS:
         count = prompt.count(token)
         if count != 1:
@@ -304,14 +291,14 @@ def validate_pair_prompt(
         raise ValueError("pair special tokens do not follow the fixed six-slot/readout order")
     expected_definition = f"Task definition: {TASK_DEFINITIONS[task]}"
     if prompt.count(expected_definition) != 1:
-        raise ValueError(f"pair prompt must contain task definition {expected_definition!r} once")
+        raise ValueError(
+            f"pair prompt must contain task definition {expected_definition!r} once"
+        )
     expected_readout = social_readout_prompt(task)
     if not prompt.endswith(expected_readout):
         raise ValueError(f"pair prompt must end with {expected_readout!r}")
-    expected_identity = MARKED_PAIR_IDENTITY if draw_bboxes else UNMARKED_PAIR_IDENTITY
-    unexpected_identity = UNMARKED_PAIR_IDENTITY if draw_bboxes else MARKED_PAIR_IDENTITY
-    if prompt.count(expected_identity) != 1 or unexpected_identity in prompt:
-        raise ValueError("pair prompt identity text does not match draw_bboxes")
+    if prompt.count(UNMARKED_PAIR_IDENTITY) != 1:
+        raise ValueError("pair prompt must contain the plain-image identity text once")
 
 
 def add_pair_special_tokens(tokenizer: Any) -> int:
@@ -372,9 +359,6 @@ TEXT_ROLE = (
     "pretrained social-gaze graph model. The graph has independently estimated the "
     "probability below from its own analysis of the scene. Use it as evidence together "
     "with the image, and determine the final answer yourself."
-)
-TEXT_MARKED_IDENTITY = (
-    "In this image Person A is marked with a RED box and Person B is marked with a BLUE box."
 )
 TEXT_CORRECTION = (
     "Do not assume the graph's estimate is correct or incorrect without checking. Inspect "
@@ -448,7 +432,7 @@ def _text_evidence_block(evidence) -> str:
     raise ValueError(f"unknown social task {task!r}")
 
 
-def compose_text_prompt(task, box_a, box_b, evidence, *, draw_bboxes: bool = True, rng=None) -> str:
+def compose_text_prompt(task, box_a, box_b, evidence, *, rng=None) -> str:
     """Render the graph's predictions as natural-language sentences (text evidence mode)."""
     if task not in TEXT_TASK_QUESTIONS:
         raise ValueError(f"unknown social task {task!r}")
@@ -457,8 +441,6 @@ def compose_text_prompt(task, box_a, box_b, evidence, *, draw_bboxes: bool = Tru
     r = rng if rng is not None else random
     question = r.choice(TEXT_TASK_QUESTIONS[task]).format(a=_fmt_box(box_a), b=_fmt_box(box_b))
     parts = [TEXT_ROLE]
-    if draw_bboxes:
-        parts.append(TEXT_MARKED_IDENTITY)
     parts.extend([
         question,
         _text_evidence_block(evidence),
@@ -482,19 +464,17 @@ def parse_yesno_probability(text: str, default: float = 0.5) -> float:
     return 1.0 if match.group(1).lower() == "yes" else 0.0
 
 
-def validate_text_pair_prompt(task, box_a, box_b, evidence, *, draw_bboxes: bool = True) -> None:
-    text = compose_text_prompt(task, box_a, box_b, evidence, draw_bboxes=draw_bboxes,
-                               rng=random.Random(0))
+def validate_text_pair_prompt(task, box_a, box_b, evidence) -> None:
+    text = compose_text_prompt(
+        task, box_a, box_b, evidence, rng=random.Random(0)
+    )
     if "Person A" not in text or "Person B" not in text:
         raise ValueError("text prompt must name Person A and Person B")
     if not text.rstrip().endswith(TEXT_OUTPUT_INSTRUCTION):
         raise ValueError("text prompt must end with the yes/no output instruction")
     if f"{TEXT_FINAL_QUESTIONS[task]}\n{TEXT_OUTPUT_INSTRUCTION}" not in text:
         raise ValueError("text prompt must repeat the final task question before answering")
-    if draw_bboxes and TEXT_MARKED_IDENTITY not in text:
-        raise ValueError("text prompt with draw_bboxes must include the red/blue identity line")
 
 
 for _task in SOCIAL_TASKS:
     validate_pair_prompt(_task)
-    validate_pair_prompt(_task, draw_bboxes=False)

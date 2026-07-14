@@ -431,3 +431,25 @@ def test_graph_evidence_config_selects_text_collate(monkeypatch):
     assert default_builders.uses_text_collate is False
     with pytest.raises(ValueError, match="graph_evidence"):
         select_generative_builders({"model": {"graph_evidence": "bogus"}})
+
+
+def test_select_generative_builders_exposes_text_only_vision_reuse_flag():
+    from vlm.train_pair import select_generative_builders
+
+    text = select_generative_builders({
+        "model": {"output": "generative", "graph_evidence": "text"},
+        "input": {"reuse_frozen_vision": True},
+    })
+    assert text.reuse_vision is True
+
+    gtoken = select_generative_builders({
+        "model": {"output": "generative", "graph_evidence": "gtoken"},
+        "input": {"reuse_frozen_vision": True},
+    })
+    assert gtoken.reuse_vision is False
+
+    disabled = select_generative_builders({
+        "model": {"output": "generative", "graph_evidence": "text"},
+        "input": {"reuse_frozen_vision": False},
+    })
+    assert disabled.reuse_vision is False

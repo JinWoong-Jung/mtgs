@@ -261,7 +261,9 @@ model:
   output: generative
   graph_evidence: text
 input:
-  draw_bboxes: true
+  reuse_frozen_vision: true
+  group_by_frame: true
+  vision_cache_size: 4
 loss:
   lm_aux_weight: 0.0
 train:
@@ -301,7 +303,9 @@ val:
     monkeypatch.setattr(eval_pair_module, "PairInputDataset", FakeDataset)
     monkeypatch.setattr(
         eval_pair_module, "make_text_generative_collate",
-        lambda processor: captured.setdefault("text_collate", object()),
+        lambda processor, *, reuse_vision: captured.setdefault(
+            "text_collate_reuse", reuse_vision
+        ) or object(),
     )
     monkeypatch.setattr(
         eval_pair_module, "make_generative_collate",
@@ -317,9 +321,10 @@ val:
     )
     monkeypatch.setattr(
         eval_pair_module, "collect_generative_predictions",
-        lambda module, dataset, processor, **kwargs: raw_graph_predictions(
-            dataset.annotations, dataset.graph_cache
-        ),
+        lambda module, dataset, processor, **kwargs: (
+            captured.setdefault("collect_kwargs", kwargs),
+            raw_graph_predictions(dataset.annotations, dataset.graph_cache),
+        )[1],
     )
     monkeypatch.setattr(
         eval_pair_module, "evaluate_pair_predictions",
@@ -333,7 +338,11 @@ val:
         batch_size=2, num_workers=0, threshold=0.5, device="cpu",
     ))
     assert captured["dataset"]["graph_evidence"] == "text"
-    assert captured["dataset"]["draw_bboxes"] is True
-    assert "text_collate" in captured
+    assert "draw_bboxes" not in captured["dataset"]
+    assert captured["text_collate_reuse"] is True
+    assert captured["collect_kwargs"]["reuse_vision"] is True
+    assert captured["collect_kwargs"]["group_by_frame"] is True
     assert captured["closed"] is True
     assert result["variant"]["graph_evidence"] == "text"
+    assert result["variant"]["reuse_frozen_vision"] is True
+    assert "draw_bboxes" not in result["variant"]

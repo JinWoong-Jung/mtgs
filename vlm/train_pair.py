@@ -475,11 +475,11 @@ def build_vlm_objective(cfg, processor, device: torch.device, resume: Path | Non
 
 @dataclass(frozen=True)
 class GenerativeBuilders:
-    """Which generative collate/dataset wiring a run resolves to, keyed off
-    ``model.graph_evidence``."""
+    """Generative dataset/collate selection plus text-only vision reuse policy."""
 
     graph_evidence: str
     uses_text_collate: bool
+    reuse_vision: bool
 
 
 def select_generative_builders(cfg) -> GenerativeBuilders:
@@ -487,7 +487,15 @@ def select_generative_builders(cfg) -> GenerativeBuilders:
     evidence = str(model_cfg.get("graph_evidence", "gtoken"))
     if evidence not in ("gtoken", "text"):
         raise ValueError(f"model.graph_evidence must be gtoken/text, got {evidence!r}")
-    return GenerativeBuilders(graph_evidence=evidence, uses_text_collate=evidence == "text")
+    input_cfg = cfg.get("input", {}) if hasattr(cfg, "get") else {}
+    reuse_vision = (
+        evidence == "text" and bool(input_cfg.get("reuse_frozen_vision", False))
+    )
+    return GenerativeBuilders(
+        graph_evidence=evidence,
+        uses_text_collate=evidence == "text",
+        reuse_vision=reuse_vision,
+    )
 
 
 def build_generative_objective(cfg, processor, device: torch.device, resume: Path | None = None):
@@ -498,8 +506,14 @@ def build_generative_objective(cfg, processor, device: torch.device, resume: Pat
     the backbone is wrapped bare (``TextGenerativeVLM``, no projector).
     """
     backbone, token_ids, target_names = _make_lora_backbone(cfg, processor, device, resume)
-    if select_generative_builders(cfg).uses_text_collate:
-        vlm = TextGenerativeVLM(backbone)
+    builders = select_generative_builders(cfg)
+    if builders.uses_text_collate:
+        cache_size = (
+            int(cfg.get("input", {}).get("vision_cache_size", 0))
+            if builders.reuse_vision
+            else 0
+        )
+        vlm = TextGenerativeVLM(backbone, vision_cache_size=cache_size)
     else:
         vlm = PairGenerativeVLM(
             backbone,
@@ -667,6 +681,8 @@ def collect_generative_predictions(
     num_workers: int,
     device: torch.device,
     description: str,
+    reuse_vision: bool = False,
+    group_by_frame: bool = False,
     route_threshold: float | None = None,
 ) -> PairPredictionCollector:
     """Fill a prediction collector with EyeVLM candidate-scoring probabilities: each pair's
@@ -699,13 +715,16 @@ def collect_generative_predictions(
             return collector
         eval_dataset = Subset(dataset, low)
     eval_collate = (
-        make_text_generative_eval_collate(processor)
+        make_text_generative_eval_collate(
+            processor, reuse_vision=reuse_vision
+        )
         if uses_text_collate
         else make_generative_eval_collate(processor)
     )
     loader = make_validation_loader(
         eval_dataset, eval_collate, batch_size, num_workers,
         pin_memory=device.type == "cuda",
+        group_by_frame=group_by_frame and uses_text_collate,
     )
     was_training = objective.training
     objective.eval()
@@ -887,15 +906,13 @@ def main() -> None:
     output_mode = str(cfg.get("model", {}).get("output", "yesno"))
     generative = output_mode == "generative"
     builders = select_generative_builders(cfg)
-    draw_bboxes = bool(input_cfg.get("draw_bboxes", True))
-    reuse_vision = (
-        not draw_bboxes
-        and bool(input_cfg.get("reuse_frozen_vision", True))
-        and mode == "vlm"
-        and not generative          # generative collate does not do cross-pair vision reuse yet
+    reuse_vision = mode == "vlm" and (
+        builders.reuse_vision
+        if generative
+        else bool(input_cfg.get("reuse_frozen_vision", False))
     )
     group_by_frame = reuse_vision and bool(
-        input_cfg.get("group_by_frame", True)
+        input_cfg.get("group_by_frame", False)
     )
 
     processor = objective = None
@@ -906,13 +923,14 @@ def main() -> None:
             args.frame_root,
             train_cache,
             raw_image_cache_size=int(cfg.train.get("raw_image_cache_size", 16)),
-            draw_bboxes=draw_bboxes,
             output_mode=output_mode,
             graph_evidence=builders.graph_evidence,
         )
         if generative:
             collate = (
-                make_text_generative_collate(processor)
+                make_text_generative_collate(
+                    processor, reuse_vision=builders.reuse_vision
+                )
                 if builders.uses_text_collate
                 else make_generative_collate(processor)
             )
@@ -1043,7 +1061,6 @@ def main() -> None:
                 args.val_frame_root,
                 val_cache,
                 raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
-                draw_bboxes=draw_bboxes,
                 output_mode=output_mode,
                 graph_evidence=builders.graph_evidence,
                 generative_prompt_seed=seed if generative else None,
@@ -1095,7 +1112,7 @@ def main() -> None:
         f"[pair] mode={mode} train={len(train_dataset)} samples/ep={num_samples} "
         f"bs={batch_size} accum={accumulation} pos_weight={pos_weights} "
         f"lm_aux={float(cfg.loss.get('lm_aux_weight', 0.0))} "
-        f"draw_bboxes={draw_bboxes} reuse_vision={reuse_vision} "
+        f"reuse_vision={reuse_vision} "
         f"group_by_frame={group_by_frame} out={experiment_dir}",
         flush=True,
     )
@@ -1149,6 +1166,8 @@ def main() -> None:
                     batch_size=val_batch_size,
                     num_workers=int(cfg.val.get("num_workers", num_workers)),
                     device=device, description=f"gen:val:{epoch}",
+                    reuse_vision=builders.reuse_vision,
+                    group_by_frame=group_by_frame,
                     route_threshold=route_threshold,
                 )
             else:

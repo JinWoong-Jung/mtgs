@@ -14,7 +14,6 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from vlm.overlay import build_canonical_pair_overlay
 from vlm.pair_dataset import (
     PairAnnotationDataset,
     PairSample,
@@ -42,8 +41,8 @@ class RawFrameCache:
     """Process-local LRU of decoded, unmodified RGB frames.
 
     DataLoader workers each own their cache. A small bound avoids multiplying a large
-    image cache by ``num_workers``. Pair overlays are never cached because their pixels
-    depend on A/B; callers must treat the returned raw image as read-only.
+    image cache by ``num_workers``. Callers must treat the returned raw image as read-only;
+    pair identity is supplied by normalized bbox coordinates in the text prompt.
     """
 
     def __init__(self, frame_root: str | Path, max_items: int = 32):
@@ -94,7 +93,6 @@ class PairVLMInput:
     image: Image.Image
     prompt: str
     evidence: PairGraphEvidence
-    draw_bboxes: bool = True
     vision_cache_key: str | None = None
 
 
@@ -108,7 +106,6 @@ class PairInputDataset(Dataset):
         graph_cache: Mapping[str, Mapping[str, object]],
         *,
         raw_image_cache_size: int = 32,
-        draw_bboxes: bool = True,
         output_mode: str = "yesno",
         graph_evidence: str = "gtoken",
         generative_prompt_seed: int | None = None,
@@ -128,14 +125,6 @@ class PairInputDataset(Dataset):
         self.generative_prompt_seed = (
             None if generative_prompt_seed is None else int(generative_prompt_seed)
         )
-        # Generative (EyeVLM-style) identifies people by text bbox coordinates, so the
-        # image remains unmodified.  Cross-pair vision reuse is a separate collate feature.
-        # gtoken generative uses text bbox coords on an unmodified image; text mode uses the
-        # red/blue A/B overlay so the model can bind "Person A"/"Person B" visually.
-        self.draw_bboxes = bool(draw_bboxes) and not (
-            output_mode == "generative" and graph_evidence == "gtoken"
-        )
-
         required_sids = {sample.sid for sample in self.annotations}
         missing = sorted(required_sids.difference(graph_cache))
         if missing:
@@ -172,7 +161,7 @@ class PairInputDataset(Dataset):
             evidence = assemble_pair_graph_evidence(sample, cache)
 
         raw = self.frames.get(sample.sid)
-        need_boxes = self.draw_bboxes or self.output_mode == "generative"
+        need_boxes = self.output_mode == "generative"
         box_a = box_b = None
         if need_boxes:
             bboxes = cache.get("head_bboxes")
@@ -193,29 +182,25 @@ class PairInputDataset(Dataset):
                 )
             box_a = bboxes[sample.person_i]
             box_b = bboxes[sample.person_j]
-        if self.draw_bboxes:
-            image = build_canonical_pair_overlay(raw, box_a, box_b)
-        else:
-            # RawFrameCache images are immutable by contract. Returning the shared
-            # object lets the collator deduplicate image preprocessing by frame id.
-            image = raw
+        # RawFrameCache images are immutable by contract. Returning the shared object
+        # lets the collator deduplicate image preprocessing and vision encoding by frame.
+        image = raw
         if text_mode:
             prompt = compose_text_prompt(
                 sample.task, box_a.tolist(), box_b.tolist(), evidence,
-                draw_bboxes=self.draw_bboxes, rng=self._generative_rng(sample),
+                rng=self._generative_rng(sample),
             )
         elif self.output_mode == "generative":
             prompt = compose_generative_prompt(
                 sample.task, box_a.tolist(), box_b.tolist(), rng=self._generative_rng(sample)
             )
         else:
-            prompt = task_conditioned_pair_prompt(sample.task, draw_bboxes=self.draw_bboxes)
+            prompt = task_conditioned_pair_prompt(sample.task)
         return PairVLMInput(
             annotation=sample,
             image=image,
             prompt=prompt,
             evidence=evidence,
-            draw_bboxes=self.draw_bboxes,
             vision_cache_key=str(
                 (self.frames.frame_root / sample.sid / "frame.png").resolve()
             ),

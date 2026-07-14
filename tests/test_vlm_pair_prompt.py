@@ -5,7 +5,6 @@ from PIL import Image
 
 from vlm.pair_features import SLOT_NAMES
 from vlm.pair_prompt import (
-    MARKED_PAIR_IDENTITY,
     PAIR_EVIDENCE_TOKENS,
     PAIR_INSTRUCTION_TEMPLATE,
     PAIR_SPECIAL_TOKENS,
@@ -67,7 +66,7 @@ def test_task_conditioning_changes_only_one_plain_text_field():
         prompt = task_conditioned_pair_prompt(task)
         assert instruction == PAIR_INSTRUCTION_TEMPLATE.format(
             task_definition=definition,
-            pair_identity=MARKED_PAIR_IDENTITY,
+            pair_identity=UNMARKED_PAIR_IDENTITY,
         )
         assert f"Task definition: {definition}" in prompt
         for token in PAIR_SPECIAL_TOKENS:
@@ -87,14 +86,12 @@ def test_task_conditioning_changes_only_one_plain_text_field():
     assert len(set(normalized)) == 1
 
 
-def test_unmarked_prompt_is_explicit_and_keeps_the_same_slot_schema():
-    marked = task_conditioned_pair_prompt("lah")
-    unmarked = task_conditioned_pair_prompt("lah", draw_bboxes=False)
-    assert MARKED_PAIR_IDENTITY in marked and UNMARKED_PAIR_IDENTITY not in marked
-    assert UNMARKED_PAIR_IDENTITY in unmarked and MARKED_PAIR_IDENTITY not in unmarked
+def test_plain_prompt_is_explicit_and_keeps_the_fixed_slot_schema():
+    prompt = task_conditioned_pair_prompt("lah")
+    assert prompt.count(UNMARKED_PAIR_IDENTITY) == 1
     for token in PAIR_SPECIAL_TOKENS:
-        assert marked.count(token) == unmarked.count(token) == 1
-    validate_pair_prompt("lah", unmarked, draw_bboxes=False)
+        assert prompt.count(token) == 1
+    validate_pair_prompt("lah", prompt)
 
 
 def test_special_registration_preserves_existing_tokens_and_is_idempotent():

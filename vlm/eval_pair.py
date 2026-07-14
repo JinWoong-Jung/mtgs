@@ -118,19 +118,19 @@ def _variant_settings(cfg, mode: str) -> dict[str, Any]:
     if mode == "vlm":
         input_cfg = cfg.get("input", {})
         generative = str(cfg.get("model", {}).get("output", "yesno")) == "generative"
-        graph_evidence = (
-            select_generative_builders(cfg).graph_evidence if generative else None
+        builders = select_generative_builders(cfg) if generative else None
+        reuse_vision = (
+            builders.reuse_vision
+            if builders is not None
+            else bool(input_cfg.get("reuse_frozen_vision", False))
         )
-        draw_bboxes = bool(input_cfg.get("draw_bboxes", True))
         return {
             "output": "generative" if generative else "yesno",
-            "graph_evidence": graph_evidence,
+            "graph_evidence": None if builders is None else builders.graph_evidence,
             "lm_aux_weight": float(cfg.loss.get("lm_aux_weight", 0.0)),
-            "draw_bboxes": draw_bboxes,
-            "reuse_frozen_vision": not generative and not draw_bboxes
-            and bool(input_cfg.get("reuse_frozen_vision", True)),
-            "group_by_frame": not generative and not draw_bboxes
-            and bool(input_cfg.get("group_by_frame", True)),
+            "reuse_frozen_vision": reuse_vision,
+            "group_by_frame": reuse_vision
+            and bool(input_cfg.get("group_by_frame", False)),
             "vision_cache_size": int(input_cfg.get("vision_cache_size", 0)),
         }
     if mode == "features_mlp":
@@ -160,14 +160,14 @@ def run_evaluation(args) -> dict[str, Any]:
     output_mode = str(cfg.get("model", {}).get("output", "yesno"))
     generative = output_mode == "generative"
     generative_builders = select_generative_builders(cfg) if generative else None
-    draw_bboxes = bool(input_cfg.get("draw_bboxes", True))
-    reuse_vision = (
-        mode == "vlm"
-        and not draw_bboxes
-        and not generative
-        and bool(input_cfg.get("reuse_frozen_vision", True))
+    reuse_vision = mode == "vlm" and (
+        generative_builders.reuse_vision
+        if generative_builders is not None
+        else bool(input_cfg.get("reuse_frozen_vision", False))
     )
-    group_by_frame = reuse_vision and bool(input_cfg.get("group_by_frame", True))
+    group_by_frame = reuse_vision and bool(
+        input_cfg.get("group_by_frame", False)
+    )
     if mode == "vlm":
         if not args.frame_root:
             raise ValueError("vlm evaluation requires --frame_root")
@@ -180,7 +180,6 @@ def run_evaluation(args) -> dict[str, Any]:
             args.frame_root,
             graph_cache,
             raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
-            draw_bboxes=draw_bboxes,
             output_mode=output_mode,
             graph_evidence=(
                 generative_builders.graph_evidence if generative_builders else "gtoken"
@@ -189,7 +188,9 @@ def run_evaluation(args) -> dict[str, Any]:
         )
         if generative:
             collate = (
-                make_text_generative_collate(processor)
+                make_text_generative_collate(
+                    processor, reuse_vision=generative_builders.reuse_vision
+                )
                 if generative_builders.uses_text_collate
                 else make_generative_collate(processor)
             )
@@ -275,6 +276,8 @@ def run_evaluation(args) -> dict[str, Any]:
                     module, dataset, processor,
                     batch_size=batch_size, num_workers=num_workers,
                     device=device, description=f"eval:{mode}",
+                    reuse_vision=generative_builders.reuse_vision,
+                    group_by_frame=group_by_frame,
                     route_threshold=_route_threshold(cfg),
                 )
             else:
