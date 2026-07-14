@@ -167,6 +167,10 @@ def test_epoch_batch_logger_tracks_optimizer_updates_not_microbatches():
     assert [step for step, _ in events] == [1, 2]
     assert all(event["examples"] > 0 for _, event in events)
     assert all(torch.isfinite(torch.tensor(event["batch_loss"])) for _, event in events)
+    assert all(
+        set(event) == {"batch_loss", "running_loss", "examples"}
+        for _, event in events
+    )
 
 
 def test_graph_feature_control_runs_through_shared_epoch_loop():

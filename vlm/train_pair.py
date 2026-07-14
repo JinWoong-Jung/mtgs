@@ -806,8 +806,6 @@ def run_epoch(
             ):
                 batch_logger(optimizer_steps, {
                     "batch_loss": float(output.loss.detach()),
-                    "batch_residual_loss": float(output.residual_loss.detach()),
-                    "batch_accuracy": float(predictions.eq(labels.bool()).float().mean()),
                     "running_loss": loss_sum / max(count, 1),
                     "examples": int(count),
                 })
@@ -1234,7 +1232,10 @@ def main() -> None:
         with ledger.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(state) + "\n")
         if wandb is not None:
-            log = {f"train/{key}": value for key, value in asdict(train_stats).items() if value is not None}
+            log = {
+                "train/loss": train_stats.loss,
+                "train/examples": train_stats.examples,
+            }
             if val_stats is not None:
                 log.update({f"val/{key}": value for key, value in asdict(val_stats).items() if value is not None})
             if val_metrics is not None:
