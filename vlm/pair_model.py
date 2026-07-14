@@ -398,19 +398,62 @@ def _text_generative_collate(processor: Any, answers_for):
     return collate
 
 
-def make_text_generative_collate(processor: Any):
-    """Text-mode SFT: one sequence per pair, target = the pair's own yes/no answer."""
-    base = _text_generative_collate(
-        processor, lambda items: [(generative_answer_yesno(int(it.annotation.label)), it)
-                                  for it in items])
+def make_text_generative_collate(processor: Any, *, reuse_vision: bool = False):
+    """Text-mode SFT with optional one-vision-encoding-per-unique-frame reuse."""
+    processor.tokenizer.padding_side = "right"
 
     def collate(items: Sequence[PairVLMInput]) -> dict[str, Any]:
-        out = base(items)
+        if not items:
+            raise ValueError("cannot collate an empty pair batch")
+        answers = [
+            (generative_answer_yesno(int(item.annotation.label)), item)
+            for item in items
+        ]
+        prompt_texts, full_texts = [], []
+        for answer, item in answers:
+            user = _user_message(item)
+            prompt_texts.append(
+                processor.apply_chat_template(
+                    [user], tokenize=False, add_generation_prompt=True
+                )
+            )
+            full_texts.append(
+                processor.apply_chat_template(
+                    [
+                        user,
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": answer}],
+                        },
+                    ],
+                    tokenize=False,
+                )
+            )
+        if reuse_vision:
+            prompt_enc = _encode_reused_frame_batch(processor, prompt_texts, items)
+            encoded = _encode_reused_frame_batch(processor, full_texts, items)
+        else:
+            images = [item.image for item in items]
+            prompt_enc = processor(
+                text=prompt_texts, images=images, return_tensors="pt", padding=True
+            )
+            encoded = processor(
+                text=full_texts, images=images, return_tensors="pt", padding=True
+            )
+        prompt_lens = prompt_enc["attention_mask"].sum(dim=1)
+        out = dict(encoded)
+        labels = out["input_ids"].clone()
+        labels[out["attention_mask"] == 0] = -100
+        for index, prompt_len in enumerate(prompt_lens.tolist()):
+            labels[index, :prompt_len] = -100
+        out["labels"] = labels
         out["task_ids"] = torch.tensor(
-            [SOCIAL_TASK_ID[it.annotation.task] for it in items], dtype=torch.long)
+            [SOCIAL_TASK_ID[item.annotation.task] for item in items], dtype=torch.long
+        )
         out["pair_labels"] = torch.tensor(
-            [it.annotation.label for it in items], dtype=torch.float32)
-        out["eval_keys"] = [it.annotation.eval_key for it in items]
+            [item.annotation.label for item in items], dtype=torch.float32
+        )
+        out["eval_keys"] = [item.annotation.eval_key for item in items]
         return out
 
     return collate
@@ -431,31 +474,6 @@ def make_text_generative_eval_collate(processor: Any):
         return out
 
     return collate
-
-
-class TextGenerativeVLM(nn.Module):
-    """Generative pair model with NO graph soft-token injection: the graph evidence is
-    already natural-language text inside the prompt. Wraps the frozen+LoRA backbone so
-    ``PairGenerativeObjective`` can SFT it to emit yes/no and score candidates."""
-
-    def __init__(self, backbone: nn.Module):
-        super().__init__()
-        self.backbone = backbone
-
-    def close(self) -> None:
-        pass
-
-    def get_output_embeddings(self) -> nn.Module:
-        return self.backbone.get_output_embeddings()
-
-    def forward(self, model_inputs: Mapping[str, torch.Tensor]):
-        device = next(self.backbone.parameters()).device
-        kwargs = {
-            key: (value.to(device) if torch.is_tensor(value) else value)
-            for key, value in model_inputs.items() if key not in _NON_MODEL_KEYS
-        }
-        kwargs.update({"output_hidden_states": False, "return_dict": True, "use_cache": False})
-        return self.backbone(**kwargs)
 
 
 def placeholder_masks(
@@ -804,6 +822,90 @@ class _VisionReuseMixin:
             deepstack_visual_embeds=deepstack,
             **kwargs,
         )
+
+
+@dataclass
+class TextGenerativeVLMOutput:
+    loss: torch.Tensor | None
+    logits: torch.Tensor
+    past_key_values: Any = None
+    hidden_states: Any = None
+    attentions: Any = None
+
+
+class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
+    """Text-evidence generative VLM with optional cross-pair vision reuse."""
+
+    def __init__(self, backbone: nn.Module, vision_cache_size: int = 0):
+        super().__init__()
+        self.backbone = backbone
+        self._init_vision_reuse(vision_cache_size)
+
+    def close(self) -> None:
+        self.clear_vision_cache()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.vision_cache_size:
+            self._vision_model().visual.eval()
+        return self
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.backbone.get_output_embeddings()
+
+    def _reused_generative_output(
+        self, hidden_output: Any, labels: torch.Tensor | None
+    ) -> TextGenerativeVLMOutput:
+        """Apply the frozen LM head and causal CE bypassed by the low-level reuse path."""
+        hidden_states = (
+            hidden_output.last_hidden_state
+            if hasattr(hidden_output, "last_hidden_state")
+            else hidden_output[0]
+        )
+        logits = self.get_output_embeddings()(hidden_states)
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous().float()
+            shift_labels = labels[:, 1:].contiguous().to(logits.device)
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.shape[-1]),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        return TextGenerativeVLMOutput(
+            loss=loss,
+            logits=logits,
+            past_key_values=getattr(hidden_output, "past_key_values", None),
+            hidden_states=getattr(hidden_output, "hidden_states", None),
+            attentions=getattr(hidden_output, "attentions", None),
+        )
+
+    def forward(self, model_inputs: Mapping[str, torch.Tensor]):
+        device = next(self.backbone.parameters()).device
+        reuse_vision = "vision_reuse_indices" in model_inputs
+        kwargs = {
+            key: value
+            for key, value in model_inputs.items()
+            if key not in _NON_MODEL_KEYS
+        }
+        if not reuse_vision:
+            kwargs = {
+                key: value.to(device) if torch.is_tensor(value) else value
+                for key, value in kwargs.items()
+            }
+            kwargs.update(
+                {"output_hidden_states": False, "return_dict": True, "use_cache": False}
+            )
+            return self.backbone(**kwargs)
+
+        labels = kwargs.pop("labels", None)
+        if torch.is_tensor(labels):
+            labels = labels.to(device)
+        kwargs.update(
+            {"output_hidden_states": False, "return_dict": True, "use_cache": False}
+        )
+        hidden_output = self._forward_with_reused_vision(kwargs, device)
+        return self._reused_generative_output(hidden_output, labels)
 
 
 class PairSocialVLM(_VisionReuseMixin, nn.Module):

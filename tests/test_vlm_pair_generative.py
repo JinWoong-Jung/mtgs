@@ -1,11 +1,22 @@
 import random
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
+from PIL import Image
 
+from vlm.pair_dataset import PairSample
+from vlm.pair_features import TextGraphEvidence
 from vlm.pair_head import PairGenerativeObjective, answer_loglik
-from vlm.pair_model import GraphTokenProjector, TextGenerativeVLM, graph_token_masks
+from vlm.pair_input import PairVLMInput
+from vlm.pair_model import (
+    GraphTokenProjector,
+    TextGenerativeVLM,
+    graph_token_masks,
+    make_text_generative_collate,
+)
 from vlm.pair_prompt import (
     FINAL_PROBABILITY_QUESTION,
     GRAPH_EVIDENCE_INTRO,
@@ -114,6 +125,92 @@ def test_text_generative_vlm_runs_without_graph_features():
     out = vlm(inp)
     assert out.logits.shape == (2, 6, 32)
     assert out.loss is not None
+
+
+def test_text_generative_vlm_accepts_vision_cache_size_and_exposes_cache_info():
+    vlm = TextGenerativeVLM(_StubBackbone(), vision_cache_size=4)
+    try:
+        info = vlm.vision_cache_info()
+        assert info.max_items == 4
+        assert info.curr_items == 0
+    finally:
+        vlm.close()
+
+
+def test_text_generative_reuse_forward_returns_logits_and_next_token_ce():
+    class _ReuseBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head = nn.Linear(4, 8, bias=False)
+
+        def get_output_embeddings(self):
+            return self.head
+
+    class _ReuseVLM(TextGenerativeVLM):
+        def _forward_with_reused_vision(self, kwargs, device):
+            assert "labels" not in kwargs
+            batch, length = kwargs["input_ids"].shape
+            hidden = torch.randn(batch, length, 4, device=device, requires_grad=True)
+            return SimpleNamespace(
+                last_hidden_state=hidden,
+                past_key_values=None,
+                hidden_states=None,
+                attentions=None,
+            )
+
+    vlm = _ReuseVLM(_ReuseBackbone(), vision_cache_size=1)
+    labels = torch.tensor([[1, 2, 3, 4], [2, 3, 4, 5]])
+    try:
+        output = vlm(
+            {
+                "input_ids": torch.zeros(2, 4, dtype=torch.long),
+                "labels": labels,
+                "vision_reuse_indices": torch.tensor([0, 0]),
+            }
+        )
+        assert output.logits.shape == (2, 4, 8)
+        assert output.loss is not None and torch.isfinite(output.loss)
+        expected = torch.nn.functional.cross_entropy(
+            output.logits[:, :-1].float().reshape(-1, 8), labels[:, 1:].reshape(-1)
+        )
+        torch.testing.assert_close(output.loss, expected)
+        output.loss.backward()
+        assert vlm.backbone.head.weight.grad is not None
+    finally:
+        vlm.close()
+
+
+def test_make_text_generative_collate_reuse_flag_produces_vision_reuse_keys():
+    transformers = pytest.importorskip("transformers")
+    model_root = Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct"
+    snapshots = sorted((model_root / "snapshots").glob("*"))
+    if not snapshots:
+        pytest.skip("local Qwen3-VL processor cache is unavailable")
+    processor = transformers.AutoProcessor.from_pretrained(
+        snapshots[-1], local_files_only=True
+    )
+    item = PairVLMInput(
+        annotation=PairSample(
+            sid="tiny",
+            task="lah",
+            person_i=0,
+            person_j=1,
+            label=1,
+            raw_i=1,
+            raw_j=0,
+        ),
+        image=Image.new("RGB", (56, 56), "black"),
+        prompt="Is Person A looking at Person B? Answer yes or no.",
+        evidence=TextGraphEvidence(task="lah", p_ab=0.5),
+        draw_bboxes=False,
+        vision_cache_key="/split/tiny/frame.png",
+    )
+
+    batch = make_text_generative_collate(processor, reuse_vision=True)([item, item])
+
+    assert batch["vision_reuse_indices"].tolist() == [0, 0]
+    assert batch["vision_unique_grid_thw"].shape == (1, 3)
+    assert batch["vision_frame_ids"] == ("/split/tiny/frame.png",)
 
 
 def test_text_objective_score_returns_probability_per_pair():
