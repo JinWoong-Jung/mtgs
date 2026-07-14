@@ -23,12 +23,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── 설정 (여기만 바꾸면 됨. 환경변수로도 덮어쓰기 가능) ────────────────────────
-SPLITS="train val test"              # 공백 구분 목록 → 하나의 GPU에서 순차 추출
-STAGE=both                               # export | overlays | both
-CHECKPOINT=/home/jinwoongjung/MTGS/experiments/2026-07-10/V18/train/checkpoints/best.ckpt # graph 피처 추출용 체크포인트 (repo root 기준)
-NUM_PEOPLE=all                       # all(가변 N) | <정수>. all이면 export bs=1 강제
-BATCH_SIZE=4                         # export 배치 (NUM_PEOPLE=all 이면 코드가 1로 강제)
-CACHE=/home/jinwoongjung/MTGS/data/vlm_feature   # 산출물 저장 루트
+SPLITS="${SPLITS:-train val test}"              # 공백 구분 목록 → 하나의 GPU에서 순차 추출
+STAGE="${STAGE:-export}"                         # export | overlays | both
+CHECKPOINT="${CHECKPOINT:-/home/jinwoongjung/MTGS/experiments/V18/train/checkpoints/best.ckpt}"
+LAEO_DERIVE="${LAEO_DERIVE:-decoder}"          # V18의 trained head_laeo를 반드시 사용
+NUM_PEOPLE="${NUM_PEOPLE:-all}"                     # all(가변 N) | <정수>. all이면 export bs=1 강제
+BATCH_SIZE="${BATCH_SIZE:-4}"                       # export 배치 (NUM_PEOPLE=all 이면 코드가 1로 강제)
+CACHE="${CACHE:-/home/jinwoongjung/MTGS/data/vlm_feature}"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
@@ -49,19 +50,27 @@ set -e
 
 mkdir -p "$CACHE" /home/jinwoongjung/MTGS/scripts/logs
 
-echo "===== graph_extract: SPLITS=($SPLITS) STAGE=$STAGE CKPT=$CHECKPOINT NUM_PEOPLE=$NUM_PEOPLE bs=$BATCH_SIZE ====="
+echo "===== graph_extract: SPLITS=($SPLITS) STAGE=$STAGE CKPT=$CHECKPOINT LAEO=$LAEO_DERIVE NUM_PEOPLE=$NUM_PEOPLE bs=$BATCH_SIZE ====="
 echo "===== out -> $CACHE ====="
 
 run_export () {
   local split="$1"
+  local final="$CACHE/vlmgraph_${split}.pt"
+  local pending="$CACHE/.vlmgraph_${split}.pt.pending"
+  rm -f "$pending"
   echo "----- [export] graph features: split=$split -----"
-  python -u -m vlm.graph_export \
+  if ! python -u -m vlm.graph_export \
     --split "$split" \
     --ckpt "$CHECKPOINT" \
-    --out "$CACHE/vlmgraph_${split}.pt" \
+    --out "$pending" \
     --batch_size "$BATCH_SIZE" \
-    --num_people "$NUM_PEOPLE"
-  echo "----- [export] done -> $CACHE/vlmgraph_${split}.pt -----"
+    --num_people "$NUM_PEOPLE" \
+    --laeo_derive "$LAEO_DERIVE"; then
+    rm -f "$pending"
+    return 1
+  fi
+  mv -f "$pending" "$final"
+  echo "----- [export] done -> $final (atomically replaced stale cache) -----"
 }
 
 run_overlays () {

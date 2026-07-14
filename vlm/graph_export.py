@@ -35,10 +35,15 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--save_every", type=int, default=4000)
     ap.add_argument("--num_people", default="", help="'all' to override N (offline extraction); empty=config default")
+    ap.add_argument(
+        "--laeo_derive", choices=("decoder", "lah_min"), default="decoder",
+        help="LAEO readout used for exported logits; decoder is required for V18 extraction",
+    )
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = make_cfg(args.split, num_people=(args.num_people or None))
+    cfg.gaze_graph.laeo_derive = args.laeo_derive
     cfg.test.batch_size = args.batch_size
     # Variable-N (num_people="all") frames can't be stacked -> force batch_size 1.
     if (cfg.data.num_people == "all" or args.split == "test") and args.batch_size != 1:
@@ -67,6 +72,11 @@ def main():
     model = MTGSModel(cfg)
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     miss, unexp = model.load_state_dict(ck["state_dict"], strict=False)
+    laeo_load_issues = [key for key in [*miss, *unexp] if "head_laeo" in key]
+    if args.laeo_derive == "decoder" and laeo_load_issues:
+        raise RuntimeError(
+            f"V18 LAEO decoder weights did not load cleanly: {laeo_load_issues[:10]}"
+        )
     print(f"[export] ckpt epoch={ck.get('epoch')} missing={len(miss)} unexpected={len(unexp)}", flush=True)
     model.eval().to(device)
     model.model.gaze_graph_block.export_features = True
@@ -87,6 +97,10 @@ def main():
         sa_c  = f["sa_mat"][:, c].float().cpu()
         # LAEO: lah_min 모드면 laeo_mat=None → min(lah, lah^T) (logit space, 대칭)
         if f["laeo_mat"] is None:
+            if args.laeo_derive == "decoder":
+                raise RuntimeError(
+                    "LAEO decoder export requested but gaze_graph_block produced no laeo_mat"
+                )
             laeo_all = torch.minimum(f["lah_mat"], f["lah_mat"].transpose(-1, -2))
         else:
             laeo_all = f["laeo_mat"]
