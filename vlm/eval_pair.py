@@ -41,8 +41,11 @@ from vlm.pair_input import (
     pair_control_collate,
     pair_feature_control_collate,
 )
-from vlm.pair_head import answer_token_ids
-from vlm.pair_model import make_generative_collate, make_pair_collate
+from vlm.pair_model import (
+    make_generative_collate,
+    make_pair_collate,
+    make_text_generative_collate,
+)
 from vlm.train_pair import (
     _load_graph_cache,
     _processor,
@@ -54,6 +57,7 @@ from vlm.train_pair import (
     make_validation_loader,
     restore_control_checkpoint,
     run_epoch,
+    select_generative_builders,
 )
 
 
@@ -114,9 +118,13 @@ def _variant_settings(cfg, mode: str) -> dict[str, Any]:
     if mode == "vlm":
         input_cfg = cfg.get("input", {})
         generative = str(cfg.get("model", {}).get("output", "yesno")) == "generative"
+        graph_evidence = (
+            select_generative_builders(cfg).graph_evidence if generative else None
+        )
         draw_bboxes = bool(input_cfg.get("draw_bboxes", True))
         return {
             "output": "generative" if generative else "yesno",
+            "graph_evidence": graph_evidence,
             "lm_aux_weight": float(cfg.loss.get("lm_aux_weight", 0.0)),
             "draw_bboxes": draw_bboxes,
             "reuse_frozen_vision": not generative and not draw_bboxes
@@ -151,6 +159,7 @@ def run_evaluation(args) -> dict[str, Any]:
     input_cfg = cfg.get("input", {})
     output_mode = str(cfg.get("model", {}).get("output", "yesno"))
     generative = output_mode == "generative"
+    generative_builders = select_generative_builders(cfg) if generative else None
     draw_bboxes = bool(input_cfg.get("draw_bboxes", True))
     reuse_vision = (
         mode == "vlm"
@@ -173,10 +182,17 @@ def run_evaluation(args) -> dict[str, Any]:
             raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
             draw_bboxes=draw_bboxes,
             output_mode=output_mode,
+            graph_evidence=(
+                generative_builders.graph_evidence if generative_builders else "gtoken"
+            ),
             generative_prompt_seed=int(cfg.val.get("prompt_seed", cfg.train.get("seed", 101))) if generative else None,
         )
         if generative:
-            collate = make_generative_collate(processor)
+            collate = (
+                make_text_generative_collate(processor)
+                if generative_builders.uses_text_collate
+                else make_generative_collate(processor)
+            )
         else:
             collate = make_pair_collate(processor, reuse_vision=reuse_vision)
     elif mode == "features_mlp":

@@ -238,3 +238,102 @@ val:
     assert (output / "result.json").exists()
     saved = torch.load(output / "predictions.pt", weights_only=False)
     assert len(saved["probabilities"]) == 6
+
+
+
+def test_text_generative_eval_uses_text_dataset_and_collate(tmp_path, monkeypatch):
+    """Standalone eval must rebuild the same text-evidence input contract as training."""
+    manifest = tmp_path / "manifest.jsonl"
+    _manifest(manifest)
+    cache = {
+        "s0": {
+            task + "_logits": torch.tensor([[0.0, -0.2], [0.3, 0.0]])
+            for task in ("lah", "laeo", "sa")
+        }
+    }
+    graph_path = tmp_path / "graph.pt"
+    torch.save(cache, graph_path)
+    gtmeta = tmp_path / "gtmeta.pt"
+    torch.save({}, gtmeta)
+    config = tmp_path / "config.yaml"
+    config.write_text("""
+model:
+  output: generative
+  graph_evidence: text
+input:
+  draw_bboxes: true
+loss:
+  lm_aux_weight: 0.0
+train:
+  seed: 7
+val:
+  bs: 2
+  num_workers: 0
+""")
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    captured = {}
+
+    class FakeDataset:
+        def __init__(self, manifest, frame_root, graph_cache, **kwargs):
+            captured["dataset"] = kwargs
+            self.annotations = PairAnnotationDataset(manifest)
+            self.graph_cache = graph_cache
+            self.graph_evidence = kwargs["graph_evidence"]
+
+        def __len__(self):
+            return len(self.annotations)
+
+    class FakeObjective:
+        def close(self):
+            captured["closed"] = True
+
+    fixed_metrics = {
+        "F1_LAH": 0.7, "F1_LAEO": 0.6, "F1_SA": 0.5,
+        "LAH_AP": 0.8, "LAEO_AP": 0.7, "SA_AP": 0.6,
+        "LAH_AUC": 0.9, "LAEO_AUC": 0.8, "SA_AUC": 0.7,
+        "social_ap": 0.7, "social_auc": 0.8, "mean_social_f1": 0.6,
+        "detail": "locked metric detail",
+    }
+    monkeypatch.setattr(eval_pair_module, "_resolve_device", lambda *_: torch.device("cpu"))
+    monkeypatch.setattr(eval_pair_module, "_processor", lambda *_: object())
+    monkeypatch.setattr(eval_pair_module, "PairInputDataset", FakeDataset)
+    monkeypatch.setattr(
+        eval_pair_module, "make_text_generative_collate",
+        lambda processor: captured.setdefault("text_collate", object()),
+    )
+    monkeypatch.setattr(
+        eval_pair_module, "make_generative_collate",
+        lambda processor: pytest.fail("text evidence must not select gtoken collate"),
+    )
+    monkeypatch.setattr(
+        eval_pair_module, "build_generative_objective",
+        lambda *args: (FakeObjective(), ()),
+    )
+    monkeypatch.setattr(
+        eval_pair_module, "_restore_vlm_modules",
+        lambda *args: {"mode": "vlm", "epoch": 1},
+    )
+    monkeypatch.setattr(
+        eval_pair_module, "collect_generative_predictions",
+        lambda module, dataset, processor, **kwargs: raw_graph_predictions(
+            dataset.annotations, dataset.graph_cache
+        ),
+    )
+    monkeypatch.setattr(
+        eval_pair_module, "evaluate_pair_predictions",
+        lambda *args, **kwargs: dict(fixed_metrics),
+    )
+
+    result = run_evaluation(SimpleNamespace(
+        mode="vlm", name="text evidence", checkpoint=str(checkpoint),
+        config=str(config), manifest=str(manifest), frame_root=str(tmp_path),
+        graph_feats=str(graph_path), gtmeta=str(gtmeta), output_dir=str(tmp_path / "output"),
+        batch_size=2, num_workers=0, threshold=0.5, device="cpu",
+    ))
+    assert captured["dataset"]["graph_evidence"] == "text"
+    assert captured["dataset"]["draw_bboxes"] is True
+    assert "text_collate" in captured
+    assert captured["closed"] is True
+    assert result["variant"]["graph_evidence"] == "text"
