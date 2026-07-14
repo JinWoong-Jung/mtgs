@@ -58,9 +58,12 @@ from vlm.pair_eval import (
 from vlm.pair_model import (
     PairGenerativeVLM,
     PairSocialVLM,
+    TextGenerativeVLM,
     make_generative_collate,
     make_generative_eval_collate,
     make_pair_collate,
+    make_text_generative_collate,
+    make_text_generative_eval_collate,
     prepare_pair_tokens,
 )
 from vlm.patches import patch_qwen3vl_patch_embed
@@ -277,8 +280,12 @@ def partition_vlm_parameters(objective: PairSocialObjective):
 
     lora = [parameter for _, parameter in lora_named]
     if isinstance(objective, PairGenerativeObjective):
-        # generative: only the graph projector learns besides LoRA.
-        new = list(objective.vlm.projector.parameters())
+        if isinstance(objective.vlm, TextGenerativeVLM):
+            # text mode: graph evidence is already text in the prompt; only LoRA trains.
+            new = []
+        else:
+            # gtoken generative: only the graph projector learns besides LoRA.
+            new = list(objective.vlm.projector.parameters())
     else:
         new = (
             list(objective.vlm.projector.parameters())
@@ -466,16 +473,41 @@ def build_vlm_objective(cfg, processor, device: torch.device, resume: Path | Non
     return vlm, decoder, None, target_names
 
 
+@dataclass(frozen=True)
+class GenerativeBuilders:
+    """Which generative collate/dataset wiring a run resolves to, keyed off
+    ``model.graph_evidence``."""
+
+    graph_evidence: str
+    uses_text_collate: bool
+
+
+def select_generative_builders(cfg) -> GenerativeBuilders:
+    model_cfg = cfg.get("model", {}) if hasattr(cfg, "get") else cfg["model"]
+    evidence = str(model_cfg.get("graph_evidence", "gtoken"))
+    if evidence not in ("gtoken", "text"):
+        raise ValueError(f"model.graph_evidence must be gtoken/text, got {evidence!r}")
+    return GenerativeBuilders(graph_evidence=evidence, uses_text_collate=evidence == "text")
+
+
 def build_generative_objective(cfg, processor, device: torch.device, resume: Path | None = None):
-    """EyeVLM-style generative objective: LM generates yes/no; graph = input soft-tokens."""
+    """EyeVLM-style generative objective: LM generates yes/no.
+
+    gtoken mode: graph evidence is injected as input soft-tokens (``PairGenerativeVLM`` +
+    projector). text mode: graph evidence is already natural-language text in the prompt, so
+    the backbone is wrapped bare (``TextGenerativeVLM``, no projector).
+    """
     backbone, token_ids, target_names = _make_lora_backbone(cfg, processor, device, resume)
-    vlm = PairGenerativeVLM(
-        backbone,
-        token_ids,
-        graph_dim=int(cfg.model.get("graph_dim", 256)),
-        graph_hidden_dim=int(cfg.model.get("graph_hidden_dim", 1024)),
-        heatmap_conv_dim=int(cfg.model.get("heatmap_conv_dim", 128)),
-    )
+    if select_generative_builders(cfg).uses_text_collate:
+        vlm = TextGenerativeVLM(backbone)
+    else:
+        vlm = PairGenerativeVLM(
+            backbone,
+            token_ids,
+            graph_dim=int(cfg.model.get("graph_dim", 256)),
+            graph_hidden_dim=int(cfg.model.get("graph_hidden_dim", 1024)),
+            heatmap_conv_dim=int(cfg.model.get("heatmap_conv_dim", 128)),
+        )
     objective = PairGenerativeObjective(vlm).to(device=device)
     return objective, target_names
 
@@ -486,7 +518,8 @@ def _restore_vlm_modules(objective: PairSocialObjective, checkpoint: Path) -> di
     if not modules_path.exists() or not trainer_path.exists():
         raise FileNotFoundError(f"incomplete pair checkpoint: {checkpoint}")
     modules = torch.load(modules_path, map_location="cpu", weights_only=False)
-    objective.vlm.projector.load_state_dict(modules["projector"], strict=True)
+    if "projector" in modules:
+        objective.vlm.projector.load_state_dict(modules["projector"], strict=True)
     if not isinstance(objective, PairGenerativeObjective):
         with torch.no_grad():
             objective.vlm.social_query.copy_(
@@ -513,8 +546,13 @@ def save_vlm_checkpoint(
     objective.vlm.backbone.save_pretrained(path / "adapter")
     processor.save_pretrained(path / "processor")
     if isinstance(objective, PairGenerativeObjective):
-        # generative: only the graph projector learns besides LoRA (no social_query/decoder).
-        modules = {"generative": True, "projector": _cpu_state_dict(objective.vlm.projector)}
+        if isinstance(objective.vlm, TextGenerativeVLM):
+            # text mode: graph evidence is text in the prompt; no projector to save.
+            modules = {"generative": True, "text_evidence": True}
+        else:
+            # gtoken generative: only the graph projector learns besides LoRA (no
+            # social_query/decoder).
+            modules = {"generative": True, "projector": _cpu_state_dict(objective.vlm.projector)}
     else:
         modules = {
             "projector": _cpu_state_dict(objective.vlm.projector),
@@ -640,6 +678,7 @@ def collect_generative_predictions(
     """
     collector = PairPredictionCollector()
     eval_dataset = dataset
+    uses_text_collate = getattr(dataset, "graph_evidence", "gtoken") == "text"
     if route_threshold is not None:
         high, low = partition_by_graph_confidence(
             dataset.annotations, dataset.graph_cache, route_threshold
@@ -659,8 +698,13 @@ def collect_generative_predictions(
         if not low:
             return collector
         eval_dataset = Subset(dataset, low)
+    eval_collate = (
+        make_text_generative_eval_collate(processor)
+        if uses_text_collate
+        else make_generative_eval_collate(processor)
+    )
     loader = make_validation_loader(
-        eval_dataset, make_generative_eval_collate(processor), batch_size, num_workers,
+        eval_dataset, eval_collate, batch_size, num_workers,
         pin_memory=device.type == "cuda",
     )
     was_training = objective.training
@@ -844,6 +888,7 @@ def main() -> None:
     input_cfg = cfg.get("input", {})
     output_mode = str(cfg.get("model", {}).get("output", "yesno"))
     generative = output_mode == "generative"
+    builders = select_generative_builders(cfg)
     draw_bboxes = bool(input_cfg.get("draw_bboxes", True))
     reuse_vision = (
         not draw_bboxes
@@ -865,9 +910,14 @@ def main() -> None:
             raw_image_cache_size=int(cfg.train.get("raw_image_cache_size", 16)),
             draw_bboxes=draw_bboxes,
             output_mode=output_mode,
+            graph_evidence=builders.graph_evidence,
         )
         if generative:
-            collate = make_generative_collate(processor)
+            collate = (
+                make_text_generative_collate(processor)
+                if builders.uses_text_collate
+                else make_generative_collate(processor)
+            )
         else:
             collate = make_pair_collate(processor, reuse_vision=reuse_vision)
         batch_size = int(cfg.train.bs)
@@ -997,6 +1047,7 @@ def main() -> None:
                 raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
                 draw_bboxes=draw_bboxes,
                 output_mode=output_mode,
+                graph_evidence=builders.graph_evidence,
                 generative_prompt_seed=seed if generative else None,
             )
         elif mode == "graph_mlp":

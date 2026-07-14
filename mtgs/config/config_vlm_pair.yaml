@@ -17,6 +17,10 @@ model:
   # [{"label": 0}]; graph vectors are injected at <gtok0>...<gtok3>.
   # yesno is the legacy hidden-state / LM-head readout path.
   output: generative
+  # gtoken: legacy graph feature soft-tokens at <gtok*>.
+  # text  : graph predictions written as natural-language probabilities in the prompt;
+  #         answer is a single word yes/no scored by logP(yes)-logP(no). No <gtok> injection.
+  graph_evidence: text
   # Used only by graph_mlp/features_mlp controls and the legacy yesno path.
   decoder_hidden_dim: 512
   decoder_dropout: 0.1
@@ -31,8 +35,10 @@ model:
     targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 input:
-  # Generative mode uses the raw image and text bbox coordinates; it therefore remains false.
-  draw_bboxes: false
+  # text graph_evidence mode enables the red/blue A/B bbox overlay so the model can bind
+  # "Person A"/"Person B" visually. gtoken generative forces this off internally regardless
+  # of this setting (see PairInputDataset.draw_bboxes).
+  draw_bboxes: true
   # Cross-pair vision reuse is implemented only for the legacy yesno collate.
   # Disable these fields so experiment metadata does not imply it was used here.
   reuse_frozen_vision: false

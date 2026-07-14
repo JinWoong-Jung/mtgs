@@ -371,3 +371,24 @@ def test_actual_tiny_qwen_peft_keeps_only_lora_and_new_modules_trainable():
         )
     finally:
         objective.close()
+
+
+def test_graph_evidence_config_selects_text_collate(monkeypatch):
+    # Guard: a text-mode config must resolve to the text collate + text dataset arg.
+    from vlm.train_pair import select_generative_builders
+
+    text_builders = select_generative_builders(
+        {"model": {"output": "generative", "graph_evidence": "text"}}
+    )
+    assert text_builders.graph_evidence == "text"
+    assert text_builders.uses_text_collate is True
+    gtok_builders = select_generative_builders(
+        {"model": {"output": "generative", "graph_evidence": "gtoken"}}
+    )
+    assert gtok_builders.graph_evidence == "gtoken"
+    assert gtok_builders.uses_text_collate is False
+    default_builders = select_generative_builders({"model": {"output": "generative"}})
+    assert default_builders.graph_evidence == "gtoken"
+    assert default_builders.uses_text_collate is False
+    with pytest.raises(ValueError, match="graph_evidence"):
+        select_generative_builders({"model": {"graph_evidence": "bogus"}})
