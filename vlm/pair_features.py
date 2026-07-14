@@ -326,3 +326,90 @@ def assemble_generative_graph(sample: PairSample, cache: Mapping[str, object]) -
     else:
         raise ValueError(f"unknown social task {sample.task!r}")
     return GenGraphEvidence(sample.task, feats, present)
+
+
+# ── Text graph evidence: natural-language probabilities (no feature injection) ───────────
+@dataclass(frozen=True)
+class PersonGazeText:
+    """SA-only per-person summary rendered as text.
+
+    ``third_*`` is the most-likely OTHER person this person gazes at (excluding the pair
+    partner and non-visible slots); ``None`` when no such person exists. ``nonperson_prob``
+    is P(gaze lands on an in-frame non-person point) = sigmoid(null_in_logits)."""
+    third_bbox: tuple[float, float, float, float] | None
+    third_prob: float | None
+    nonperson_prob: float | None
+
+
+@dataclass(frozen=True)
+class TextGraphEvidence:
+    """Graph predictions for one pair, ready to be written into the prompt as sentences.
+
+    LAH : p_ab only.               LAEO: p_ab and p_ba (directional looking probs).
+    SA  : person_a / person_b (third-person + non-person location probs)."""
+    task: str
+    p_ab: float | None = None
+    p_ba: float | None = None
+    person_a: PersonGazeText | None = None
+    person_b: PersonGazeText | None = None
+
+
+def _sa_person_text(
+    self_idx: int,
+    partner_idx: int,
+    lah_logits: torch.Tensor,
+    null_in_logits: torch.Tensor,
+    head_bboxes: torch.Tensor,
+    vis_mask: torch.Tensor | None,
+) -> PersonGazeText:
+    n = lah_logits.shape[0]
+    best_k, best_logit = None, None
+    for k in range(n):
+        if k in (self_idx, partner_idx):
+            continue
+        if vis_mask is not None and not bool(vis_mask[k]):
+            continue
+        logit = float(lah_logits[self_idx, k])
+        if best_logit is None or logit > best_logit:
+            best_logit, best_k = logit, k
+    if best_k is None:
+        third_bbox, third_prob = None, None
+    else:
+        third_bbox = tuple(round(float(v), 2) for v in head_bboxes[best_k].tolist())
+        third_prob = float(torch.sigmoid(torch.tensor(best_logit)))
+    nonperson = float(torch.sigmoid(null_in_logits[self_idx].float()))
+    return PersonGazeText(third_bbox=third_bbox, third_prob=third_prob, nonperson_prob=nonperson)
+
+
+def assemble_text_graph_evidence(
+    sample: PairSample, cache: Mapping[str, object]
+) -> TextGraphEvidence:
+    """Read the frozen graph's per-pair probabilities for the natural-language prompt."""
+    lah = _tensor(cache, "lah_logits", 2).float()
+    a, b = sample.person_i, sample.person_j
+    n = lah.shape[0]
+    for name, idx in (("person_i", a), ("person_j", b)):
+        if not 0 <= idx < n:
+            raise IndexError(f"{name}={idx} outside person range [0,{n})")
+
+    if sample.task == "lah":
+        return TextGraphEvidence(task="lah", p_ab=float(torch.sigmoid(lah[a, b])))
+    if sample.task == "laeo":
+        return TextGraphEvidence(
+            task="laeo",
+            p_ab=float(torch.sigmoid(lah[a, b])),
+            p_ba=float(torch.sigmoid(lah[b, a])),
+        )
+    if sample.task == "sa":
+        null_in = _tensor(cache, "null_in_logits", 1)
+        bboxes = cache.get("head_bboxes")
+        if not torch.is_tensor(bboxes) or bboxes.ndim != 2 or bboxes.shape[1] != 4:
+            raise ValueError(f"head_bboxes must be [N,4] for {sample.sid!r}")
+        vis = cache.get("vis_mask")
+        vis = vis if torch.is_tensor(vis) else None
+        return TextGraphEvidence(
+            task="sa",
+            person_a=_sa_person_text(a, b, lah, null_in, bboxes, vis),
+            person_b=_sa_person_text(b, a, lah, null_in, bboxes, vis),
+        )
+    raise ValueError(f"unknown social task {sample.task!r}")

@@ -7,6 +7,9 @@ from vlm.pair_features import (
     SLOT_NAMES,
     assemble_pair_graph_evidence,
     stack_pair_graph_evidence,
+    PersonGazeText,
+    TextGraphEvidence,
+    assemble_text_graph_evidence,
 )
 
 
@@ -166,3 +169,57 @@ def test_half_cache_casts_only_fixed_outputs_to_float32():
 def test_empty_batch_is_rejected():
     with pytest.raises(ValueError, match="empty"):
         stack_pair_graph_evidence([])
+
+
+def _text_cache(n=4):
+    torch.manual_seed(0)
+    lah = torch.full((n, n), -3.0)
+    lah[0, 1] = 2.0      # P(A->B) high
+    lah[1, 0] = -1.0     # P(B->A) low-ish
+    lah[0, 2] = 1.0      # A's best third person is 2
+    lah[1, 3] = 0.5      # B's best third person is 3
+    return {
+        "lah_logits": lah,
+        "null_in_logits": torch.tensor([0.0, 0.8, -0.5, 0.2]),  # sigmoid -> .5,.69,.38,.55
+        "head_bboxes": torch.tensor([[0., 0., 1., 1.],
+                                     [2., 2., 3., 3.],
+                                     [4., 4., 5., 5.],
+                                     [6., 6., 7., 7.]]),
+        "vis_mask": torch.ones(n, dtype=torch.bool),
+    }
+
+
+def test_text_evidence_lah_is_directional_ab_only():
+    s = PairSample(sid="x", task="lah", person_i=0, person_j=1, label=1, raw_i=0, raw_j=1)
+    ev = assemble_text_graph_evidence(s, _text_cache())
+    assert abs(ev.p_ab - torch.sigmoid(torch.tensor(2.0)).item()) < 1e-5
+    assert ev.p_ba is None and ev.person_a is None and ev.person_b is None
+
+
+def test_text_evidence_laeo_has_both_directions():
+    s = PairSample(sid="x", task="laeo", person_i=0, person_j=1, label=0, raw_i=0, raw_j=1)
+    ev = assemble_text_graph_evidence(s, _text_cache())
+    assert abs(ev.p_ab - torch.sigmoid(torch.tensor(2.0)).item()) < 1e-5
+    assert abs(ev.p_ba - torch.sigmoid(torch.tensor(-1.0)).item()) < 1e-5
+    assert ev.person_a is None
+
+
+def test_text_evidence_sa_picks_best_third_person_and_nonperson_prob():
+    s = PairSample(sid="x", task="sa", person_i=0, person_j=1, label=1, raw_i=0, raw_j=1)
+    ev = assemble_text_graph_evidence(s, _text_cache())
+    # A's best third (k not in {0,1}) is person 2, bbox [4,4,5,5]
+    assert ev.person_a.third_bbox == (4.0, 4.0, 5.0, 5.0)
+    assert abs(ev.person_a.third_prob - torch.sigmoid(torch.tensor(1.0)).item()) < 1e-5
+    assert abs(ev.person_a.nonperson_prob - torch.sigmoid(torch.tensor(0.0)).item()) < 1e-5
+    # B's best third (k not in {0,1}) is person 3, bbox [6,6,7,7]
+    assert ev.person_b.third_bbox == (6.0, 6.0, 7.0, 7.0)
+    assert ev.p_ab is None
+
+
+def test_text_evidence_sa_no_third_person_when_none_visible():
+    cache = _text_cache()
+    cache["vis_mask"] = torch.tensor([True, True, False, False])  # only A,B visible
+    s = PairSample(sid="x", task="sa", person_i=0, person_j=1, label=0, raw_i=0, raw_j=1)
+    ev = assemble_text_graph_evidence(s, cache)
+    assert ev.person_a.third_bbox is None and ev.person_a.third_prob is None
+    assert ev.person_a.nonperson_prob is not None
