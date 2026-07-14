@@ -402,8 +402,8 @@ def assemble_text_graph_evidence(
         )
     if sample.task == "sa":
         null_in = _tensor(cache, "null_in_logits", 1)
-        bboxes = cache.get("head_bboxes")
-        if not torch.is_tensor(bboxes) or bboxes.ndim != 2 or bboxes.shape[1] != 4:
+        bboxes = _tensor(cache, "head_bboxes", 2)
+        if bboxes.shape[1] != 4:
             raise ValueError(f"head_bboxes must be [N,4] for {sample.sid!r}")
         vis = cache.get("vis_mask")
         vis = vis if torch.is_tensor(vis) else None
