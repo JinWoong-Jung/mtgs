@@ -46,7 +46,7 @@ gaze_graph:
   prior_weight: 0.5     # initial value of prior_w
   use_node_xattn: true  # (V14에서 deprecated: node init은 heatmap XAttn 미사용)
   frozen: false         # true: freeze trunk, train only gaze_graph_block
-  laeo_derive: "lah_min"  # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
+  laeo_derive: "decoder"  # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
   lambda_null: 0.5      # weight for dual null-edge loss (null_in + null_out)
 
 # (vlm: 섹션 제거됨 — VLM은 향후 동료 코드로 재도입 예정)

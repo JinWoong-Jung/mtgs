@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from vlm.vision_cache import DiskVisionFrame, VisionDiskCache, VisionDiskCacheWriter
+from vlm.runtime.vision_cache import DiskVisionFrame, VisionDiskCache, VisionDiskCacheWriter
 
 
 def _frame(value: float) -> DiskVisionFrame:

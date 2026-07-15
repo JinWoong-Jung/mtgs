@@ -144,21 +144,33 @@ class VideoLAEODataset_temporal(Dataset):
         person_ids = img_annotations["person_ids"]
         inout = img_annotations["inout"]
 
-        # shuffle person ids during training
-        if self.split == "train":
-            shuffle_idx = get_shuffle_idx(inout)
-            person_ids = person_ids[shuffle_idx]
-
-        # keep up to num_people ids
-        num_heads = len(person_ids)
-        num_keep = num_heads
-        if self.num_people != "all":
+        # Offline VLM extraction can pin the exact original person IDs selected
+        # for this frame.  The normal MTGS path remains stochastic and unchanged.
+        forced_person_ids = getattr(self, "vlm_person_ids_by_path", None)
+        if forced_person_ids is not None:
+            try:
+                person_ids = np.asarray(forced_person_ids[path], dtype=person_ids.dtype)
+            except KeyError as exc:
+                raise KeyError(f"missing frozen VLM person selection for {path!r}") from exc
+            if self.num_people == "all" or len(person_ids) > self.num_people:
+                raise ValueError(f"invalid frozen VLM selection of {len(person_ids)} people")
             batch_num_heads = self.num_people
-            if num_heads > 1:
-                num_keep = np.random.randint(2, min(num_heads, self.num_people) + 1)
         else:
-            batch_num_heads = num_heads
-        person_ids = person_ids[-num_keep:]
+            # shuffle person ids during training
+            if self.split == "train":
+                shuffle_idx = get_shuffle_idx(inout)
+                person_ids = person_ids[shuffle_idx]
+
+            # keep up to num_people ids
+            num_heads = len(person_ids)
+            num_keep = num_heads
+            if self.num_people != "all":
+                batch_num_heads = self.num_people
+                if num_heads > 1:
+                    num_keep = np.random.randint(2, min(num_heads, self.num_people) + 1)
+            else:
+                batch_num_heads = num_heads
+            person_ids = person_ids[-num_keep:]
         num_pairs = batch_num_heads * (batch_num_heads + 1)
 
         # randomly choose to apply the horizontal flip augmentation

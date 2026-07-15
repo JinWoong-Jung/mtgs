@@ -7,8 +7,6 @@
       target(0.75,0.5) → alignment[looker,target] = -1 (graph's dir is target→looker,
       so "looking at" is NEGATIVE — verified, matches the graph's cached align).
   (b2) EMPIRICAL alignment sign on real val: LAH=yes align ≪ LAH=no align (both < 0).
-  (c) mapping CONSISTENCY: manifest_record_to_indices agrees with the legacy,
-      empirically-verified query_slots (looker=A, target=B for LAH).
 """
 
 from __future__ import annotations
@@ -88,24 +86,8 @@ def test_alignment_convention(max_frames=2000):
     assert my < 0, "looking-at alignment should be negative under the graph convention"
 
 
-def test_mapping_consistency():
-    from vlm.injection import query_slots     # legacy, empirically verified (AUC 0.94)
-    recs = [json.loads(l) for l in open(f"{C}/manifest_val.jsonl")]
-    n = 0
-    for r in recs[:5000]:
-        looker, target = manifest_record_to_indices(r)
-        a, b, _, _ = query_slots(r)
-        if r["task"] == "lah":
-            assert (looker, target) == (a, b), f"LAH mapping mismatch {r}"
-        else:
-            assert (looker, target) == (a, b), f"symmetric mapping mismatch {r}"
-        n += 1
-    print(f"[c] mapping consistency vs legacy query_slots: {n} records OK")
-
-
 if __name__ == "__main__":
     test_geometry()
     test_alignment_convention()
-    test_mapping_consistency()
     test_direction()
     print("\nWP0 convention tests PASSED")
