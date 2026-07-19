@@ -1,4 +1,3 @@
-import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,96 +7,14 @@ import torch.nn as nn
 from PIL import Image
 
 from vlm.social.data import SocialSample
-from vlm.social.evidence import TextGraphEvidence
-from vlm.social.objective import GenerativeObjective, answer_loglik, generative_answer_token_ids
+from vlm.social.objective import GenerativeObjective, generative_answer_token_ids
 from vlm.social.input import SocialVLMInput
 from vlm.social.model import (
-    GraphTokenProjector,
     TextGenerativeVLM,
-    graph_token_masks,
     make_text_generative_collate,
     make_text_generative_direct_eval_collate,
     make_text_generative_eval_collate,
 )
-from vlm.social.prompt import (
-    FINAL_PROBABILITY_QUESTION,
-    GRAPH_EVIDENCE_INTRO,
-    GRAPH_TOKENS,
-    GRAPH_TOKEN_COUNT,
-    QUESTION_BANK,
-    SOCIAL_RELATION_TOKEN,
-    compose_generative_prompt,
-    generative_answer_json,
-    parse_label_probability,
-    validate_generative_prompt,
-)
-
-
-def test_compositional_prompt_bank_samples_and_keeps_task_graph_tokens():
-    box_a, box_b = [0.12, 0.18, 0.26, 0.42], [0.58, 0.21, 0.73, 0.46]
-    for task in ("lah", "laeo", "sa"):
-        validate_generative_prompt(task, box_a, box_b)
-        text = compose_generative_prompt(task, box_a, box_b, rng=random.Random(3))
-        assert "0.12" in text and "0.58" in text                 # bbox coords substituted
-        assert SOCIAL_RELATION_TOKEN not in text
-        for k, token in enumerate(GRAPH_TOKENS):
-            assert text.count(token) == (1 if k < GRAPH_TOKEN_COUNT[task] else 0)
-        assert '[{"label": y}]' in text
-        assert GRAPH_EVIDENCE_INTRO in text
-        assert FINAL_PROBABILITY_QUESTION in text
-        assert len(QUESTION_BANK[task]) == 10                    # ten question paraphrases
-
-
-def test_answer_json_and_probability_parser():
-    assert generative_answer_json(1) == '[{"label": 1}]'
-    assert generative_answer_json(0) == '[{"label": 0}]'
-    assert parse_label_probability('{"label": 0.83}') == 0.83
-    assert parse_label_probability('{"label": 9.0}') == 1.0      # clamp
-    assert parse_label_probability("no json", default=0.5) == 0.5
-
-
-def test_graph_token_masks_allow_variable_presence():
-    token_ids = {tok: 900 + i for i, tok in enumerate(GRAPH_TOKENS)}
-    # SA uses only gtok0, gtok1
-    row = [7, 900, 5, 901, 5]
-    masks = graph_token_masks(torch.tensor([row]), token_ids)
-    assert masks.shape == (1, len(row), 4)
-    assert masks.sum().item() == 2
-    assert masks[0, :, 2].sum().item() == 0                      # absent slots have no position
-
-
-def test_graph_token_projector_shapes():
-    proj = GraphTokenProjector(graph_dim=16, output_dim=8)
-    out = proj(torch.randn(3, 4, 16))
-    assert out.shape == (3, 4, 8)
-
-
-def test_answer_loglik_and_score():
-    logits = torch.zeros(2, 4, 5)
-    logits[0, 2, 3] = 10.0
-    labels = torch.full((2, 4), -100)
-    labels[:, 3] = 3
-    ll = answer_loglik(logits, labels)
-    assert ll[0] > ll[1]
-
-    class _FakeGenVLM(nn.Module):
-        def __init__(self, n):
-            super().__init__()
-            self.w = nn.Parameter(torch.randn(n, 4, 5))
-
-        def forward(self, model_inputs):
-            return SimpleNamespace(logits=self.w, loss=self.w.mean())
-
-        def close(self):
-            pass
-
-    num_pairs = 3
-    obj = GenerativeObjective(_FakeGenVLM(2 * num_pairs))
-    lab = torch.full((2 * num_pairs, 4), -100)
-    lab[:, 3] = 1
-    prob = obj.score({"labels": lab}, num_pairs)
-    assert prob.shape == (num_pairs,)
-    assert bool(((prob >= 0) & (prob <= 1)).all())
 
 
 class _StubBackbone(torch.nn.Module):
@@ -212,7 +129,6 @@ def _unmarked_text_item():
         ),
         image=Image.new("RGB", (56, 56), "black"),
         prompt="Is Person A looking at Person B? Answer yes or no.",
-        evidence=TextGraphEvidence(task="lah", p_ab=0.5),
         vision_cache_key="/split/tiny/frame.png",
     )
 
@@ -238,52 +154,6 @@ def test_make_text_generative_eval_collate_reuse_dedups_across_2b_candidates():
     assert batch["vision_reuse_indices"].tolist() == [0, 0, 0, 0]
     assert batch["vision_unique_grid_thw"].shape == (1, 3)
     assert batch["vision_frame_ids"] == ("/split/tiny/frame.png",)
-
-
-def test_text_objective_score_returns_probability_per_pair():
-    vlm = TextGenerativeVLM(_StubBackbone())
-    obj = GenerativeObjective(vlm)
-    # 2 pairs -> [2B]=4 rows: pos_0,pos_1,neg_0,neg_1
-    inp = {"input_ids": torch.randint(0, 32, (4, 6)),
-           "labels": torch.randint(0, 32, (4, 6))}
-    prob = obj.score(inp, num_pairs=2)
-    assert prob.shape == (2,)
-    assert torch.all((prob >= 0) & (prob <= 1))
-
-
-def test_text_score_prefers_yes_when_backbone_prefers_yes():
-    """logP(yes)-logP(no) sign wiring: a backbone that always emits high logit for a fixed
-    'yes' token id must score the yes-candidate above the no-candidate."""
-    import torch
-    from vlm.social.objective import GenerativeObjective
-    from vlm.social.model import TextGenerativeVLM
-
-    YES_ROW, NO_ROW = 5, 6      # pretend token ids; yes-candidate label row uses YES_ROW
-
-    class Prefer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            # TextGenerativeVLM.forward resolves the target device via
-            # next(self.backbone.parameters()); real backbones (Qwen etc.) always have
-            # parameters, so give the stub one inert buffer-like param to match that contract.
-            self.dummy = torch.nn.Parameter(torch.zeros(1))
-
-        def forward(self, input_ids=None, labels=None, **kw):
-            B, L = input_ids.shape
-            logits = torch.zeros(B, L, 8)
-            logits[..., YES_ROW] = 3.0        # always confident about the yes token
-            out = type("O", (), {})()
-            out.logits, out.loss = logits, None
-            return out
-
-    obj = GenerativeObjective(TextGenerativeVLM(Prefer()))
-    # pair 0: yes-candidate labels point at YES_ROW; no-candidate at NO_ROW
-    labels = torch.full((2, 4), -100)
-    labels[0, 1:] = YES_ROW      # positive (yes) candidate
-    labels[1, 1:] = NO_ROW       # negative (no) candidate
-    inp = {"input_ids": torch.zeros(2, 4, dtype=torch.long), "labels": labels}
-    prob = obj.score(inp, num_pairs=1)
-    assert prob.item() > 0.5
 
 
 def test_text_generative_vlm_reuse_matches_no_reuse_numerically():
@@ -404,6 +274,12 @@ def test_direct_yesno_score_is_sigmoid_of_the_two_answer_logits():
     torch.testing.assert_close(
         probability, torch.sigmoid(torch.tensor([2.0, -3.0]))
     )
+
+
+def test_generative_score_requires_direct_token_ids():
+    obj = GenerativeObjective(TextGenerativeVLM(_StubBackbone()))
+    with pytest.raises(ValueError, match="direct_yes_no_token_ids"):
+        obj.score({}, num_pairs=1)
 
 
 def test_text_direct_eval_collate_has_one_prompt_per_pair():

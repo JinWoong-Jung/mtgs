@@ -1,10 +1,12 @@
-"""Checkpoint evaluation and 5-way comparison for pair-wise social VLM models.
+"""Checkpoint evaluation and comparison for the pair-wise social-gaze VLM.
+
+Two modes only: the frozen-graph ``raw_graph`` baseline and the generative text-evidence
+``vlm``. Each run reports both, so a single ``vlm`` run yields the graph-vs-VLM table.
 
 Examples::
 
     python -m vlm.social.evaluate run --mode raw_graph ...
-    python -m vlm.social.evaluate run --mode features_mlp --checkpoint .../best ...
-    python -m vlm.social.evaluate run --mode vlm --name vlm_lm_aux --checkpoint .../best ...
+    python -m vlm.social.evaluate run --mode vlm --name my_vlm --checkpoint .../best ...
     python -m vlm.social.evaluate compare result_dirs_or_json_files...
 """
 
@@ -25,44 +27,27 @@ from vlm.social.evaluation import (
     evaluate_predictions,
     format_graph_model_table,
     format_metrics,
+    format_metrics_table,
+    format_routing_comparison_table,
     metric_deltas,
     metric_payload,
     raw_graph_predictions,
+    routing_low_confidence_keys,
 )
-from vlm.social.objective import (
-    GraphFeatureMLPControl,
-    GraphLogitMLPControl,
-    SocialObjective,
-    TaskBCELoss,
-)
-from vlm.social.input import (
-    GraphControlDataset,
-    GraphFeatureControlDataset,
-    SocialInputDataset,
-    control_collate,
-    feature_control_collate,
-)
-from vlm.social.model import (
-    make_generative_collate,
-    make_social_collate,
-    make_text_generative_collate,
-)
+from vlm.social.data import SocialAnnotationDataset
+from vlm.social.input import SocialInputDataset
 from vlm.social.training import (
     _load_graph_cache,
     _processor,
     _restore_vlm_modules,
     _route_threshold,
     build_generative_objective,
-    build_vlm_objective,
     collect_generative_predictions,
-    make_validation_loader,
-    restore_control_checkpoint,
-    run_epoch,
     select_generative_builders,
 )
 
 
-EVAL_MODES = ("raw_graph", "graph_mlp", "features_mlp", "vlm")
+EVAL_MODES = ("raw_graph", "vlm")
 
 
 def _resolve_device(value: str, mode: str) -> torch.device:
@@ -81,23 +66,6 @@ def _validate_checkpoint_mode(state: Mapping[str, Any], mode: str) -> None:
     saved = state.get("mode")
     if saved is not None and saved != mode:
         raise ValueError(f"checkpoint mode is {saved!r}, requested evaluator mode is {mode!r}")
-
-
-def _control_module(cfg, mode: str, dataset, device: torch.device):
-    if mode == "graph_mlp":
-        return GraphLogitMLPControl(
-            hidden_dim=int(cfg.control.get("hidden_dim", 32)),
-            dropout=float(cfg.control.get("dropout", 0.0)),
-        ).to(device)
-    if mode == "features_mlp":
-        return GraphFeatureMLPControl(
-            feature_dim=dataset.feature_dim,
-            hidden_dim=int(cfg.control.get("feature_hidden_dim", 512)),
-            dropout=float(cfg.control.get("dropout", 0.0)),
-            include_heatmaps=bool(cfg.control.get("include_heatmaps", False)),
-            heatmap_pool_size=int(cfg.control.get("heatmap_pool_size", 8)),
-        ).to(device)
-    raise ValueError(f"not a control mode: {mode}")
 
 
 def _checkpoint_summary(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -130,14 +98,6 @@ def _variant_settings(cfg, mode: str) -> dict[str, Any]:
             and bool(input_cfg.get("group_by_frame", False)),
             "vision_cache_size": int(input_cfg.get("vision_cache_size", 0)),
         }
-    if mode == "features_mlp":
-        return {
-            "include_heatmaps": bool(cfg.control.get("include_heatmaps", False)),
-            "heatmap_pool_size": int(cfg.control.get("heatmap_pool_size", 8)),
-            "hidden_dim": int(cfg.control.get("feature_hidden_dim", 512)),
-        }
-    if mode == "graph_mlp":
-        return {"hidden_dim": int(cfg.control.get("hidden_dim", 32))}
     return {}
 
 
@@ -146,17 +106,40 @@ def run_evaluation(args) -> dict[str, Any]:
     if mode not in EVAL_MODES:
         raise ValueError(f"mode must be one of {EVAL_MODES}, got {mode!r}")
     cfg = OmegaConf.load(args.config)
+    # Confidence-gated routing mixes the frozen graph's and the VLM's independent score
+    # scales, so AP/AUC over the combined predictions are not meaningful once routed --
+    # only report F1 in that case (see format_graph_model_table / format_metrics docstrings).
+    routing_on = mode == "vlm" and bool(cfg.get("routing", {}).get("use", False))
+    routing_threshold = float(cfg.get("routing", {}).get("threshold", 0.8))
     graph_cache = _load_graph_cache(args.graph_feats)
     device = _resolve_device(args.device, mode)
     threshold = float(args.threshold)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    wandb = None
+    if not getattr(args, "wandb_off", True):
+        import wandb as wandb_module
+
+        wandb = wandb_module
+        run_id = str(getattr(args, "wandb_run_id", "")).strip()
+        init_kwargs = dict(
+            project="MTGS",
+            entity="gaze-social",
+            group="vlm",
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
+        if run_id:
+            init_kwargs.update(id=run_id, resume="must")
+        else:
+            init_kwargs.update(
+                job_type="test", name=args.name or f"{cfg.experiment.name}_{mode}"
+            )
+        wandb.init(**init_kwargs)
     processor = objective = None
+    dataset = None
     input_cfg = cfg.get("input", {})
-    generative = mode == "vlm"
-    output_mode = "generative" if generative else "yesno"
-    generative_builders = select_generative_builders(cfg) if generative else None
+    generative_builders = select_generative_builders(cfg) if mode == "vlm" else None
     reuse_vision = mode == "vlm" and generative_builders.reuse_vision
     group_by_frame = reuse_vision and bool(
         input_cfg.get("group_by_frame", False)
@@ -173,46 +156,30 @@ def run_evaluation(args) -> dict[str, Any]:
             args.frame_root,
             graph_cache,
             raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
-            output_mode=output_mode,
-            graph_evidence="text",
-            generative_prompt_seed=int(cfg.val.get("prompt_seed", cfg.train.get("seed", 101))) if generative else None,
-            include_graph_evidence=(
-                generative_builders.include_graph_evidence if generative_builders else True
-            ),
+            generative_prompt_seed=int(cfg.val.get("prompt_seed", cfg.train.get("seed", 101))),
+            include_graph_evidence=generative_builders.include_graph_evidence,
         )
-        if generative:
-            collate = (
-                make_text_generative_collate(
-                    processor, reuse_vision=generative_builders.reuse_vision
-                )
-                if generative_builders.uses_text_collate
-                else make_generative_collate(processor)
-            )
-        else:
-            collate = make_social_collate(processor, reuse_vision=reuse_vision)
-    elif mode == "features_mlp":
-        if not args.checkpoint:
-            raise ValueError("features_mlp evaluation requires --checkpoint")
-        checkpoint = Path(args.checkpoint)
-        dataset = GraphFeatureControlDataset(args.manifest, graph_cache)
-        collate = feature_control_collate
-    else:
-        checkpoint = None if mode == "raw_graph" else Path(args.checkpoint)
-        if mode == "graph_mlp" and not args.checkpoint:
-            raise ValueError("graph_mlp evaluation requires --checkpoint")
-        dataset = GraphControlDataset(args.manifest, graph_cache)
-        collate = control_collate
+        annotations = dataset.annotations
+    else:  # raw_graph: no VLM, no frames -- only the frozen graph logits are scored.
+        checkpoint = None
+        annotations = SocialAnnotationDataset(args.manifest)
 
-    expected_keys = [sample.eval_key for sample in dataset.annotations]
-    expected_sids = {sample.sid for sample in dataset.annotations}
-    graph_collector = raw_graph_predictions(dataset.annotations, graph_cache)
+    expected_keys = [sample.eval_key for sample in annotations.samples]
+    expected_sids = {sample.sid for sample in annotations.samples}
+    graph_collector = raw_graph_predictions(annotations.samples, graph_cache)
     graph_metrics = evaluate_predictions(
         args.gtmeta,
         graph_collector.probabilities,
         expected_sids=expected_sids,
         threshold=threshold,
     )
-    print(format_metrics(graph_metrics, "raw_graph"), flush=True)
+    print(format_metrics(graph_metrics, "raw_graph", f1_only=routing_on), flush=True)
+    if wandb is not None:
+        wandb.log({
+            f"metric/test_graph/{key}": value
+            for key, value in metric_payload(graph_metrics).items()
+            if value is not None
+        })
 
     state = None
     stats = None
@@ -220,69 +187,30 @@ def run_evaluation(args) -> dict[str, Any]:
         collector = graph_collector
         metrics = graph_metrics
     else:
-        del graph_collector
+        if not routing_on:
+            # Routing needs graph_collector.records for the final diagnostic table
+            # (format_routing_comparison_table); otherwise free it now as before.
+            del graph_collector
         if checkpoint is None or not checkpoint.exists():
             raise FileNotFoundError(f"checkpoint does not exist: {checkpoint}")
-        criterion = TaskBCELoss().to(device)
-        if mode == "vlm" and generative:
-            objective, _ = build_generative_objective(cfg, processor, device, checkpoint)
-            module = objective
-            state = _restore_vlm_modules(objective, checkpoint)
-        elif mode == "vlm":
-            vlm, decoder, _, _ = build_vlm_objective(
-                cfg, processor, device, checkpoint
-            )
-            # LM auxiliary affects training only. Evaluation needs the residual logits and
-            # therefore avoids an unnecessary full-vocabulary projection.
-            objective = SocialObjective(vlm, decoder, criterion)
-            module = objective
-            state = _restore_vlm_modules(objective, checkpoint)
-        else:
-            module = _control_module(cfg, mode, dataset, device)
-            state = restore_control_checkpoint(checkpoint, module, criterion)
+        objective, _ = build_generative_objective(cfg, processor, device, checkpoint)
+        module = objective
+        state = _restore_vlm_modules(objective, checkpoint)
         _validate_checkpoint_mode(state, mode)
 
-        default_bs = (
-            int(cfg.val.bs)
-            if mode == "vlm"
-            else int(
-                cfg.control.get(
-                    "feature_val_bs" if mode == "features_mlp" else "val_bs",
-                    cfg.control.get("val_bs", cfg.control.get("bs", 1024)),
-                )
-            )
-        )
-        batch_size = default_bs if args.batch_size <= 0 else int(args.batch_size)
+        batch_size = int(cfg.val.bs) if args.batch_size <= 0 else int(args.batch_size)
         default_workers = int(cfg.val.get("num_workers", 4))
         num_workers = default_workers if args.num_workers < 0 else int(args.num_workers)
-        loader = make_validation_loader(
-            dataset,
-            collate,
-            batch_size,
-            num_workers,
-            pin_memory=device.type == "cuda",
-            group_by_frame=group_by_frame,
-        )
         collector = PredictionCollector()
         try:
-            if mode == "vlm" and generative:
-                collector = collect_generative_predictions(
-                    module, dataset, processor,
-                    batch_size=batch_size, num_workers=num_workers,
-                    device=device, description=f"eval:{mode}",
-                    reuse_vision=generative_builders.reuse_vision,
-                    group_by_frame=group_by_frame,
-                    route_threshold=_route_threshold(cfg),
-                )
-            else:
-                stats = run_epoch(
-                    module,
-                    loader,
-                    device=device,
-                    criterion=None if mode == "vlm" else criterion,
-                    description=f"eval:{mode}",
-                    prediction_collector=collector,
-                )
+            collector = collect_generative_predictions(
+                module, dataset, processor,
+                batch_size=batch_size, num_workers=num_workers,
+                device=device, description=f"Test [{args.name or mode}]",
+                reuse_vision=generative_builders.reuse_vision,
+                group_by_frame=group_by_frame,
+                route_threshold=_route_threshold(cfg),
+            )
         finally:
             if objective is not None:
                 objective.close()
@@ -293,7 +221,14 @@ def run_evaluation(args) -> dict[str, Any]:
             expected_sids=expected_sids,
             threshold=threshold,
         )
-        print(format_metrics(metrics, args.name or mode), flush=True)
+        print(format_metrics(metrics, args.name or mode, f1_only=routing_on), flush=True)
+
+    if wandb is not None:
+        wandb.log({
+            f"metric/test/{key}": value
+            for key, value in metric_payload(metrics).items()
+            if value is not None
+        })
 
     collector.save(output_dir / "predictions.pt")
     details = (
@@ -325,17 +260,41 @@ def run_evaluation(args) -> dict[str, Any]:
     result_path = output_dir / "result.json"
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"[pair-eval] wrote {result_path}", flush=True)
+    # Keep this as the final stdout block for a redirected test .out file.
     if mode != "raw_graph":
-        # Keep this as the final stdout block for a redirected test .out file.
+        if routing_on:
+            low_conf_keys = routing_low_confidence_keys(
+                dataset.annotations, graph_cache, routing_threshold
+            )
+            print(
+                format_routing_comparison_table(
+                    graph_collector.records,
+                    collector.records,
+                    low_conf_keys,
+                    graph_metrics,
+                    metrics,
+                    threshold=routing_threshold,
+                    model_name=args.name or mode,
+                ),
+                flush=True,
+            )
+        else:
+            print(
+                format_graph_model_table(
+                    graph_metrics,
+                    metrics,
+                    dataset.annotations,
+                    model_name=args.name or mode,
+                ),
+                flush=True,
+            )
+    else:
         print(
-            format_graph_model_table(
-                graph_metrics,
-                metrics,
-                dataset.annotations,
-                model_name=args.name or mode,
-            ),
+            format_metrics_table(metrics, annotations, title=args.name or mode),
             flush=True,
         )
+    if wandb is not None:
+        wandb.finish()
     return result
 
 
@@ -432,10 +391,12 @@ def _run_parser(subparsers) -> None:
     parser.add_argument("--graph_feats", required=True)
     parser.add_argument("--gtmeta", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--wandb_run_id", default="")
     parser.add_argument("--batch_size", type=int, default=0)
     parser.add_argument("--num_workers", type=int, default=-1)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--wandb_off", action="store_true")
 
 
 def _compare_parser(subparsers) -> None:

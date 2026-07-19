@@ -1,19 +1,26 @@
 #!/bin/bash
 
-#SBATCH --job-name=eval_vlm
-#SBATCH --gres=gpu:rtx6000:1
+#SBATCH --job-name=eval_vlm_bal
+#SBATCH --gres=gpu:mig48gb:1
 #SBATCH --time=24:00:00
 #SBATCH -c 8
 #SBATCH -p gpu
 #SBATCH --mem=48G
-#SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_%j.out
-#SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_%j.err
+#SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_balanced_%j.out
+#SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_balanced_%j.err
 
 set -e
 
 # Slurm keeps stdout/stderr separate: model loading and real errors land in .err,
 # while our own tqdm bars and the final result table (printed via Python's stdout)
 # land in .out.
+
+# One-off sibling of eval_vlm.sh: eval_vlm.sh's RUN_DIR is a hardcoded literal
+# and its test profile is always forced to "full" via input_provenance.env
+# (VLM_TEST_MANIFEST_PROFILE=full, frozen by train_vlm.sh) -- there is no way
+# to ask it for a balanced-profile test run. This script only exists to answer
+# "what does VLM_v3(balanced) score on its own balanced test split" as a first
+# quick check, ahead of the full-profile run.
 
 # Set only the completed VLM training directory.
 RUN_DIR="/home/jinwoongjung/MTGS/experiments/VLM/VLM_v3(balanced)"
@@ -30,14 +37,12 @@ else
 fi
 
 mkdir -p scripts/logs
-# Resolve every evaluation input from the selected run. `input_provenance.env`
-# is frozen by train_vlm.sh and records the cache used when that run trained.
 MODE="vlm"
 SPLIT="test"
-NAME="$(basename "$RUN_DIR")"
+NAME="$(basename "$RUN_DIR")_balanced"
 CHECKPOINT="$RUN_DIR/train/checkpoints/best"
 CONFIG="$RUN_DIR/config_vlm.yaml"
-OUT="$RUN_DIR/test"
+OUT="$RUN_DIR/test_balanced"
 DEVICE="auto"
 WANDB_OFF=1
 PROVENANCE="$RUN_DIR/input_provenance.env"
@@ -47,12 +52,14 @@ if [ ! -f "$PROVENANCE" ]; then
     exit 2
 fi
 source "$PROVENANCE"
-if [ -z "$VLM_CACHE" ] || [ -z "$VLM_TEST_MANIFEST_PROFILE" ]; then
+if [ -z "$VLM_CACHE" ]; then
     echo "Invalid input provenance: $PROVENANCE" >&2
     exit 2
 fi
 CACHE="$VLM_CACHE"
-MANIFEST_PROFILE="$VLM_TEST_MANIFEST_PROFILE"
+# Deliberately override the provenance's always-"full" test profile with
+# "balanced" -- that is this script's entire reason to exist.
+MANIFEST_PROFILE="balanced"
 MANIFEST="$CACHE/manifests/$MANIFEST_PROFILE/manifest_$SPLIT.jsonl"
 FRAME_ROOT="$CACHE/overlays/$SPLIT"
 for required in "$CONFIG" "$CHECKPOINT" "$MANIFEST" "$FRAME_ROOT" "$CACHE/vlmgraph_$SPLIT.pt" "$CACHE/gtmeta_$SPLIT.pt"; do
@@ -62,30 +69,9 @@ for required in "$CONFIG" "$CHECKPOINT" "$MANIFEST" "$FRAME_ROOT" "$CACHE/vlmgra
     fi
 done
 echo "[vlm] run=$RUN_DIR checkpoint=$CHECKPOINT cache=$CACHE test_profile=$MANIFEST_PROFILE output=$OUT"
-if [ -z "$MANIFEST_PROFILE" ] && [ "$SPLIT" = "test" ]; then
-    MANIFEST_PROFILE=full
-elif [ -z "$MANIFEST_PROFILE" ]; then
-    MANIFEST_PROFILE=$(python - "$CONFIG" <<'PYCFG'
-import sys
-from omegaconf import OmegaConf
-print(OmegaConf.load(sys.argv[1]).get("data", {}).get("profile", "full"))
-PYCFG
-)
-fi
-MANIFEST=${MANIFEST:-$CACHE/manifests/$MANIFEST_PROFILE/manifest_${SPLIT}.jsonl}
-if [ ! -f "$MANIFEST" ]; then
-    echo "Missing manifest: $MANIFEST" >&2
-    exit 2
-fi
 echo "[vlm] manifest_profile=$MANIFEST_PROFILE manifest=$MANIFEST"
-CHECKPOINT_ARGS=()
-if [ "$MODE" != "raw_graph" ]; then
-    if [ -z "$CHECKPOINT" ]; then
-        echo "CHECKPOINT is required for MODE=$MODE" >&2
-        exit 2
-    fi
-    CHECKPOINT_ARGS=(--checkpoint "$CHECKPOINT")
-fi
+
+CHECKPOINT_ARGS=(--checkpoint "$CHECKPOINT")
 WANDB_ARGS=()
 [ "$WANDB_OFF" = "1" ] && WANDB_ARGS=(--wandb_off)
 

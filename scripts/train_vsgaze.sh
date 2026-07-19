@@ -5,11 +5,11 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 #SBATCH --job-name=vsgaze_train
-#SBATCH --gres=gpu:rtx6000:1
+#SBATCH --gres=gpu:mig48gb:1
 #SBATCH --time=48:00:00
 #SBATCH -c 8
 #SBATCH -p gpu
-#SBATCH --mem=96G
+#SBATCH --mem=48G
 #SBATCH --output=logs/vg_gaze_graph_%j.out
 #SBATCH --error=logs/vg_gaze_graph_%j.err
 
@@ -33,7 +33,7 @@ WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # GazeFol
 
 FROZEN=false
 
-EXP_NAME="V18"
+EXP_NAME="MTGS+graph"
 
 CHECKPOINT_MONITOR="metric/val/social_ap"
 CHECKPOINT_MODE="max"

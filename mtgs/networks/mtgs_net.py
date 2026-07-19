@@ -54,7 +54,6 @@ class MTGS(nn.Module):
         gaze_graph_edge_dim: int = 128,
         gaze_graph_use_prior: bool = True,
         gaze_graph_prior_weight: float = 0.5,
-        gaze_graph_use_node_xattn: bool = True,
         gaze_graph_laeo_derive: str = "decoder",
         gaze_graph_use: bool = True,
     ):
@@ -171,7 +170,6 @@ class MTGS(nn.Module):
                 num_layers=gaze_graph_num_layers,
                 use_prior=gaze_graph_use_prior,
                 prior_weight=gaze_graph_prior_weight,
-                use_node_xattn=gaze_graph_use_node_xattn,
                 face_dim=token_dim,   # raw GazeEncoder token dim (pre-adaptor face)
                 laeo_derive=gaze_graph_laeo_derive,  # skip head_laeo forward when "lah_min"
             )

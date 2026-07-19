@@ -44,6 +44,7 @@ class ManifestReport:
     frame_offset: int
     approximate_sid_stride: bool
     counts: dict[str, dict[str, int]]
+    boundary_removed: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,7 @@ class ManifestReport:
             "frame_offset": self.frame_offset,
             "approximate_sid_stride": self.approximate_sid_stride,
             "counts": self.counts,
+            "boundary_removed": self.boundary_removed,
         }
 
 
@@ -196,6 +198,39 @@ def balance_task_labels(records: Sequence[Record], *, seed: int) -> list[Record]
     return [dict(record) for index, record in enumerate(records) if index in selected]
 
 
+def load_boundary_cache(path: str | Path) -> Mapping[str, Mapping[str, Any]]:
+    """Load a vlm.cache.boundary per-sid ``{task}_boundary`` matrix cache."""
+
+    cache = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(cache, Mapping):
+        raise ValueError(f"boundary cache must be a mapping, got {type(cache).__name__}")
+    return cache
+
+
+def filter_boundary_pairs(
+    records: Sequence[Record], boundary_cache: Mapping[str, Mapping[str, Any]]
+) -> list[Record]:
+    """Drop rows flagged as a local gaze-event transition (Eyes on Gaze / EyeVLM-style
+    boundary-frame removal; see ``vlm.cache.boundary``).
+
+    A row is dropped iff ``boundary_cache[sid][f"{task}_boundary"][i, j]`` is True,
+    i.e. the center frame's GT label for that pair disagreed with a GT-valid
+    neighboring frame inside the model's local temporal context window.
+    """
+
+    output = []
+    for record in records:
+        sample = SocialSample.from_manifest_record(record)
+        entry = boundary_cache.get(sample.sid)
+        if entry is None:
+            raise ValueError(f"boundary cache is missing sid {sample.sid!r}")
+        flags = entry[f"{sample.task}_boundary"]
+        if bool(flags[sample.raw_i, sample.raw_j]):
+            continue
+        output.append(dict(record))
+    return output
+
+
 def summarize(
     input_records: Sequence[Record],
     output_records: Sequence[Record],
@@ -204,6 +239,7 @@ def summarize(
     sources: Iterable[str] | None,
     frame_stride: int,
     frame_offset: int,
+    boundary_removed: int = 0,
 ) -> ManifestReport:
     counts = {task: {"yes": 0, "no": 0} for task in SOCIAL_TASKS}
     for record in output_records:
@@ -219,6 +255,7 @@ def summarize(
         frame_offset=frame_offset,
         approximate_sid_stride=frame_stride > 1,
         counts=counts,
+        boundary_removed=boundary_removed,
     )
 
 
@@ -231,8 +268,14 @@ def build_manifest(
     frame_offset: int = 0,
     balance_labels: bool = True,
     seed: int = 101,
+    boundary_cache: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[Record], ManifestReport]:
-    """Derive one auditable manifest view from canonical records."""
+    """Derive one auditable manifest view from canonical records.
+
+    ``boundary_cache``, when given, drops local gaze-event-transition rows
+    (see :func:`filter_boundary_pairs`) before balancing, so Pos:Neg=1:1 is
+    computed on the label-quality-filtered pool.
+    """
 
     filtered = filter_records(
         records,
@@ -241,6 +284,11 @@ def build_manifest(
         frame_stride=frame_stride,
         frame_offset=frame_offset,
     )
+    boundary_removed = 0
+    if boundary_cache is not None:
+        before = len(filtered)
+        filtered = filter_boundary_pairs(filtered, boundary_cache)
+        boundary_removed = before - len(filtered)
     output = balance_task_labels(filtered, seed=seed) if balance_labels else filtered
     return output, summarize(
         records,
@@ -249,6 +297,7 @@ def build_manifest(
         sources=allowed_sources,
         frame_stride=frame_stride,
         frame_offset=frame_offset,
+        boundary_removed=boundary_removed,
     )
 
 
@@ -280,6 +329,11 @@ def _parse_args() -> argparse.Namespace:
         "--no-balance-labels", action="store_true",
         help="do not apply task-wise Pos:Neg=1:1 negative sampling",
     )
+    parser.add_argument(
+        "--boundary-cache", default="",
+        help="vlm.cache.boundary output (.pt); drop local gaze-event-transition rows "
+        "before balancing (Eyes on Gaze / EyeVLM-style boundary-frame removal)",
+    )
     return parser.parse_args()
 
 
@@ -287,6 +341,7 @@ def main() -> None:
     args = _parse_args()
     records = read_manifest(args.manifest)
     sid_sources = load_sid_sources(args.gtmeta) if args.gtmeta else None
+    boundary_cache = load_boundary_cache(args.boundary_cache) if args.boundary_cache else None
     output, report = build_manifest(
         records,
         sid_sources=sid_sources,
@@ -295,6 +350,7 @@ def main() -> None:
         frame_offset=args.frame_offset,
         balance_labels=not args.no_balance_labels,
         seed=args.seed,
+        boundary_cache=boundary_cache,
     )
     write_manifest(args.output, output)
     payload = report.as_dict()
@@ -305,6 +361,7 @@ def main() -> None:
             "gtmeta": str(Path(args.gtmeta).resolve()) if args.gtmeta else None,
             "seed": args.seed,
             "balance_labels": not args.no_balance_labels,
+            "boundary_cache": str(Path(args.boundary_cache).resolve()) if args.boundary_cache else None,
         }
     )
     if args.report:

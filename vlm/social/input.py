@@ -20,18 +20,8 @@ from vlm.social.data import (
     SOCIAL_TASK_ID,
     frame_path,
 )
-from vlm.social.evidence import (
-    GraphEvidence,
-    assemble_generative_graph,
-    assemble_graph_evidence,
-    assemble_text_graph_evidence,
-    stack_graph_evidence,
-)
-from vlm.social.prompt import (
-    compose_generative_prompt,
-    compose_text_prompt,
-    task_prompt,
-)
+from vlm.social.evidence import assemble_text_graph_evidence
+from vlm.social.prompt import compose_text_prompt
 
 
 FrameCacheInfo = namedtuple("FrameCacheInfo", "hits misses max_items curr_items")
@@ -92,7 +82,6 @@ class SocialVLMInput:
     annotation: SocialSample
     image: Image.Image
     prompt: str
-    evidence: GraphEvidence
     vision_cache_key: str | None = None
 
 
@@ -106,21 +95,9 @@ class SocialInputDataset(Dataset):
         graph_cache: Mapping[str, Mapping[str, object]],
         *,
         raw_image_cache_size: int = 32,
-        output_mode: str = "yesno",
-        graph_evidence: str = "gtoken",
         generative_prompt_seed: int | None = None,
         include_graph_evidence: bool = True,
     ):
-        if output_mode not in ("yesno", "generative"):
-            raise ValueError(f"output_mode must be yesno/generative, got {output_mode!r}")
-        if graph_evidence not in ("gtoken", "text"):
-            raise ValueError(f"graph_evidence must be gtoken/text, got {graph_evidence!r}")
-        if not include_graph_evidence and graph_evidence != "text":
-            raise ValueError(
-                "include_graph_evidence=False is only meaningful for graph_evidence='text' "
-                f"(the ablation applies to the natural-language prompt); got {graph_evidence!r}"
-            )
-        self.graph_evidence = graph_evidence
         self.include_graph_evidence = bool(include_graph_evidence)
         self.annotations = (
             manifest if isinstance(manifest, SocialAnnotationDataset)
@@ -128,7 +105,6 @@ class SocialInputDataset(Dataset):
         )
         self.graph_cache = graph_cache
         self.frames = RawFrameCache(frame_root, max_items=raw_image_cache_size)
-        self.output_mode = output_mode
         self.generative_prompt_seed = (
             None if generative_prompt_seed is None else int(generative_prompt_seed)
         )
@@ -158,57 +134,38 @@ class SocialInputDataset(Dataset):
     def __getitem__(self, index: int) -> SocialVLMInput:
         sample = self.annotations[index]
         cache = self.graph_cache[sample.sid]
-        text_mode = self.output_mode == "generative" and self.graph_evidence == "text"
-        if self.output_mode == "generative":
-            evidence = (
-                assemble_text_graph_evidence(sample, cache) if text_mode
-                else assemble_generative_graph(sample, cache)
-            )
-        else:
-            evidence = assemble_graph_evidence(sample, cache)
+        evidence = assemble_text_graph_evidence(sample, cache)
 
-        raw = self.frames.get(sample.sid)
-        need_boxes = self.output_mode == "generative"
-        box_a = box_b = None
-        if need_boxes:
-            bboxes = cache.get("head_bboxes")
-            if not torch.is_tensor(bboxes) or bboxes.ndim != 2 or bboxes.shape[1] != 4:
-                shape = (
-                    tuple(bboxes.shape)
-                    if torch.is_tensor(bboxes)
-                    else type(bboxes).__name__
-                )
-                raise ValueError(
-                    f"head_bboxes for {sample.sid!r} must have shape [N,4], got {shape}"
-                )
-            max_index = max(sample.person_i, sample.person_j)
-            if max_index >= bboxes.shape[0]:
-                raise IndexError(
-                    f"pair person index {max_index} exceeds {sample.sid!r} bbox count "
-                    f"{bboxes.shape[0]}"
-                )
-            box_a = bboxes[sample.person_i]
-            box_b = bboxes[sample.person_j]
+        bboxes = cache.get("head_bboxes")
+        if not torch.is_tensor(bboxes) or bboxes.ndim != 2 or bboxes.shape[1] != 4:
+            shape = (
+                tuple(bboxes.shape)
+                if torch.is_tensor(bboxes)
+                else type(bboxes).__name__
+            )
+            raise ValueError(
+                f"head_bboxes for {sample.sid!r} must have shape [N,4], got {shape}"
+            )
+        max_index = max(sample.person_i, sample.person_j)
+        if max_index >= bboxes.shape[0]:
+            raise IndexError(
+                f"pair person index {max_index} exceeds {sample.sid!r} bbox count "
+                f"{bboxes.shape[0]}"
+            )
+        box_a = bboxes[sample.person_i]
+        box_b = bboxes[sample.person_j]
         # RawFrameCache images are immutable by contract. Returning the shared object
         # lets the collator deduplicate image preprocessing and vision encoding by frame.
-        image = raw
-        if text_mode:
-            prompt = compose_text_prompt(
-                sample.task, box_a.tolist(), box_b.tolist(), evidence,
-                rng=self._generative_rng(sample),
-                include_graph_evidence=self.include_graph_evidence,
-            )
-        elif self.output_mode == "generative":
-            prompt = compose_generative_prompt(
-                sample.task, box_a.tolist(), box_b.tolist(), rng=self._generative_rng(sample)
-            )
-        else:
-            prompt = task_prompt(sample.task)
+        image = self.frames.get(sample.sid)
+        prompt = compose_text_prompt(
+            sample.task, box_a.tolist(), box_b.tolist(), evidence,
+            rng=self._generative_rng(sample),
+            include_graph_evidence=self.include_graph_evidence,
+        )
         return SocialVLMInput(
             annotation=sample,
             image=image,
             prompt=prompt,
-            evidence=evidence,
             vision_cache_key=str(
                 (self.frames.frame_root / sample.sid / "frame.png").resolve()
             ),
@@ -353,135 +310,3 @@ def task_pos_weights(
         output[task] = min(max(negative / positive, minimum), maximum)
     return output
 
-
-@dataclass(frozen=True)
-class GraphControlInput:
-    annotation: SocialSample
-    graph_logit: torch.Tensor
-
-
-class GraphControlDataset(Dataset):
-    """Same labelled rows as SocialInputDataset, with no image or Qwen dependency."""
-
-    def __init__(
-        self,
-        manifest: str | Path | SocialAnnotationDataset,
-        graph_cache: Mapping[str, Mapping[str, object]],
-    ):
-        self.annotations = (
-            manifest if isinstance(manifest, SocialAnnotationDataset)
-            else SocialAnnotationDataset(manifest)
-        )
-        self.graph_cache = graph_cache
-        missing = sorted({s.sid for s in self.annotations.samples}.difference(graph_cache))
-        if missing:
-            raise ValueError(f"graph cache is missing {len(missing)} manifest frames")
-
-    def __len__(self) -> int:
-        return len(self.annotations)
-
-    def __getitem__(self, index: int) -> GraphControlInput:
-        sample = self.annotations[index]
-        return GraphControlInput(
-            annotation=sample,
-            graph_logit=sample_graph_logit(sample, self.graph_cache[sample.sid]),
-        )
-
-    def sample_weights(
-        self, *, balance_mode: str = "task", hard_floor: float | None = None
-    ) -> torch.Tensor:
-        return sample_weights(
-            self.annotations,
-            self.graph_cache,
-            balance_mode=balance_mode,
-            hard_floor=hard_floor,
-        )
-
-
-@dataclass(frozen=True)
-class GraphFeatureControlInput:
-    annotation: SocialSample
-    evidence: GraphEvidence
-
-
-class GraphFeatureControlDataset(Dataset):
-    """Six-slot graph evidence with no image decoding, processor, or Qwen path."""
-
-    def __init__(
-        self,
-        manifest: str | Path | SocialAnnotationDataset,
-        graph_cache: Mapping[str, Mapping[str, object]],
-    ):
-        self.annotations = (
-            manifest if isinstance(manifest, SocialAnnotationDataset)
-            else SocialAnnotationDataset(manifest)
-        )
-        self.graph_cache = graph_cache
-        missing = sorted({s.sid for s in self.annotations.samples}.difference(graph_cache))
-        if missing:
-            raise ValueError(f"graph cache is missing {len(missing)} manifest frames")
-        if not self.annotations.samples:
-            raise ValueError("graph feature control requires at least one annotation")
-        # Establish the MLP input contract before optimizer construction. Every later
-        # sample is independently validated by assemble_graph_evidence.
-        first = self.annotations.samples[0]
-        self.feature_dim = assemble_graph_evidence(
-            first, self.graph_cache[first.sid]
-        ).feature_dim
-
-    def __len__(self) -> int:
-        return len(self.annotations)
-
-    def __getitem__(self, index: int) -> GraphFeatureControlInput:
-        sample = self.annotations[index]
-        evidence = assemble_graph_evidence(
-            sample, self.graph_cache[sample.sid]
-        )
-        if evidence.feature_dim != self.feature_dim:
-            raise ValueError(
-                f"inconsistent graph feature dimension for {sample.sid!r}: "
-                f"expected {self.feature_dim}, got {evidence.feature_dim}"
-            )
-        return GraphFeatureControlInput(annotation=sample, evidence=evidence)
-
-    def sample_weights(
-        self, *, balance_mode: str = "task", hard_floor: float | None = None
-    ) -> torch.Tensor:
-        return sample_weights(
-            self.annotations,
-            self.graph_cache,
-            balance_mode=balance_mode,
-            hard_floor=hard_floor,
-        )
-
-
-def control_collate(items: list[GraphControlInput]) -> dict[str, object]:
-    if not items:
-        raise ValueError("cannot collate an empty graph-control batch")
-    return {
-        "graph_logits": torch.stack([item.graph_logit for item in items]),
-        "task_ids": torch.tensor(
-            [SOCIAL_TASK_ID[item.annotation.task] for item in items], dtype=torch.long
-        ),
-        "pair_labels": torch.tensor(
-            [item.annotation.label for item in items], dtype=torch.float32
-        ),
-        "eval_keys": [item.annotation.eval_key for item in items],
-    }
-
-
-def feature_control_collate(
-    items: list[GraphFeatureControlInput],
-) -> dict[str, object]:
-    if not items:
-        raise ValueError("cannot collate an empty graph-feature-control batch")
-    return {
-        "pair_graph": stack_graph_evidence([item.evidence for item in items]),
-        "task_ids": torch.tensor(
-            [SOCIAL_TASK_ID[item.annotation.task] for item in items], dtype=torch.long
-        ),
-        "pair_labels": torch.tensor(
-            [item.annotation.label for item in items], dtype=torch.float32
-        ),
-        "eval_keys": [item.annotation.eval_key for item in items],
-    }

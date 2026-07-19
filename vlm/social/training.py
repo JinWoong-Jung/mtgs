@@ -9,8 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
+import sys
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,21 +31,11 @@ from tqdm import tqdm
 
 from vlm.cache.config import QWEN
 from vlm.social.objective import (
-    GraphFeatureMLPControl,
-    GraphLogitMLPControl,
     GenerativeObjective,
-    SocialObjective,
-    TaskBCELoss,
-    YesNoResidualHead,
-    answer_token_ids,
     generative_answer_token_ids,
 )
 from vlm.social.input import (
-    GraphControlDataset,
-    GraphFeatureControlDataset,
     SocialInputDataset,
-    control_collate,
-    feature_control_collate,
     task_pos_weights,
     partition_by_graph_confidence,
     sample_graph_logit,
@@ -53,21 +43,18 @@ from vlm.social.input import (
 from vlm.social.evaluation import (
     PredictionCollector,
     evaluate_predictions,
+    format_graph_model_table,
     format_metrics,
+    format_routing_comparison_table,
     metric_payload,
     raw_graph_predictions,
+    routing_low_confidence_keys,
 )
 from vlm.social.model import (
-    GenerativeVLM,
-    SocialVLM,
     TextGenerativeVLM,
-    make_generative_collate,
-    make_generative_eval_collate,
-    make_social_collate,
     make_text_generative_collate,
     make_text_generative_direct_eval_collate,
     make_text_generative_eval_collate,
-    prepare_social_tokens,
 )
 from vlm.runtime.qwen import patch_qwen3vl_patch_embed
 
@@ -75,7 +62,15 @@ from vlm.runtime.qwen import patch_qwen3vl_patch_embed
 LORA_PROJECTIONS = (
     "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"
 )
-TRAIN_MODES = ("vlm", "graph_mlp", "features_mlp")
+
+# Under confidence-gated routing, per-pair scores come from two independently
+# calibrated models (graph logit vs VLM logit-yes/no), so any ranking-based metric
+# is not meaningful -- see format_metrics()'s f1_only docstring. Keep this key set in
+# sync with what format_metrics(f1_only=True) drops.
+_ROUTING_INVALID_METRIC_KEYS = {
+    "social_ap", "social_auc",
+    "LAH_AP", "LAH_AUC", "LAEO_AP", "LAEO_AUC", "SA_AP", "SA_AUC", "AP_SA",
+}
 
 
 @dataclass
@@ -99,6 +94,7 @@ def format_epoch_report(
     selection_score: float,
     best_score: float | None,
     improved: bool,
+    f1_only: bool = False,
 ) -> str:
     """Compact, metrics-only block written once after a completed epoch."""
 
@@ -118,23 +114,13 @@ def format_epoch_report(
     if val_stats is not None:
         lines.append(stats_line("val", val_stats))
     if val_metrics is not None:
-        lines.append(format_metrics(val_metrics, "validation"))
+        lines.append(format_metrics(val_metrics, "validation", f1_only=f1_only))
     best = "N/A" if best_score is None else f"{best_score:.6f}"
     lines.append(
         f"  selection: {selection_name}={selection_score:.6f} "
         f"best={best} improved={improved}"
     )
     return "\n".join(lines)
-
-
-def append_epoch_report(path: str | Path | None, report: str) -> None:
-    """Append one epoch block to the Slurm metrics file when configured."""
-    if not path:
-        return
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as stream:
-        stream.write(report.rstrip() + "\n")
 
 
 def seed_everything(seed: int) -> None:
@@ -188,6 +174,15 @@ class FrameGroupedBatchSampler(Sampler[list[int]]):
 
 
 def _dataset_frame_ids(dataset) -> list[str]:
+    # Confidence-gated routing wraps the low-confidence remainder in a Subset
+    # (collect_generative_predictions), which has no .annotations of its own --
+    # unwrap to the base dataset's annotations and index through .indices instead.
+    if isinstance(dataset, Subset):
+        annotations = getattr(dataset.dataset, "annotations", None)
+        samples = getattr(annotations, "samples", None)
+        if samples is None:
+            raise ValueError("frame grouping requires a pair dataset with annotations")
+        return [samples[i].sid for i in dataset.indices]
     annotations = getattr(dataset, "annotations", None)
     samples = getattr(annotations, "samples", None)
     if samples is None or len(samples) != len(dataset):
@@ -288,8 +283,12 @@ def _trainable(parameters: Iterable[torch.nn.Parameter]) -> list[torch.nn.Parame
     return [parameter for parameter in parameters if parameter.requires_grad]
 
 
-def partition_vlm_parameters(objective: SocialObjective):
-    """Return disjoint LoRA/new-module groups and validate the frozen-base contract."""
+def partition_vlm_parameters(objective: GenerativeObjective):
+    """Return disjoint LoRA/new-module groups and validate the frozen-base contract.
+
+    The text-evidence generative VLM has no new trainable modules besides the LoRA
+    adapters: graph evidence is already natural-language prompt text.
+    """
     lora_named = [
         (name, parameter)
         for name, parameter in objective.vlm.backbone.named_parameters()
@@ -302,20 +301,7 @@ def partition_vlm_parameters(objective: SocialObjective):
         raise ValueError(f"non-LoRA Qwen parameters are trainable: {invalid[:10]}")
 
     lora = [parameter for _, parameter in lora_named]
-    if isinstance(objective, GenerativeObjective):
-        if isinstance(objective.vlm, TextGenerativeVLM):
-            # text mode: graph evidence is already text in the prompt; only LoRA trains.
-            new = []
-        else:
-            # gtoken generative: only the graph projector learns besides LoRA.
-            new = list(objective.vlm.projector.parameters())
-    else:
-        new = (
-            list(objective.vlm.projector.parameters())
-            + [objective.vlm.social_query]
-            + list(objective.decoder.parameters())
-        )
-    new = _trainable(new)
+    new = _trainable([])
     overlap = {id(parameter) for parameter in lora}.intersection(
         id(parameter) for parameter in new
     )
@@ -430,7 +416,6 @@ def _make_lora_backbone(cfg, processor, device: torch.device, resume: Path | Non
         device_map=str(device),
         attn_implementation="sdpa",   # fast attention on Blackwell (avoid eager fallback)
     )
-    token_ids = prepare_social_tokens(processor.tokenizer, base)
     patch_qwen3vl_patch_embed(base)
     base.requires_grad_(False)
 
@@ -468,43 +453,13 @@ def _make_lora_backbone(cfg, processor, device: torch.device, resume: Path | Non
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
     backbone.enable_input_require_grads()
-    return backbone, token_ids, target_names
-
-
-def build_vlm_objective(cfg, processor, device: torch.device, resume: Path | None = None):
-    backbone, token_ids, target_names = _make_lora_backbone(
-        cfg, processor, device, resume
-    )
-    vlm = SocialVLM(
-        backbone,
-        token_ids,
-        graph_dim=int(cfg.model.get("graph_dim", 256)),
-        graph_hidden_dim=int(cfg.model.get("graph_hidden_dim", 1024)),
-        heatmap_conv_dim=int(cfg.model.get("heatmap_conv_dim", 128)),
-        vision_cache_size=int(
-            cfg.get("input", {}).get("vision_cache_size", 0)
-        ),
-    )
-    # Primary head: the frozen LM head's " yes"/" no" log-odds at h_social.
-    #   graph_residual=true  -> final = graph_logit + yes/no correction (VLM refines graph)
-    #   graph_residual=false -> final = yes/no only (pure VLM standalone; scale starts at 1)
-    yes_id, no_id = answer_token_ids(processor.tokenizer)
-    graph_residual = bool(cfg.model.get("graph_residual", True))
-    decoder = YesNoResidualHead(
-        yes_id,
-        no_id,
-        use_graph_residual=graph_residual,
-        scale_init=0.0 if graph_residual else 1.0,
-    ).to(device=device)
-    return vlm, decoder, None, target_names
+    return backbone, target_names
 
 
 @dataclass(frozen=True)
 class GenerativeBuilders:
-    """Generative dataset/collate selection plus text-only vision reuse policy."""
+    """Text-evidence generative VLM policy (the single supported contract)."""
 
-    graph_evidence: str
-    uses_text_collate: bool
     reuse_vision: bool
     include_graph_evidence: bool
 
@@ -514,74 +469,51 @@ def select_generative_builders(cfg) -> GenerativeBuilders:
     model_cfg = cfg.get("model", {}) if hasattr(cfg, "get") else cfg["model"]
     input_cfg = cfg.get("input", {}) if hasattr(cfg, "get") else {}
     return GenerativeBuilders(
-        graph_evidence="text",
-        uses_text_collate=True,
         reuse_vision=bool(input_cfg.get("reuse_frozen_vision", False)),
         include_graph_evidence=bool(model_cfg.get("include_graph_evidence", True)),
     )
 
 
 def build_generative_objective(cfg, processor, device: torch.device, resume: Path | None = None):
-    """Generative yes/no objective with graph evidence written in the prompt."""
-    backbone, token_ids, target_names = _make_lora_backbone(cfg, processor, device, resume)
+    """Generative yes/no objective with graph evidence written in the prompt as text."""
+    backbone, target_names = _make_lora_backbone(cfg, processor, device, resume)
     builders = select_generative_builders(cfg)
-    if builders.uses_text_collate:
-        cache_size = (
-            int(cfg.get("input", {}).get("vision_cache_size", 0))
-            if builders.reuse_vision
-            else 0
-        )
-        disk_cache = str(cfg.get("input", {}).get("vision_disk_cache", "")) or None
-        disk_metadata = None if disk_cache is None else {
-            "qwen": str(cfg.model.get("qwen", QWEN)),
-            "max_pixels": str(int(cfg.model.get("max_pixels", 200704))),
-        }
-        vlm = TextGenerativeVLM(
-            backbone,
-            vision_cache_size=cache_size,
-            vision_disk_cache=disk_cache,
-            vision_disk_metadata=disk_metadata,
-        )
-    else:
-        vlm = GenerativeVLM(
-            backbone,
-            token_ids,
-            graph_dim=int(cfg.model.get("graph_dim", 256)),
-            graph_hidden_dim=int(cfg.model.get("graph_hidden_dim", 1024)),
-            heatmap_conv_dim=int(cfg.model.get("heatmap_conv_dim", 128)),
-        )
-    direct_ids = generative_answer_token_ids(processor.tokenizer) if builders.uses_text_collate else None
+    cache_size = (
+        int(cfg.get("input", {}).get("vision_cache_size", 0))
+        if builders.reuse_vision
+        else 0
+    )
+    disk_cache = str(cfg.get("input", {}).get("vision_disk_cache", "")) or None
+    disk_metadata = None if disk_cache is None else {
+        "qwen": str(cfg.model.get("qwen", QWEN)),
+        "max_pixels": str(int(cfg.model.get("max_pixels", 200704))),
+    }
+    vlm = TextGenerativeVLM(
+        backbone,
+        vision_cache_size=cache_size,
+        vision_disk_cache=disk_cache,
+        vision_disk_metadata=disk_metadata,
+    )
+    direct_ids = generative_answer_token_ids(processor.tokenizer)
     objective = GenerativeObjective(
         vlm, direct_yes_no_token_ids=direct_ids
     ).to(device=device)
     return objective, target_names
 
 
-def _restore_vlm_modules(objective: SocialObjective, checkpoint: Path) -> dict[str, Any]:
+def _restore_vlm_modules(objective: GenerativeObjective, checkpoint: Path) -> dict[str, Any]:
     modules_path = checkpoint / "pair_modules.pt"
     trainer_path = checkpoint / "trainer_state.pt"
     if not modules_path.exists() or not trainer_path.exists():
         raise FileNotFoundError(f"incomplete pair checkpoint: {checkpoint}")
-    modules = torch.load(modules_path, map_location="cpu", weights_only=False)
-    if "projector" in modules:
-        objective.vlm.projector.load_state_dict(modules["projector"], strict=True)
-    if not isinstance(objective, GenerativeObjective):
-        with torch.no_grad():
-            objective.vlm.social_query.copy_(
-                modules["social_query"].to(
-                    objective.vlm.social_query.device, objective.vlm.social_query.dtype
-                )
-            )
-        objective.decoder.load_state_dict(modules["decoder"], strict=True)
-        objective.criterion.load_state_dict(modules["criterion"], strict=True)
-        if objective.lm_auxiliary is not None and modules.get("lm_auxiliary") is not None:
-            objective.lm_auxiliary.load_state_dict(modules["lm_auxiliary"], strict=True)
+    # Text-evidence generative VLM has no extra trainable modules besides the LoRA
+    # adapter (restored from disk by PeftModel.from_pretrained); nothing to load here.
     return torch.load(trainer_path, map_location="cpu", weights_only=False)
 
 
 def save_vlm_checkpoint(
     path: Path,
-    objective: SocialObjective,
+    objective: GenerativeObjective,
     processor,
     optimizer,
     scheduler,
@@ -590,24 +522,9 @@ def save_vlm_checkpoint(
     path.mkdir(parents=True, exist_ok=True)
     objective.vlm.backbone.save_pretrained(path / "adapter")
     processor.save_pretrained(path / "processor")
-    if isinstance(objective, GenerativeObjective):
-        if isinstance(objective.vlm, TextGenerativeVLM):
-            # text mode: graph evidence is text in the prompt; no projector to save.
-            modules = {"generative": True, "text_evidence": True}
-        else:
-            # gtoken generative: only the graph projector learns besides LoRA (no
-            # social_query/decoder).
-            modules = {"generative": True, "projector": _cpu_state_dict(objective.vlm.projector)}
-    else:
-        modules = {
-            "projector": _cpu_state_dict(objective.vlm.projector),
-            "social_query": objective.vlm.social_query.detach().cpu(),
-            "decoder": _cpu_state_dict(objective.decoder),
-            "criterion": _cpu_state_dict(objective.criterion),
-            "lm_auxiliary": None
-            if objective.lm_auxiliary is None
-            else _cpu_state_dict(objective.lm_auxiliary),
-        }
+    # Text-evidence generative VLM: graph evidence is prompt text; only the LoRA adapter
+    # (saved above) trains, so there are no extra modules to serialize.
+    modules = {"generative": True, "text_evidence": True}
     torch.save(modules, path / "pair_modules.pt")
     torch.save(
         {
@@ -618,50 +535,6 @@ def save_vlm_checkpoint(
         },
         path / "trainer_state.pt",
     )
-
-
-def save_control_checkpoint(
-    path: Path,
-    control: torch.nn.Module,
-    criterion: TaskBCELoss,
-    optimizer,
-    scheduler,
-    state: Mapping[str, Any],
-) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            **dict(state),
-            "control": _cpu_state_dict(control),
-            "criterion": _cpu_state_dict(criterion),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "torch_rng_state": torch.get_rng_state(),
-        },
-        path / "control.pt",
-    )
-
-
-def restore_control_checkpoint(
-    path: Path, control, criterion, optimizer=None, scheduler=None
-) -> dict[str, Any]:
-    state = torch.load(path / "control.pt", map_location="cpu", weights_only=False)
-    control.load_state_dict(state["control"], strict=True)
-    criterion.load_state_dict(state["criterion"], strict=True)
-    if optimizer is not None:
-        optimizer.load_state_dict(state["optimizer"])
-    if scheduler is not None:
-        scheduler.load_state_dict(state["scheduler"])
-    return state
-
-
-def _vlm_batch(objective: SocialObjective, batch: dict[str, Any]):
-    batch = dict(batch)
-    graph = batch.pop("pair_graph")
-    task_ids = batch.pop("task_ids")
-    labels = batch.pop("pair_labels")
-    batch.pop("eval_keys")
-    return objective(batch, graph, task_ids, labels), labels
 
 
 def _generative_batch(objective: GenerativeObjective, batch: dict[str, Any]):
@@ -683,24 +556,6 @@ def _generative_batch(objective: GenerativeObjective, batch: dict[str, Any]):
         "lm_aux_loss": None, "lm_aux_accuracy": None, "decoder": decoder,
     })()
     return shim, labels
-
-
-def _control_batch(control, criterion, batch: dict[str, Any], device: torch.device):
-    task_ids = batch["task_ids"].to(device)
-    labels = batch["pair_labels"].to(device)
-    if "pair_graph" in batch:
-        decoder = control(batch["pair_graph"], task_ids)
-    else:
-        decoder = control(batch["graph_logits"].to(device), task_ids)
-    loss = criterion(decoder.logits, labels, task_ids)
-    output = type("ControlBatchOutput", (), {
-        "loss": loss.loss,
-        "residual_loss": loss.loss,
-        "lm_aux_loss": None,
-        "lm_aux_accuracy": None,
-        "decoder": decoder,
-    })()
-    return output, labels
 
 
 def collect_generative_predictions(
@@ -725,7 +580,6 @@ def collect_generative_predictions(
     """
     collector = PredictionCollector()
     eval_dataset = dataset
-    uses_text_collate = getattr(dataset, "graph_evidence", "gtoken") == "text"
     if route_threshold is not None:
         high, low = partition_by_graph_confidence(
             dataset.annotations, dataset.graph_cache, route_threshold
@@ -746,30 +600,23 @@ def collect_generative_predictions(
             return collector
         eval_dataset = Subset(dataset, low)
     direct_text_scoring = (
-        uses_text_collate
-        and reuse_vision
+        reuse_vision
         and getattr(objective, "direct_yes_no_token_ids", None) is not None
     )
     eval_collate = (
-        make_text_generative_direct_eval_collate(
-            processor, reuse_vision=True
-        )
+        make_text_generative_direct_eval_collate(processor, reuse_vision=True)
         if direct_text_scoring
-        else make_text_generative_eval_collate(
-            processor, reuse_vision=reuse_vision
-        )
-        if uses_text_collate
-        else make_generative_eval_collate(processor)
+        else make_text_generative_eval_collate(processor, reuse_vision=reuse_vision)
     )
     loader = make_validation_loader(
         eval_dataset, eval_collate, batch_size, num_workers,
         pin_memory=device.type == "cuda",
-        group_by_frame=group_by_frame and uses_text_collate,
+        group_by_frame=group_by_frame,
     )
     was_training = objective.training
     objective.eval()
     with torch.no_grad():
-        for batch in tqdm(loader, desc=description, leave=False):
+        for batch in tqdm(loader, desc=description, leave=False, file=sys.stdout):
             num_pairs = int(batch["num_pairs"])
             model_inputs = {
                 k: v for k, v in batch.items()
@@ -792,7 +639,6 @@ def run_epoch(
     loader: DataLoader,
     *,
     device: torch.device,
-    criterion: TaskBCELoss | None = None,
     optimizer=None,
     scheduler=None,
     accumulation: int = 1,
@@ -801,11 +647,15 @@ def run_epoch(
     prediction_collector: PredictionCollector | None = None,
     batch_log_interval: int = 0,
     batch_logger=None,
+    loss_ema_state: dict[str, float] | None = None,
+    loss_ema_beta: float = 0.98,
 ) -> EpochStats:
     if batch_log_interval < 0:
         raise ValueError("batch_log_interval must be non-negative")
     if batch_logger is not None and not callable(batch_logger):
         raise TypeError("batch_logger must be callable")
+    if not 0.0 < loss_ema_beta < 1.0:
+        raise ValueError("loss_ema_beta must be in (0, 1)")
     training = optimizer is not None
     module.train(training)
     if training:
@@ -815,20 +665,13 @@ def run_epoch(
     lm_count = 0
     batches = len(loader)
     optimizer_steps = 0
-    iterator = tqdm(loader, desc=description, leave=False)
+    iterator = tqdm(loader, desc=description, leave=False, file=sys.stdout)
 
     for index, batch in enumerate(iterator):
         group_start = (index // accumulation) * accumulation
         group_size = min(accumulation, batches - group_start)
         with torch.set_grad_enabled(training):
-            if isinstance(module, SocialObjective):
-                output, labels = _vlm_batch(module, batch)
-            elif isinstance(module, GenerativeObjective):
-                output, labels = _generative_batch(module, batch)
-            else:
-                if criterion is None:
-                    raise ValueError("graph control requires a BCE criterion")
-                output, labels = _control_batch(module, criterion, batch, device)
+            output, labels = _generative_batch(module, batch)
             if output.loss is None:
                 raise RuntimeError("training objective did not return loss")
             if training:
@@ -836,8 +679,17 @@ def run_epoch(
 
         batch_size = labels.numel()
         count += batch_size
-        loss_sum += float(output.loss.detach()) * batch_size
+        batch_loss = float(output.loss.detach())
+        loss_sum += batch_loss * batch_size
         residual_sum += float(output.residual_loss.detach()) * batch_size
+        if loss_ema_state is not None:
+            # Dense EMA over every micro-batch; state lives in the caller so the curve
+            # is continuous across epochs (unlike the epoch-cumulative loss_sum/count).
+            prev = loss_ema_state.get("value")
+            loss_ema_state["value"] = (
+                batch_loss if prev is None
+                else loss_ema_beta * prev + (1.0 - loss_ema_beta) * batch_loss
+            )
         predictions = output.decoder.logits.detach().gt(0).to(labels.device)
         correct += int(predictions.eq(labels.bool()).sum())
         if prediction_collector is not None:
@@ -868,9 +720,13 @@ def run_epoch(
             if batch_logger is not None and batch_log_interval and (
                 optimizer_steps % batch_log_interval == 0 or index + 1 == batches
             ):
+                running = (
+                    loss_ema_state["value"] if loss_ema_state is not None
+                    else loss_sum / max(count, 1)
+                )
                 batch_logger(optimizer_steps, {
-                    "batch_loss": float(output.loss.detach()),
-                    "running_loss": loss_sum / max(count, 1),
+                    "batch_loss": batch_loss,
+                    "running_loss": running,
                     "examples": int(count),
                 })
         iterator.set_postfix(loss=f"{loss_sum / max(count, 1):.4f}")
@@ -917,16 +773,17 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
-    mode = str(cfg.experiment.get("mode", "vlm"))
-    if mode not in TRAIN_MODES:
-        raise ValueError(f"experiment.mode must be one of {TRAIN_MODES}, got {mode!r}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if mode == "vlm" and device.type != "cuda":
-        raise RuntimeError("Qwen VLM training requires CUDA; use graph_mlp mode on CPU")
+    if device.type != "cuda":
+        raise RuntimeError("Qwen VLM training requires CUDA")
     seed = int(cfg.train.get("seed", 101))
     monitor = str(cfg.experiment.get("monitor", "social_ap"))
     monitor_mode = str(cfg.experiment.get("monitor_mode", "max")).lower()
     threshold = float(cfg.val.get("threshold", 0.5))
+    # Confidence-gated routing mixes the frozen graph's and the VLM's independent score
+    # scales, so AP/AUC over the combined predictions are not meaningful once routed --
+    # only report F1 in that case (see format_graph_model_table / format_metrics docstrings).
+    routing_on = bool(cfg.get("routing", {}).get("use", False))
     seed_everything(seed)
 
     experiment_dir = Path(str(cfg.experiment.out_root)) / str(cfg.experiment.name)
@@ -934,7 +791,6 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, experiment_dir / "config_vlm.yaml")
     ledger = experiment_dir / "metrics.jsonl"
-    epoch_metrics_path = os.environ.get("VLM_EPOCH_METRICS_PATH")
     resume = Path(args.resume) if args.resume else None
 
     train_cache = _load_graph_cache(args.graph_feats)
@@ -954,7 +810,14 @@ def main() -> None:
     # data.profile chooses a subset; sampling only traverses that selected population.
     balance_mode = balance_modes.get(sampling_strategy, "none")
     hard_floor = None
-    route_threshold = None
+    # Confidence-gated routing (config_vlm.yaml `routing.use`): validation answers
+    # high-confidence pairs with the frozen graph directly and queries the VLM only on
+    # the low-confidence remainder, mirroring eval_vlm.sh's test-time behaviour exactly.
+    # This requires --val_manifest to be the FULL (unfiltered) val set -- train_vlm.sh
+    # filters only the TRAIN manifest to low-confidence pairs, never --val_manifest --
+    # otherwise raw_graph_predictions() below would score the graph on the hard subset
+    # only, not the full population it needs to be compared against.
+    route_threshold = _route_threshold(cfg)
     epochs = int(cfg.train.epochs)
     num_samples = int(sampling_cfg.get("samples_per_epoch", 0))
     num_workers = int(cfg.train.get("num_workers", 4))
@@ -962,52 +825,23 @@ def main() -> None:
     grad_clip = float(cfg.optim.get("grad_clip", 1.0))
     input_cfg = cfg.get("input", {})
     # The only VLM implementation is generative yes/no with text graph evidence.
-    generative = mode == "vlm"
-    output_mode = "generative" if generative else "yesno"
     builders = select_generative_builders(cfg)
-    reuse_vision = mode == "vlm" and builders.reuse_vision
+    reuse_vision = builders.reuse_vision
     group_by_frame = reuse_vision and bool(
         input_cfg.get("group_by_frame", False)
     )
 
-    processor = objective = None
-    if mode == "vlm":
-        processor = _processor(cfg, resume)
-        train_dataset = SocialInputDataset(
-            args.manifest,
-            args.frame_root,
-            train_cache,
-            raw_image_cache_size=int(cfg.train.get("raw_image_cache_size", 16)),
-            output_mode=output_mode,
-            graph_evidence=builders.graph_evidence,
-            include_graph_evidence=builders.include_graph_evidence,
-        )
-        if generative:
-            collate = (
-                make_text_generative_collate(
-                    processor, reuse_vision=builders.reuse_vision
-                )
-                if builders.uses_text_collate
-                else make_generative_collate(processor)
-            )
-        else:
-            collate = make_social_collate(processor, reuse_vision=reuse_vision)
-        batch_size = int(cfg.train.bs)
-        val_batch_size = int(cfg.val.bs)
-    elif mode == "graph_mlp":
-        train_dataset = GraphControlDataset(args.manifest, train_cache)
-        collate = control_collate
-        batch_size = int(cfg.control.get("bs", 1024))
-        val_batch_size = int(cfg.control.get("val_bs", batch_size))
-        accumulation = int(cfg.control.get("accum", 1))
-    else:
-        train_dataset = GraphFeatureControlDataset(args.manifest, train_cache)
-        collate = feature_control_collate
-        batch_size = int(cfg.control.get("feature_bs", cfg.control.get("bs", 1024)))
-        val_batch_size = int(
-            cfg.control.get("feature_val_bs", cfg.control.get("val_bs", batch_size))
-        )
-        accumulation = int(cfg.control.get("accum", 1))
+    processor = _processor(cfg, resume)
+    train_dataset = SocialInputDataset(
+        args.manifest,
+        args.frame_root,
+        train_cache,
+        raw_image_cache_size=int(cfg.train.get("raw_image_cache_size", 16)),
+        include_graph_evidence=builders.include_graph_evidence,
+    )
+    collate = make_text_generative_collate(processor, reuse_vision=builders.reuse_vision)
+    batch_size = int(cfg.train.bs)
+    val_batch_size = int(cfg.val.bs)
     if sampling_strategy == "once":
         # Exact-once traversal never changes the selected population size.
         num_samples = len(train_dataset)
@@ -1019,65 +853,23 @@ def main() -> None:
             balance_mode=balance_mode, hard_floor=hard_floor
         )
 
-    # Generative training uses next-token CE; BCE weighting belongs only to the
-    # vision-free graph-control variants.
-    if generative:
-        pos_weights = {}
-        criterion = None
-    else:
-        pos_weights = _resolve_pos_weights(cfg, train_dataset.annotations)
-        validate_sampler_loss_compatibility(balance_mode, pos_weights)
-        criterion = TaskBCELoss(pos_weights).to(device)
-
-    if mode == "vlm":
-        if generative:
-            objective, target_names = build_generative_objective(
-                cfg, processor, device, resume
-            )
-        else:
-            vlm, decoder, _auxiliary, target_names = build_vlm_objective(
-                cfg, processor, device, resume
-            )
-            # yes/no head is the primary prediction now; the old LM auxiliary is subsumed.
-            objective = SocialObjective(vlm, decoder, criterion)
-        module = objective
-        lora_params, new_params = partition_vlm_parameters(objective)
-        parameter_groups = [{"params": lora_params, "lr": float(cfg.optim.lr)}]
-        if new_params:
-            parameter_groups.append(
-                {
-                    "params": new_params,
-                    "lr": float(cfg.optim.get("new_module_lr", cfg.optim.lr)),
-                }
-            )
-        optimizer = torch.optim.AdamW(
-            parameter_groups,
-            weight_decay=float(cfg.optim.weight_decay),
+    # Generative training uses next-token CE (no BCE weighting).
+    objective, target_names = build_generative_objective(cfg, processor, device, resume)
+    module = objective
+    lora_params, new_params = partition_vlm_parameters(objective)
+    parameter_groups = [{"params": lora_params, "lr": float(cfg.optim.lr)}]
+    if new_params:
+        parameter_groups.append(
+            {
+                "params": new_params,
+                "lr": float(cfg.optim.get("new_module_lr", cfg.optim.lr)),
+            }
         )
-        print(f"[vlm] LoRA targets={len(target_names)}, params={sum(p.numel() for p in lora_params):,}")
-    elif mode == "graph_mlp":
-        module = GraphLogitMLPControl(
-            hidden_dim=int(cfg.control.get("hidden_dim", 32)),
-            dropout=float(cfg.control.get("dropout", 0.0)),
-        ).to(device)
-        optimizer = torch.optim.AdamW(
-            module.parameters(),
-            lr=float(cfg.control.get("lr", cfg.optim.get("new_module_lr", cfg.optim.lr))),
-            weight_decay=float(cfg.optim.weight_decay),
-        )
-    else:
-        module = GraphFeatureMLPControl(
-            feature_dim=train_dataset.feature_dim,
-            hidden_dim=int(cfg.control.get("feature_hidden_dim", 512)),
-            dropout=float(cfg.control.get("dropout", 0.0)),
-            include_heatmaps=bool(cfg.control.get("include_heatmaps", False)),
-            heatmap_pool_size=int(cfg.control.get("heatmap_pool_size", 8)),
-        ).to(device)
-        optimizer = torch.optim.AdamW(
-            module.parameters(),
-            lr=float(cfg.control.get("lr", cfg.optim.get("new_module_lr", cfg.optim.lr))),
-            weight_decay=float(cfg.optim.weight_decay),
-        )
+    optimizer = torch.optim.AdamW(
+        parameter_groups,
+        weight_decay=float(cfg.optim.weight_decay),
+    )
+    print(f"[vlm] LoRA targets={len(target_names)}, params={sum(p.numel() for p in lora_params):,}")
 
     steps_per_epoch = optimizer_steps_per_epoch(num_samples, batch_size, accumulation)
     total_steps = epochs * steps_per_epoch
@@ -1093,15 +885,9 @@ def main() -> None:
     best_score = None
     global_step = 0
     if resume is not None:
-        if mode == "vlm":
-            state = _restore_vlm_modules(objective, resume)
-        else:
-            state = restore_control_checkpoint(
-                resume, module, criterion, optimizer, scheduler
-            )
-        if mode == "vlm":
-            optimizer.load_state_dict(state["optimizer"])
-            scheduler.load_state_dict(state["scheduler"])
+        state = _restore_vlm_modules(objective, resume)
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
         start_epoch = int(state["epoch"]) + 1
         global_step = int(state.get("global_step", 0))
         best_val_loss = float(state.get("best_val_loss", best_val_loss))
@@ -1113,23 +899,14 @@ def main() -> None:
     val_loader = None
     val_dataset = None
     if args.val_manifest and val_cache is not None:
-        if mode == "vlm":
-            val_dataset = SocialInputDataset(
-                args.val_manifest,
-                args.val_frame_root,
-                val_cache,
-                raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
-                output_mode=output_mode,
-                graph_evidence=builders.graph_evidence,
-                generative_prompt_seed=(
-                    int(cfg.val.get("prompt_seed", seed)) if generative else None
-                ),
-                include_graph_evidence=builders.include_graph_evidence,
-            )
-        elif mode == "graph_mlp":
-            val_dataset = GraphControlDataset(args.val_manifest, val_cache)
-        else:
-            val_dataset = GraphFeatureControlDataset(args.val_manifest, val_cache)
+        val_dataset = SocialInputDataset(
+            args.val_manifest,
+            args.val_frame_root,
+            val_cache,
+            raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
+            generative_prompt_seed=int(cfg.val.get("prompt_seed", seed)),
+            include_graph_evidence=builders.include_graph_evidence,
+        )
         val_loader = make_validation_loader(
             val_dataset,
             collate,
@@ -1151,8 +928,13 @@ def main() -> None:
             expected_sids={sample.sid for sample in val_dataset.annotations},
             threshold=threshold,
         )
-        print(format_metrics(graph_val_metrics, "raw_graph:val"), flush=True)
-        del graph_collector
+        print(format_metrics(graph_val_metrics, "raw_graph:val", f1_only=routing_on), flush=True)
+        if not routing_on:
+            # Routing needs graph_val_collector.records for the final diagnostic table
+            # (format_routing_comparison_table); otherwise free it now as before.
+            del graph_collector
+        else:
+            graph_val_collector = graph_collector
 
     use_wandb = not args.wandb_off
     wandb_batch_log_interval = int(cfg.train.get("wandb_log_interval", 25))
@@ -1161,21 +943,25 @@ def main() -> None:
         import wandb as wandb_module
 
         wandb = wandb_module
-        wandb.init(
+        run = wandb.init(
             project="MTGS",
             entity="gaze-social",
             group="vlm",
             name=str(cfg.experiment.name),
             config=OmegaConf.to_container(cfg, resolve=True),
         )
+        (experiment_dir / "wandb_run_id.txt").write_text(str(run.id), encoding="utf-8")
 
     print(
-        f"[vlm] mode={mode} train={len(train_dataset)} samples/ep={num_samples} "
+        f"[vlm] train={len(train_dataset)} samples/ep={num_samples} "
         f"sampling={sampling_strategy} bs={batch_size} accum={accumulation} "
         f"reuse_vision={reuse_vision} group_by_frame={group_by_frame} "
         f"out={experiment_dir}",
         flush=True,
     )
+    # Persistent across epochs so train/running_loss is a continuous EMA rather than an
+    # epoch-cumulative mean that resets (and visibly jumps) at every epoch boundary.
+    train_loss_ema: dict[str, float] = {}
     for epoch in range(start_epoch, epochs):
         loader = make_epoch_loader(
             train_dataset,
@@ -1209,41 +995,30 @@ def main() -> None:
             module,
             loader,
             device=device,
-            criterion=criterion if mode != "vlm" else None,
             optimizer=optimizer,
             scheduler=scheduler,
             accumulation=accumulation,
             grad_clip=grad_clip,
-            description=f"{mode}:train:{epoch}",
+            description=f"Epoch {epoch + 1}/{epochs} [train]",
             batch_log_interval=wandb_batch_log_interval if wandb is not None else 0,
             batch_logger=log_train_batch if wandb is not None else None,
+            loss_ema_state=train_loss_ema,
         )
         global_step += steps_per_epoch
         val_stats = None
         val_collector = None
         val_metrics = None
         if val_loader is not None:
-            if generative:
-                # metrics via EyeVLM candidate scoring (teacher-forced JSON log-likelihood).
-                val_collector = collect_generative_predictions(
-                    module, val_dataset, processor,
-                    batch_size=val_batch_size,
-                    num_workers=int(cfg.val.get("num_workers", num_workers)),
-                    device=device, description=f"gen:val:{epoch}",
-                    reuse_vision=builders.reuse_vision,
-                    group_by_frame=group_by_frame,
-                    route_threshold=route_threshold,
-                )
-            else:
-                val_collector = PredictionCollector()
-                val_stats = run_epoch(
-                    module,
-                    val_loader,
-                    device=device,
-                    criterion=criterion if mode != "vlm" else None,
-                    description=f"{mode}:val:{epoch}",
-                    prediction_collector=val_collector,
-                )
+            # metrics via direct yes/no answer-logit scoring (one prompt forward per pair).
+            val_collector = collect_generative_predictions(
+                module, val_dataset, processor,
+                batch_size=val_batch_size,
+                num_workers=int(cfg.val.get("num_workers", num_workers)),
+                device=device, description=f"Epoch {epoch + 1}/{epochs} [val]",
+                reuse_vision=builders.reuse_vision,
+                group_by_frame=group_by_frame,
+                route_threshold=route_threshold,
+            )
             val_collector.assert_complete(
                 sample.eval_key for sample in val_dataset.annotations
             )
@@ -1254,7 +1029,12 @@ def main() -> None:
                     expected_sids={sample.sid for sample in val_dataset.annotations},
                     threshold=threshold,
                 )
-                print(format_metrics(val_metrics, f"{mode}:val:{epoch}"), flush=True)
+                print(
+                    format_metrics(
+                        val_metrics, f"epoch {epoch + 1}/{epochs} val", f1_only=routing_on
+                    ),
+                    flush=True,
+                )
 
         if val_metrics is not None or val_stats is not None:
             selection_name, selection_mode, selection_score = checkpoint_score(
@@ -1274,7 +1054,7 @@ def main() -> None:
             val_stats.loss if val_stats is not None else train_stats.loss,
         )
         state = {
-            "mode": mode,
+            "mode": "vlm",
             "epoch": epoch,
             "global_step": global_step,
             "monitor": selection_name,
@@ -1289,27 +1069,17 @@ def main() -> None:
             if graph_val_metrics is None
             else metric_payload(graph_val_metrics),
         }
-        if mode == "vlm":
-            save_vlm_checkpoint(
-                checkpoint_dir / "last", objective, processor, optimizer, scheduler, state
-            )
-        else:
-            save_control_checkpoint(
-                checkpoint_dir / "last", module, criterion, optimizer, scheduler, state
-            )
+        save_vlm_checkpoint(
+            checkpoint_dir / "last", objective, processor, optimizer, scheduler, state
+        )
         if val_collector is not None:
             val_collector.save(checkpoint_dir / "last" / "val_predictions.pt")
         if improved:
             best_score = selection_score
             state["best_score"] = best_score
-            if mode == "vlm":
-                save_vlm_checkpoint(
-                    checkpoint_dir / "best", objective, processor, optimizer, scheduler, state
-                )
-            else:
-                save_control_checkpoint(
-                    checkpoint_dir / "best", module, criterion, optimizer, scheduler, state
-                )
+            save_vlm_checkpoint(
+                checkpoint_dir / "best", objective, processor, optimizer, scheduler, state
+            )
             if val_collector is not None:
                 val_collector.save(checkpoint_dir / "best" / "val_predictions.pt")
         with ledger.open("a", encoding="utf-8") as stream:
@@ -1321,10 +1091,11 @@ def main() -> None:
             if val_stats is not None:
                 log.update({f"val/{key}": value for key, value in asdict(val_stats).items() if value is not None})
             if val_metrics is not None:
+                excluded_keys = _ROUTING_INVALID_METRIC_KEYS if routing_on else {"AP_SA"}
                 log.update({
                     f"metric/val/{key}": value
                     for key, value in metric_payload(val_metrics).items()
-                    if value is not None and key != "AP_SA"
+                    if value is not None and key not in excluded_keys
                 })
             log.update({
                 "epoch": epoch,
@@ -1340,8 +1111,8 @@ def main() -> None:
             selection_score=selection_score,
             best_score=best_score,
             improved=improved,
+            f1_only=routing_on,
         )
-        append_epoch_report(epoch_metrics_path, epoch_report)
         print(epoch_report, flush=True)
         print(
             f"[pair] epoch={epoch} train={train_stats} val={val_stats} "
@@ -1353,6 +1124,34 @@ def main() -> None:
         objective.close()
     if wandb is not None:
         wandb.finish()
+
+    if graph_val_metrics is not None and val_metrics is not None and val_dataset is not None:
+        # Final stdout block: last epoch's val metrics against the frozen graph baseline,
+        # in the same table format eval_vlm.sh prints for a held-out test run.
+        if routing_on and val_collector is not None:
+            low_conf_keys = routing_low_confidence_keys(
+                val_dataset.annotations, val_cache, route_threshold
+            )
+            print(
+                format_routing_comparison_table(
+                    graph_val_collector.records,
+                    val_collector.records,
+                    low_conf_keys,
+                    graph_val_metrics,
+                    val_metrics,
+                    threshold=route_threshold,
+                    model_name=str(cfg.experiment.name),
+                ),
+                flush=True,
+            )
+        else:
+            print(
+                format_graph_model_table(
+                    graph_val_metrics, val_metrics, val_dataset.annotations,
+                    model_name=str(cfg.experiment.name),
+                ),
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from typing import Iterable, Mapping, Sequence
 import torch
 
 from vlm.social.data import SocialAnnotationDataset, SOCIAL_TASKS
-from vlm.social.input import sample_graph_logit
+from vlm.social.input import partition_by_graph_confidence, sample_graph_logit
 
 
 EvalKey = tuple[str, str, int, int]
@@ -26,6 +26,9 @@ CORE_METRIC_KEYS = (
     "F1_LAH",
     "F1_LAEO",
     "F1_SA",
+    "Acc_LAH",
+    "Acc_LAEO",
+    "Acc_SA",
     "LAH_AP",
     "LAH_AUC",
     "LAEO_AP",
@@ -35,7 +38,9 @@ CORE_METRIC_KEYS = (
     "social_ap",
     "social_auc",
     "mean_social_f1",
+    "mean_social_accuracy",
 )
+_ACCURACY_KEYS = (("LAH", "lah_pred", "lah_gt"), ("LAEO", "laeo_pred", "laeo_gt"), ("SA", "coatt_pred", "coatt_gt"))
 
 
 def normalize_eval_key(key: Sequence[object]) -> EvalKey:
@@ -208,8 +213,39 @@ def _parse_f1(detail: str) -> dict[str, float | None]:
     return values
 
 
-def augment_social_metrics(metrics: Mapping[str, object]) -> dict[str, object]:
-    """Add SA F1 and complete three-task aggregate metrics to locked output."""
+def binary_accuracy(
+    samples: Sequence[Mapping[str, object]], *, threshold: float = 0.5
+) -> dict[str, float | None]:
+    """Flat per-task binary accuracy (TP+TN / total) over valid (gt != -1) pairs.
+
+    Complements the locked per-target-argmax F1 with a simple threshold@0.5 accuracy,
+    computed directly from the same ``build_mtgs_dicts`` sample dicts (never re-derives
+    predictions/labels, so it cannot diverge from what ``evaluate()`` scored).
+    """
+    output: dict[str, float | None] = {}
+    for name, pred_key, gt_key in _ACCURACY_KEYS:
+        correct = 0
+        count = 0
+        for sample in samples:
+            pred = sample[pred_key].reshape(-1)
+            gt = sample[gt_key].reshape(-1)
+            valid = gt != -1
+            if not bool(valid.any()):
+                continue
+            pred_label = (pred[valid] >= threshold).long()
+            correct += int((pred_label == gt[valid]).sum())
+            count += int(valid.sum())
+        output[f"Acc_{name}"] = None if count == 0 else correct / count
+    return output
+
+
+def augment_social_metrics(
+    metrics: Mapping[str, object],
+    samples: Sequence[Mapping[str, object]] | None = None,
+    *,
+    threshold: float = 0.5,
+) -> dict[str, object]:
+    """Add SA F1, binary accuracy, and complete three-task aggregate metrics."""
     output = dict(metrics)
     parsed = _parse_f1(str(output.get("detail", "")))
     if output.get("F1_LAH") is None:
@@ -217,6 +253,8 @@ def augment_social_metrics(metrics: Mapping[str, object]) -> dict[str, object]:
     if output.get("F1_LAEO") is None:
         output["F1_LAEO"] = parsed["LAEO"]
     output["F1_SA"] = parsed["SA"]
+    if samples is not None:
+        output.update(binary_accuracy(samples, threshold=threshold))
 
     def complete_mean(keys: Sequence[str]) -> float | None:
         values = [output.get(key) for key in keys]
@@ -227,6 +265,7 @@ def augment_social_metrics(metrics: Mapping[str, object]) -> dict[str, object]:
     output["social_ap"] = complete_mean(("LAH_AP", "LAEO_AP", "SA_AP"))
     output["social_auc"] = complete_mean(("LAH_AUC", "LAEO_AUC", "SA_AUC"))
     output["mean_social_f1"] = complete_mean(("F1_LAH", "F1_LAEO", "F1_SA"))
+    output["mean_social_accuracy"] = complete_mean(("Acc_LAH", "Acc_LAEO", "Acc_SA"))
     return output
 
 
@@ -257,7 +296,7 @@ def evaluate_predictions(
         raise ValueError(
             f"gtmeta coverage mismatch: expected {len(expected)} frames, built {len(samples)}"
         )
-    return augment_social_metrics(evaluate(samples, thr=threshold))
+    return augment_social_metrics(evaluate(samples, thr=threshold), samples, threshold=threshold)
 
 
 def metric_payload(metrics: Mapping[str, object], *, detail: bool = False) -> dict[str, object]:
@@ -295,8 +334,18 @@ def format_graph_model_table(
     annotations: SocialAnnotationDataset,
     *,
     model_name: str = "VLM",
+    f1_only: bool = False,
 ) -> str:
-    """Format graph-versus-model metrics for the exact evaluated manifest."""
+    """Format graph-versus-model metrics for the exact evaluated manifest.
+
+    ``f1_only`` drops the AP/AUC columns and prints only F1: under confidence-gated
+    routing, ``model_metrics`` mixes the frozen graph's score scale (high-confidence
+    pairs) with the VLM's independent score scale (low-confidence pairs), so a ranking
+    metric (AP/AUC) computed over that mix is not meaningful. F1 thresholds each pair at
+    0.5 independently and stays valid regardless of which scale answered it. Callers pass
+    ``f1_only=cfg.routing.use`` so routed runs report the graph-only vs graph+VLM-routing
+    comparison as F1-only automatically.
+    """
 
     task_keys = {
         "LAH": ("LAH_AP", "LAH_AUC", "F1_LAH", "lah"),
@@ -315,12 +364,22 @@ def format_graph_model_table(
             return "N/A"
         return f"{float(model) - float(graph):+.4f}"
 
-    lines = [
-        f"===== TEST: RAW GRAPH vs {model_name.upper()} (same manifest) =====",
-        "| Task | Pos / Neg | Graph AP | " + model_name + " AP | ΔAP | Graph AUC | "
-        + model_name + " AUC | ΔAUC | Graph F1 | " + model_name + " F1 | ΔF1 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
+    graph_label = "Graph-only"
+    model_label = f"Graph+{model_name} routing" if f1_only else model_name
+    if f1_only:
+        lines = [
+            f"===== TEST: {graph_label.upper()} vs {model_label.upper()} (same manifest, "
+            "F1 only -- routing mixes graph/VLM score scales, AP/AUC omitted) =====",
+            f"| Task | Pos / Neg | {graph_label} F1 | {model_label} F1 | ΔF1 |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    else:
+        lines = [
+            f"===== TEST: RAW GRAPH vs {model_name.upper()} (same manifest) =====",
+            "| Task | Pos / Neg | Graph AP | " + model_name + " AP | ΔAP | Graph AUC | "
+            + model_name + " AUC | ΔAUC | Graph F1 | " + model_name + " F1 | ΔF1 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
     total_positive = total_negative = 0
     for title, (ap_key, auc_key, f1_key, task) in task_keys.items():
         if task is None:
@@ -330,26 +389,180 @@ def format_graph_model_table(
             total_positive += counts[1]
             total_negative += counts[0]
             count_text = f"{counts[1]} / {counts[0]}"
+        if f1_only:
+            lines.append(
+                f"| {title} | {count_text} | {number(graph_metrics.get(f1_key))} | "
+                f"{number(model_metrics.get(f1_key))} | {delta(f1_key)} |"
+            )
+        else:
+            lines.append(
+                f"| {title} | {count_text} | {number(graph_metrics.get(ap_key))} | "
+                f"{number(model_metrics.get(ap_key))} | {delta(ap_key)} | "
+                f"{number(graph_metrics.get(auc_key))} | {number(model_metrics.get(auc_key))} | "
+                f"{delta(auc_key)} | {number(graph_metrics.get(f1_key))} | "
+                f"{number(model_metrics.get(f1_key))} | {delta(f1_key)} |"
+            )
+    return "\n".join(lines)
+
+
+def _binary_f1_from_pairs(pairs: Sequence[tuple[int, int]]) -> float | None:
+    """Threshold@0.5 F1 over ``(label, pred)`` pairs; ``None`` if ``pairs`` is empty."""
+    if not pairs:
+        return None
+    tp = sum(1 for label, pred in pairs if label == 1 and pred == 1)
+    fp = sum(1 for label, pred in pairs if label == 0 and pred == 1)
+    fn = sum(1 for label, pred in pairs if label == 1 and pred == 0)
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    return 0.0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
+
+
+def routing_low_confidence_keys(
+    annotations: SocialAnnotationDataset,
+    graph_cache: Mapping[str, Mapping[str, object]],
+    threshold: float,
+) -> set[EvalKey]:
+    """Normalized eval keys of pairs the router sends to the VLM (graph conf < threshold)."""
+    _high, low = partition_by_graph_confidence(annotations, graph_cache, threshold)
+    return {normalize_eval_key(annotations.samples[i].eval_key) for i in low}
+
+
+def format_routing_comparison_table(
+    graph_records: Sequence[PredictionRecord],
+    model_records: Sequence[PredictionRecord],
+    low_conf_keys: set[EvalKey],
+    graph_metrics: Mapping[str, object],
+    model_metrics: Mapping[str, object],
+    *,
+    threshold: float,
+    model_name: str = "VLM",
+) -> str:
+    """4-row confidence-gated routing diagnostic (F1 only; AP/AUC are not meaningful once
+    graph and VLM score scales are mixed by routing).
+
+    Rows 1-2: flat threshold@0.5 F1 restricted to exactly the pairs the router sends to
+    the VLM (graph conf < threshold), for the graph and the VLM separately over the SAME
+    key set -- directly comparable, and answers "does the VLM actually help on the cases
+    it's asked about".
+
+    Rows 3-4: the locked per-target-pooled F1 (``compute_metrics.compute()``, via
+    ``evaluate_predictions``) over the FULL population, for the graph alone and for the
+    graph+VLM routed system -- answers "does the combined system beat the graph baseline
+    overall". ``model_records``/``model_metrics`` come from a routed collector/evaluation
+    (high-confidence pairs answered by the graph, low-confidence pairs by the VLM); rows
+    1-2 recover the VLM's own predictions on the low-confidence pairs by filtering that
+    same collector's records down to ``low_conf_keys`` -- no extra forward pass needed.
+    """
+
+    def flat_f1(records: Sequence[PredictionRecord], keys: set[EvalKey]) -> dict[str, float | None]:
+        by_task: dict[str, list[tuple[int, int]]] = {"lah": [], "laeo": [], "sa": []}
+        for record in records:
+            if record.key in keys:
+                by_task[record.key[1]].append(
+                    (record.label, 1 if record.probability >= 0.5 else 0)
+                )
+        out = {task: _binary_f1_from_pairs(pairs) for task, pairs in by_task.items()}
+        values = [value for value in out.values() if value is not None]
+        out["macro"] = sum(values) / len(values) if values else None
+        return out
+
+    def num(value: object) -> str:
+        return "N/A" if value is None else f"{float(value):.4f}"
+
+    row1 = flat_f1(graph_records, low_conf_keys)
+    row2 = flat_f1(model_records, low_conf_keys)
+    n_low = sum(1 for record in model_records if record.key in low_conf_keys)
+    n_full = len(model_records)
+
+    lines = [
+        f"===== ROUTING DIAGNOSTIC (threshold={threshold}): Graph-only vs {model_name} "
+        "(F1 only -- AP/AUC omitted, routing mixes score scales) =====",
+        "| Row | Scope | n | LAH F1 | LAEO F1 | SA F1 | Macro F1 |",
+        "|---|---|---:|---:|---:|---:|---:|",
+        f"| 1. Graph-only | conf<{threshold} | {n_low} | {num(row1['lah'])} | "
+        f"{num(row1['laeo'])} | {num(row1['sa'])} | {num(row1['macro'])} |",
+        f"| 2. {model_name} | conf<{threshold} | {n_low} | {num(row2['lah'])} | "
+        f"{num(row2['laeo'])} | {num(row2['sa'])} | {num(row2['macro'])} |",
+        f"| 3. Graph-only | full | {n_full} | {num(graph_metrics.get('F1_LAH'))} | "
+        f"{num(graph_metrics.get('F1_LAEO'))} | {num(graph_metrics.get('F1_SA'))} | "
+        f"{num(graph_metrics.get('mean_social_f1'))} |",
+        f"| 4. Graph+{model_name} routing | full | {n_full} | "
+        f"{num(model_metrics.get('F1_LAH'))} | {num(model_metrics.get('F1_LAEO'))} | "
+        f"{num(model_metrics.get('F1_SA'))} | {num(model_metrics.get('mean_social_f1'))} |",
+    ]
+    return "\n".join(lines)
+
+
+def format_metrics_table(
+    metrics: Mapping[str, object],
+    annotations: SocialAnnotationDataset,
+    *,
+    title: str = "results",
+) -> str:
+    """Format one model's per-task AP/AUC/F1/Acc metrics as a readable table.
+
+    Sibling of :func:`format_graph_model_table` for runs with no comparison model
+    (e.g. a standalone ``raw_graph`` evaluation).
+    """
+
+    task_keys = {
+        "LAH": ("LAH_AP", "LAH_AUC", "F1_LAH", "Acc_LAH", "lah"),
+        "LAEO": ("LAEO_AP", "LAEO_AUC", "F1_LAEO", "Acc_LAEO", "laeo"),
+        "SA": ("SA_AP", "SA_AUC", "F1_SA", "Acc_SA", "sa"),
+        "Macro": ("social_ap", "social_auc", "mean_social_f1", "mean_social_accuracy", None),
+    }
+    class_counts = annotations.class_counts
+
+    def number(value: object) -> str:
+        return "N/A" if value is None else f"{float(value):.4f}"
+
+    lines = [
+        f"===== {title.upper()} =====",
+        "| Task | Pos / Neg | AP | AUC | F1 | Acc |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    total_positive = total_negative = 0
+    for name, (ap_key, auc_key, f1_key, acc_key, task) in task_keys.items():
+        if task is None:
+            count_text = f"{total_positive} / {total_negative}"
+        else:
+            counts = class_counts[task]
+            total_positive += counts[1]
+            total_negative += counts[0]
+            count_text = f"{counts[1]} / {counts[0]}"
         lines.append(
-            f"| {title} | {count_text} | {number(graph_metrics.get(ap_key))} | "
-            f"{number(model_metrics.get(ap_key))} | {delta(ap_key)} | "
-            f"{number(graph_metrics.get(auc_key))} | {number(model_metrics.get(auc_key))} | "
-            f"{delta(auc_key)} | {number(graph_metrics.get(f1_key))} | "
-            f"{number(model_metrics.get(f1_key))} | {delta(f1_key)} |"
+            f"| {name} | {count_text} | {number(metrics.get(ap_key))} | "
+            f"{number(metrics.get(auc_key))} | {number(metrics.get(f1_key))} | "
+            f"{number(metrics.get(acc_key))} |"
         )
     return "\n".join(lines)
 
 
-def format_metrics(metrics: Mapping[str, object], title: str = "") -> str:
+def format_metrics(metrics: Mapping[str, object], title: str = "", *, f1_only: bool = False) -> str:
+    """One-line-per-task metric summary.
+
+    ``f1_only`` drops AP/AUC/social_ap/social_auc: under confidence-gated routing these
+    mix the graph's and VLM's independent score scales and are not meaningful (see
+    :func:`format_graph_model_table`). Pass ``f1_only=cfg.routing.use``.
+    """
+
     def value(key: str) -> str:
         item = metrics.get(key)
         return "N/A" if item is None else f"{float(item):.4f}"
 
     prefix = f"[{title}] " if title else ""
+    if f1_only:
+        return (
+            f"{prefix}mean_f1={value('mean_social_f1')} mean_acc={value('mean_social_accuracy')} "
+            "(AP/AUC omitted under routing)\n"
+            f"  LAH : F1={value('F1_LAH')} Acc={value('Acc_LAH')}\n"
+            f"  LAEO: F1={value('F1_LAEO')} Acc={value('Acc_LAEO')}\n"
+            f"  SA  : F1={value('F1_SA')} Acc={value('Acc_SA')}"
+        )
     return (
         f"{prefix}social_ap={value('social_ap')} social_auc={value('social_auc')} "
-        f"mean_f1={value('mean_social_f1')}\n"
-        f"  LAH : AP={value('LAH_AP')} AUC={value('LAH_AUC')} F1={value('F1_LAH')}\n"
-        f"  LAEO: AP={value('LAEO_AP')} AUC={value('LAEO_AUC')} F1={value('F1_LAEO')}\n"
-        f"  SA  : AP={value('SA_AP')} AUC={value('SA_AUC')} F1={value('F1_SA')}"
+        f"mean_f1={value('mean_social_f1')} mean_acc={value('mean_social_accuracy')}\n"
+        f"  LAH : AP={value('LAH_AP')} AUC={value('LAH_AUC')} F1={value('F1_LAH')} Acc={value('Acc_LAH')}\n"
+        f"  LAEO: AP={value('LAEO_AP')} AUC={value('LAEO_AUC')} F1={value('F1_LAEO')} Acc={value('Acc_LAEO')}\n"
+        f"  SA  : AP={value('SA_AP')} AUC={value('SA_AUC')} F1={value('F1_SA')} Acc={value('Acc_SA')}"
     )

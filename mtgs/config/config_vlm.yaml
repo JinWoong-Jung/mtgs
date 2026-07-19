@@ -5,15 +5,24 @@
 # dedicated experiment configs, not in the production/default training surface.
 
 experiment:
-  name: VLM(graph=true)_v1
-  out_root: experiments/vlm
-  monitor: social_ap          # locked mean AP across LAH / LAEO / SA
+  name: VLM_v3(full)-routing(0.9)
+  out_root: experiments/VLM
+  monitor: mean_social_f1          # locked mean AP across LAH / LAEO / SA
   monitor_mode: max
 
 data:
-  # The launcher resolves manifests from CACHE/manifests/<profile>.
-  # Profiles define the selected dataset subset; sampling never silently filters rows.
-  profile: fast_frame               # all rows; use fast_frame or balanced only for an explicit ablation
+  # Profiles are built by scripts/build_vlm_cache.sh.
+  # full: all rows; fast_frame: stride-3, unbalanced; balanced: ChildPlay/VAT, balanced;
+  # balanced_full: all sources, stride-3, balanced.
+  profile: full
+
+routing:
+  # Confidence-gated routing knob, read only by vlm.evaluate. use=false keeps the
+  # production/default behaviour (VLM scores every pair). The routing experiment
+  # (train on low-confidence pairs only + route at eval, report F1 only) lives in
+  # its dedicated config_vlm_routing.yaml + scripts/{train,eval}_vlm_routing.sh.
+  use: true
+  threshold: 0.9             # graph decision confidence max(p, 1-p); pairs below go to the VLM
 
 model:
   qwen: Qwen/Qwen3-VL-8B-Instruct
@@ -44,22 +53,22 @@ sampling:
 train:
   epochs: 3
   bs: 16
-  accum: 1
-  num_workers: 6
+  accum: 4
+  num_workers: 8
   raw_image_cache_size: 1    # decoded PIL-frame LRU; separate from vision cache
   seed: 101
   wandb_log_interval: 25
 
 optim:
-  lr: 1.0e-4                  # LoRA parameters (the only trainable parameters here)
+  lr: 4.0e-4                  # LoRA parameters (the only trainable parameters here)
   weight_decay: 0.01
   grad_clip: 1.0
   scheduler: cosine
   warmup_ratio: 0.03
 
 val:
-  bs: 64
-  num_workers: 6
+  bs: 16
+  num_workers: 8
   raw_image_cache_size: 1
   prompt_seed: 101            # fixed wording for comparable validation/test AP
   threshold: 0.5              # F1 threshold; AP/AUC are threshold-free

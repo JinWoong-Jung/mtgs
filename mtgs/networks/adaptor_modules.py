@@ -470,7 +470,6 @@ class GazeGraphBlock(nn.Module):
         heads: int = 4,
         use_prior: bool = True,
         prior_weight: float = 0.5,
-        use_node_xattn: bool = True,   # deprecated (V14): node init no longer uses heatmap XAttn
         face_dim: int = 768,           # raw GazeEncoder token dim (pre-adaptor facial feature)
         laeo_derive: str = "lah_min",  # "decoder": use head_laeo | "lah_min": derived downstream
     ):

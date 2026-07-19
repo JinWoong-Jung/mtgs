@@ -73,7 +73,6 @@ class MTGSModel(pl.LightningModule):
             gaze_graph_edge_dim=cfg.gaze_graph.edge_dim,
             gaze_graph_use_prior=cfg.gaze_graph.use_prior,
             gaze_graph_prior_weight=cfg.gaze_graph.prior_weight,
-            gaze_graph_use_node_xattn=cfg.gaze_graph.use_node_xattn,
             gaze_graph_laeo_derive=cfg.gaze_graph.laeo_derive,
             gaze_graph_use=cfg.gaze_graph.use,
         )

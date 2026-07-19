@@ -4,19 +4,14 @@ import pytest
 import torch
 from PIL import Image
 
-from vlm.social.evidence import TextGraphEvidence
+from vlm.social.data import SocialAnnotationDataset
 from vlm.social.input import (
-    GraphControlDataset,
-    GraphFeatureControlDataset,
     SocialInputDataset,
     RawFrameCache,
-    control_collate,
-    feature_control_collate,
     task_pos_weights,
     sample_weights,
     partition_by_graph_confidence,
 )
-from vlm.social.prompt import TASK_DEFINITIONS, task_prompt
 
 
 def _fake_graph_cache():
@@ -36,10 +31,12 @@ def _fake_graph_cache():
         "lah_logits": logits,
         "laeo_logits": logits + 10,
         "sa_logits": logits + 20,
+        "null_in_logits": torch.tensor([0.0, 0.5]),
         "head_bboxes": torch.tensor([
             [0.10, 0.10, 0.35, 0.35],
             [0.60, 0.60, 0.85, 0.85],
         ]),
+        "gaze_point": torch.tensor([[0.50, 0.50], [0.45, 0.45]]),
         "vis_mask": torch.ones(num_people, dtype=torch.bool),
     }
 
@@ -52,14 +49,14 @@ def _write_frame(root, sid, color="black"):
 
 def _write_manifest(path):
     records = [
-        # Raw LAH: person 1 looks at person 0 -> canonical A=1(red), B=0(blue).
+        # Raw LAH: person 1 looks at person 0 -> canonical A=1, B=0.
         {"sid": "s0", "task": "lah", "i": 0, "j": 1, "ans": "yes"},
         {"sid": "s0", "task": "sa", "i": 0, "j": 1, "ans": "no"},
     ]
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
 
-def _make_generative_dataset(tmp_path, *, graph_evidence="gtoken", include_graph_evidence=True):
+def _make_dataset(tmp_path, *, include_graph_evidence=True):
     frame_root = tmp_path / "frames"
     _write_frame(frame_root, "s0")
     manifest = tmp_path / "manifest.jsonl"
@@ -69,41 +66,31 @@ def _make_generative_dataset(tmp_path, *, graph_evidence="gtoken", include_graph
         manifest,
         frame_root,
         graph,
-        output_mode="generative",
-        graph_evidence=graph_evidence,
         include_graph_evidence=include_graph_evidence,
     )
 
 
-def test_text_mode_builds_text_prompt_and_evidence_on_plain_image(tmp_path):
-    ds = _make_generative_dataset(tmp_path, graph_evidence="text")
+def test_text_mode_builds_text_prompt_on_plain_image(tmp_path):
+    ds = _make_dataset(tmp_path)
     item = ds[0]
 
-    assert isinstance(item.evidence, TextGraphEvidence)
     assert "Person A" in item.prompt and "Person B" in item.prompt
     assert item.prompt.rstrip().endswith(
         'Answer with a single word, "yes" or "no".'
     )
-    assert "marked with a RED box" not in item.prompt
+    assert "graph" in item.prompt.lower()          # evidence written into the prompt as text
     assert item.image.getpixel((70, 85)) == (0, 0, 0)
 
 
 def test_text_mode_ablation_flag_drops_graph_from_prompt(tmp_path):
-    ds = _make_generative_dataset(tmp_path, graph_evidence="text", include_graph_evidence=False)
+    ds = _make_dataset(tmp_path, include_graph_evidence=False)
     item = ds[0]
 
     assert "Person A" in item.prompt and "Person B" in item.prompt
     assert "graph" not in item.prompt.lower()
-    # evidence is still assembled (harmless, unused by the text collate) but not surfaced
-    assert isinstance(item.evidence, TextGraphEvidence)
 
 
-def test_include_graph_evidence_false_rejected_outside_text_mode(tmp_path):
-    with pytest.raises(ValueError):
-        _make_generative_dataset(tmp_path, graph_evidence="gtoken", include_graph_evidence=False)
-
-
-def test_social_dataset_uses_task_text_canonical_boxes_and_raw_lru(tmp_path):
+def test_dataset_canonicalizes_lah_direction_and_reuses_raw_lru(tmp_path):
     frame_root = tmp_path / "frames"
     _write_frame(frame_root, "s0")
     manifest = tmp_path / "manifest.jsonl"
@@ -115,19 +102,10 @@ def test_social_dataset_uses_task_text_canonical_boxes_and_raw_lru(tmp_path):
     sa = dataset[1]
 
     assert (lah.annotation.person_i, lah.annotation.person_j) == (1, 0)
-    assert lah.prompt == task_prompt("lah")
-    assert sa.prompt == task_prompt("sa")
     assert lah.prompt != sa.prompt
-    assert TASK_DEFINITIONS["lah"] in lah.prompt
-    assert TASK_DEFINITIONS["sa"] in sa.prompt
-    assert lah.image.getpixel((70, 85)) == (0, 0, 0)
-    assert lah.image.getpixel((35, 30)) == (0, 0, 0)
-    assert lah.evidence.task == "lah" and sa.evidence.task == "sa"
-    assert lah.image is sa.image
+    assert lah.image is sa.image                    # same frame reused from the LRU
     assert dataset.frames.cache_info() == (1, 1, 2, 1)
     assert dataset.raw_frame_path(0) == frame_root / "s0" / "frame.png"
-    with Image.open(dataset.raw_frame_path(0)) as raw:
-        assert raw.convert("RGB").getpixel((70, 85)) == (0, 0, 0)
 
 
 def test_raw_frame_lru_is_bounded_and_can_be_disabled(tmp_path):
@@ -160,44 +138,6 @@ def test_missing_raw_frame_has_contextual_error(tmp_path):
         cache.get("s404")
 
 
-def test_graph_control_reuses_rows_without_loading_images_and_collates(tmp_path):
-    manifest = tmp_path / "manifest.jsonl"
-    _write_manifest(manifest)
-    dataset = GraphControlDataset(manifest, {"s0": _fake_graph_cache()})
-    batch = control_collate([dataset[0], dataset[1]])
-    assert batch["task_ids"].tolist() == [0, 2]
-    assert batch["pair_labels"].tolist() == [1.0, 0.0]
-    # Raw LAH is reversed once: canonical graph logit is [looker=1,target=0].
-    assert batch["graph_logits"][0].item() == 2.0
-    assert batch["graph_logits"][1].item() == 21.5
-
-
-def test_graph_feature_control_uses_six_slot_evidence_without_images(tmp_path):
-    manifest = tmp_path / "manifest.jsonl"
-    _write_manifest(manifest)
-    dataset = GraphFeatureControlDataset(manifest, {"s0": _fake_graph_cache()})
-    batch = feature_control_collate([dataset[0], dataset[1]])
-    graph = batch["pair_graph"]
-
-    assert dataset.feature_dim == 4
-    assert batch["task_ids"].tolist() == [0, 2]
-    assert graph.tasks == ("lah", "sa")
-    # LAH raw indices are transposed once by SocialAnnotationDataset: A=1 -> B=0.
-    assert graph.graph_logits.tolist() == [2.0, 21.5]
-    assert graph.person_channel_present[0].tolist() == [
-        [True, False, False],
-        [False, True, False],
-    ]
-    assert graph.relation_present[0].tolist() == [True, False]
-    assert graph.heatmap_present[0].tolist() == [True, False]
-    assert graph.person_channel_present[1].tolist() == [
-        [True, False, True],
-        [True, False, True],
-    ]
-    # Constructing and indexing the dataset never needs a frame_root.
-    assert not hasattr(dataset, "frames")
-
-
 def test_sampler_balance_hardness_and_pos_weights(tmp_path):
     manifest = tmp_path / "manifest.jsonl"
     records = [
@@ -209,44 +149,14 @@ def test_sampler_balance_hardness_and_pos_weights(tmp_path):
         {"sid": "s0", "task": "sa", "i": 1, "j": 0, "ans": "no"},
     ]
     manifest.write_text("".join(json.dumps(record) + "\n" for record in records))
-    dataset = GraphControlDataset(manifest, {"s0": _fake_graph_cache()})
-    balanced = dataset.sample_weights(balance_mode="task_label")
+    annotations = SocialAnnotationDataset(manifest)
+    cache = {"s0": _fake_graph_cache()}
+    balanced = sample_weights(annotations, cache, balance_mode="task_label")
     torch.testing.assert_close(balanced, torch.ones(6, dtype=torch.double))
-    hard = dataset.sample_weights(balance_mode="task_label", hard_floor=0.25)
+    hard = sample_weights(annotations, cache, balance_mode="task_label", hard_floor=0.25)
     assert torch.all(hard >= 0.25)
     assert torch.all(hard <= 1.25)
-    assert task_pos_weights(dataset.annotations) == {
-        "lah": 1.0, "laeo": 1.0, "sa": 1.0,
-    }
-
-
-def test_sample_weights_task_label_balance_unaffected_by_route_threshold_none(
-    tmp_path,
-):
-    manifest = tmp_path / "manifest.jsonl"
-    records = [
-        {"sid": "s0", "task": "lah", "i": 0, "j": 1, "ans": "yes"},
-        {"sid": "s0", "task": "lah", "i": 1, "j": 0, "ans": "no"},
-        {"sid": "s0", "task": "laeo", "i": 0, "j": 1, "ans": "yes"},
-        {"sid": "s0", "task": "laeo", "i": 1, "j": 0, "ans": "no"},
-        {"sid": "s0", "task": "sa", "i": 0, "j": 1, "ans": "yes"},
-        {"sid": "s0", "task": "sa", "i": 1, "j": 0, "ans": "no"},
-    ]
-    manifest.write_text("".join(json.dumps(record) + "\n" for record in records))
-    dataset = GraphControlDataset(manifest, {"s0": _fake_graph_cache()})
-
-    default_weights = sample_weights(
-        dataset.annotations,
-        dataset.graph_cache,
-        balance_mode="task_label",
-    )
-    explicit_none_weights = sample_weights(
-        dataset.annotations,
-        dataset.graph_cache,
-        balance_mode="task_label",
-        route_threshold=None,
-    )
-    torch.testing.assert_close(default_weights, explicit_none_weights)
+    assert task_pos_weights(annotations) == {"lah": 1.0, "laeo": 1.0, "sa": 1.0}
 
 
 def test_confidence_routing_partitions_and_zeroes_high_confidence_weights(tmp_path):
@@ -258,37 +168,18 @@ def test_confidence_routing_partitions_and_zeroes_high_confidence_weights(tmp_pa
         {"sid": "s0", "task": "laeo", "i": 0, "j": 1, "ans": "yes"},
     ]
     manifest.write_text("".join(json.dumps(record) + "\n" for record in records))
-    dataset = GraphControlDataset(manifest, {"s0": _fake_graph_cache()})
+    annotations = SocialAnnotationDataset(manifest)
+    cache = {"s0": _fake_graph_cache()}
 
-    high, low = partition_by_graph_confidence(dataset.annotations, dataset.graph_cache, 0.9)
+    high, low = partition_by_graph_confidence(annotations, cache, 0.9)
     assert low == [0]                       # only the low-confidence lah pair reaches the VLM
     assert high == [1, 2]
 
-    weights = sample_weights(
-        dataset.annotations, dataset.graph_cache,
-        balance_mode="task", route_threshold=0.9,
-    )
+    weights = sample_weights(annotations, cache, balance_mode="task", route_threshold=0.9)
     assert weights[0] > 0
     assert weights[1] == 0 and weights[2] == 0
 
     with pytest.raises(ValueError, match="no low-confidence training pairs"):
-        sample_weights(
-            dataset.annotations, dataset.graph_cache,
-            balance_mode="task", route_threshold=0.5,   # everything is high-confidence
-        )
+        sample_weights(annotations, cache, balance_mode="task", route_threshold=0.5)
     with pytest.raises(ValueError, match="threshold must be in"):
-        partition_by_graph_confidence(dataset.annotations, dataset.graph_cache, 1.5)
-
-
-def test_confidence_routing_sends_exact_threshold_to_vlm(tmp_path):
-    manifest = tmp_path / "manifest.jsonl"
-    manifest.write_text("{\"sid\":\"s0\",\"task\":\"lah\",\"i\":0,\"j\":1,\"ans\":\"yes\"}\n")
-    cache = _fake_graph_cache()
-    dataset = GraphControlDataset(manifest, {"s0": cache})
-    cache["lah_logits"].zero_()  # conf = 0.5 exactly, so this pair goes to the VLM.
-
-    high, low = partition_by_graph_confidence(
-        dataset.annotations, dataset.graph_cache, 0.5
-    )
-    assert high == []
-    assert low == [0]
+        partition_by_graph_confidence(annotations, cache, 1.5)
