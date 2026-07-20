@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 
 from collections import Counter, OrderedDict, namedtuple
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import torch
 from PIL import Image
@@ -20,7 +21,15 @@ from vlm.social.data import (
     SOCIAL_TASK_ID,
     frame_path,
 )
+from vlm.cache.overlay import build_overlay_pair
 from vlm.social.evidence import assemble_text_graph_evidence
+from vlm.social.graph_tokens import (
+    GraphTokenPayload,
+    extract_graph_token_payload,
+    graph_token_markers,
+    normalize_graph_evidence_mode,
+    normalize_graph_token_features,
+)
 from vlm.social.prompt import compose_text_prompt
 
 
@@ -83,10 +92,17 @@ class SocialVLMInput:
     image: Image.Image
     prompt: str
     vision_cache_key: str | None = None
+    graph_token_payload: GraphTokenPayload | None = None
 
 
 class SocialInputDataset(Dataset):
-    """Connect labelled pairs to cached frames and cached frozen graph evidence."""
+    """Connect labelled pairs to cached frames and cached frozen graph evidence.
+
+    When ``routing_threshold`` is supplied, low-confidence pairs carry a compact prompt
+    cue that the graph needs visual review. The predicate is deliberately identical to
+    :func:`partition_by_graph_confidence`: graph answers only ``conf > threshold`` and
+    the VLM-reviewed remainder is ``conf <= threshold``.
+    """
 
     def __init__(
         self,
@@ -97,8 +113,28 @@ class SocialInputDataset(Dataset):
         raw_image_cache_size: int = 32,
         generative_prompt_seed: int | None = None,
         include_graph_evidence: bool = True,
+        routing_threshold: float | None = None,
+        graph_evidence_mode: str = "text",
+        graph_token_features: Sequence[str] | None = None,
+        draw_pair_bboxes: bool = False,
     ):
+        self.draw_pair_bboxes = bool(draw_pair_bboxes)
         self.include_graph_evidence = bool(include_graph_evidence)
+        self.graph_evidence_mode = normalize_graph_evidence_mode(graph_evidence_mode)
+        if self.graph_evidence_mode == "text_tokens":
+            if not self.include_graph_evidence:
+                raise ValueError("text_tokens requires include_graph_evidence=True")
+            self.graph_token_features = normalize_graph_token_features(graph_token_features)
+        else:
+            self.graph_token_features = ()
+        if routing_threshold is not None and not 0.5 <= float(routing_threshold) <= 1.0:
+            raise ValueError(
+                "routing_threshold must be in [0.5, 1], "
+                f"got {routing_threshold}"
+            )
+        self.routing_threshold = (
+            None if routing_threshold is None else float(routing_threshold)
+        )
         self.annotations = (
             manifest if isinstance(manifest, SocialAnnotationDataset)
             else SocialAnnotationDataset(manifest)
@@ -157,18 +193,56 @@ class SocialInputDataset(Dataset):
         # RawFrameCache images are immutable by contract. Returning the shared object
         # lets the collator deduplicate image preprocessing and vision encoding by frame.
         image = self.frames.get(sample.sid)
+        frame_key = str((self.frames.frame_root / sample.sid / "frame.png").resolve())
+        if self.draw_pair_bboxes:
+            # Draw the queried pair's head boxes (A=red source, B=blue target) so the VLM
+            # sees which people the prompt's "Person A/B" refer to, instead of resolving
+            # text coordinates against the raw frame. build_overlay_pair copies the image,
+            # so the shared cache frame is never mutated. Each pair now has a distinct
+            # image, so the vision-reuse cache key must be pair-unique (otherwise the
+            # collator would encode only the first pair's boxed frame and reuse it for the
+            # rest of the frame). This intentionally forgoes per-frame vision reuse.
+            image = build_overlay_pair(
+                image,
+                sample.person_i,
+                sample.person_j,
+                bboxes,
+                {sample.person_i: "Person A", sample.person_j: "Person B"},
+            )
+            frame_key = f"{frame_key}::A{sample.person_i}B{sample.person_j}"
+        graph_needs_visual_review = (
+            self.routing_threshold is not None
+            and graph_confidence(sample, cache) <= self.routing_threshold
+        )
+        token_markers = (
+            graph_token_markers(sample.task, self.graph_token_features)
+            if self.graph_evidence_mode == "text_tokens"
+            else None
+        )
+        graph_token_payload = (
+            extract_graph_token_payload(
+                task=sample.task,
+                person_a=sample.person_i,
+                person_b=sample.person_j,
+                cache=cache,
+                features=self.graph_token_features,
+            )
+            if self.graph_evidence_mode == "text_tokens"
+            else None
+        )
         prompt = compose_text_prompt(
             sample.task, box_a.tolist(), box_b.tolist(), evidence,
             rng=self._generative_rng(sample),
             include_graph_evidence=self.include_graph_evidence,
+            graph_needs_visual_review=graph_needs_visual_review,
+            graph_token_markers=token_markers,
         )
         return SocialVLMInput(
             annotation=sample,
             image=image,
             prompt=prompt,
-            vision_cache_key=str(
-                (self.frames.frame_root / sample.sid / "frame.png").resolve()
-            ),
+            vision_cache_key=frame_key,
+            graph_token_payload=graph_token_payload,
         )
 
     def raw_frame_path(self, index: int) -> Path:
@@ -240,6 +314,43 @@ def partition_by_graph_confidence(
     return high, low
 
 
+def boost_low_confidence_weights(
+    weights: torch.Tensor,
+    annotations: SocialAnnotationDataset,
+    graph_cache: Mapping[str, Mapping[str, object]],
+    *,
+    threshold: float,
+    multiplier: float,
+) -> tuple[torch.Tensor, list[int]]:
+    """Oversample the VLM-routed remainder without discarding graph-fallback pairs.
+
+    ``multiplier=1`` is a no-op. Larger values multiply only the weights of pairs
+    whose frozen-graph confidence is ``<= threshold`` -- precisely the pairs the
+    validation/test router sends to the VLM. This is sampler weighting, not loss
+    weighting: generative yes/no CE remains unchanged for every sampled example.
+    """
+    if weights.ndim != 1 or len(weights) != len(annotations):
+        raise ValueError(
+            "weights must be a rank-1 tensor aligned with annotations: "
+            f"got shape={tuple(weights.shape)}, annotations={len(annotations)}"
+        )
+    multiplier = float(multiplier)
+    if not math.isfinite(multiplier) or multiplier < 1.0:
+        raise ValueError(
+            "low-confidence sampling multiplier must be finite and >= 1, "
+            f"got {multiplier}"
+        )
+    _high, low = partition_by_graph_confidence(annotations, graph_cache, threshold)
+    if not low:
+        raise ValueError(
+            "routing threshold leaves no low-confidence pairs to boost; raise it"
+        )
+    boosted = weights.clone()
+    if multiplier != 1.0:
+        boosted[low] *= multiplier
+    return boosted, low
+
+
 def sample_weights(
     annotations: SocialAnnotationDataset,
     graph_cache: Mapping[str, Mapping[str, object]],
@@ -309,4 +420,3 @@ def task_pos_weights(
             )
         output[task] = min(max(negative / positive, minimum), maximum)
     return output
-

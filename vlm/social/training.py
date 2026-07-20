@@ -36,9 +36,17 @@ from vlm.social.objective import (
 )
 from vlm.social.input import (
     SocialInputDataset,
+    boost_low_confidence_weights,
     task_pos_weights,
     partition_by_graph_confidence,
     sample_graph_logit,
+)
+from vlm.social.graph_tokens import (
+    GRAPH_TOKEN_SLOTS,
+    GraphTokenAdapter,
+    configure_graph_tokenizer,
+    normalize_graph_evidence_mode,
+    normalize_graph_token_features,
 )
 from vlm.social.evaluation import (
     PredictionCollector,
@@ -286,8 +294,8 @@ def _trainable(parameters: Iterable[torch.nn.Parameter]) -> list[torch.nn.Parame
 def partition_vlm_parameters(objective: GenerativeObjective):
     """Return disjoint LoRA/new-module groups and validate the frozen-base contract.
 
-    The text-evidence generative VLM has no new trainable modules besides the LoRA
-    adapters: graph evidence is already natural-language prompt text.
+    ``text`` has no new modules. ``text_tokens`` adds only the small graph-token
+    adapter; the MTGS cache and every original Qwen parameter remain frozen.
     """
     lora_named = [
         (name, parameter)
@@ -301,7 +309,8 @@ def partition_vlm_parameters(objective: GenerativeObjective):
         raise ValueError(f"non-LoRA Qwen parameters are trainable: {invalid[:10]}")
 
     lora = [parameter for _, parameter in lora_named]
-    new = _trainable([])
+    adapter = objective.vlm.graph_token_adapter
+    new = _trainable([] if adapter is None else adapter.parameters())
     overlap = {id(parameter) for parameter in lora}.intersection(
         id(parameter) for parameter in new
     )
@@ -360,6 +369,49 @@ def _route_threshold(cfg) -> float | None:
     return float(routing.get("threshold", 0.9))
 
 
+def _routing_train_settings(cfg, route_threshold: float | None) -> tuple[str, float]:
+    """Resolve the train population and optional low-confidence oversampling.
+
+    The shell launcher materializes ``low_confidence`` as a filtered manifest;
+    ``full`` preserves the canonical train manifest. A multiplier above one is
+    meaningful only for the latter because every row of the former is already
+    VLM-routed.
+    """
+    routing = cfg.get("routing", {})
+    population = str(routing.get("train_population", "low_confidence")).lower()
+    aliases = {
+        "low_conf": "low_confidence",
+        "low_confidence": "low_confidence",
+        "full": "full",
+    }
+    population = aliases.get(population, population)
+    if population not in {"low_confidence", "full"}:
+        raise ValueError(
+            "routing.train_population must be 'low_confidence' or 'full', "
+            f"got {population!r}"
+        )
+    multiplier = float(routing.get("low_confidence_weight", 1.0))
+    if not math.isfinite(multiplier) or multiplier < 1.0:
+        raise ValueError(
+            "routing.low_confidence_weight must be finite and >= 1.0, "
+            f"got {multiplier}"
+        )
+    if route_threshold is None:
+        if multiplier != 1.0:
+            raise ValueError(
+                "routing.low_confidence_weight > 1 requires routing.use=true"
+            )
+        # Without an active router every pair is VLM-scored, so filtering is invalid.
+        return "full", multiplier
+    if population == "low_confidence" and multiplier != 1.0:
+        raise ValueError(
+            "routing.low_confidence_weight only applies when "
+            "routing.train_population='full'; the low-confidence manifest is "
+            "already entirely VLM-routed"
+        )
+    return population, multiplier
+
+
 def validate_sampler_loss_compatibility(
     balance_mode: str, pos_weights: Mapping[str, float]
 ) -> None:
@@ -405,7 +457,14 @@ def score_improved(value: float, best: float | None, mode: str) -> bool:
     return best is None or (value > best if mode == "max" else value < best)
 
 
-def _make_lora_backbone(cfg, processor, device: torch.device, resume: Path | None):
+def _make_lora_backbone(
+    cfg,
+    processor,
+    device: torch.device,
+    resume: Path | None,
+    *,
+    expected_vocab_size: int | None = None,
+):
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import Qwen3VLForConditionalGeneration
 
@@ -416,6 +475,11 @@ def _make_lora_backbone(cfg, processor, device: torch.device, resume: Path | Non
         device_map=str(device),
         attn_implementation="sdpa",   # fast attention on Blackwell (avoid eager fallback)
     )
+    # ``text_tokens`` registers four special placeholders before this point. Resize
+    # before PEFT wraps the model so their input rows exist even though they are later
+    # replaced by GraphTokenAdapter embeddings at every prompt occurrence.
+    if expected_vocab_size is not None and base.get_input_embeddings().num_embeddings != expected_vocab_size:
+        base.resize_token_embeddings(expected_vocab_size)
     patch_qwen3vl_patch_embed(base)
     base.requires_grad_(False)
 
@@ -458,26 +522,72 @@ def _make_lora_backbone(cfg, processor, device: torch.device, resume: Path | Non
 
 @dataclass(frozen=True)
 class GenerativeBuilders:
-    """Text-evidence generative VLM policy (the single supported contract)."""
+    """Generative VLM policy, with optional inline frozen-graph feature tokens."""
 
     reuse_vision: bool
     include_graph_evidence: bool
+    graph_evidence_mode: str
+    graph_token_features: tuple[str, ...]
+    graph_token_edge_dim: int | None
+    graph_token_dropout: float
+    draw_pair_bboxes: bool
 
 
 def select_generative_builders(cfg) -> GenerativeBuilders:
-    """Return the single supported VLM contract: generative text evidence."""
+    """Validate the graph-evidence contract shared by train and evaluation."""
     model_cfg = cfg.get("model", {}) if hasattr(cfg, "get") else cfg["model"]
     input_cfg = cfg.get("input", {}) if hasattr(cfg, "get") else {}
+    include_graph_evidence = bool(model_cfg.get("include_graph_evidence", True))
+    reuse_vision = bool(input_cfg.get("reuse_frozen_vision", False))
+    draw_pair_bboxes = bool(input_cfg.get("draw_pair_bboxes", False))
+    mode = normalize_graph_evidence_mode(model_cfg.get("graph_evidence_mode", "text"))
+    token_cfg = model_cfg.get("graph_tokens", {})
+    if mode == "text":
+        return GenerativeBuilders(
+            reuse_vision=reuse_vision,
+            include_graph_evidence=include_graph_evidence,
+            graph_evidence_mode=mode,
+            graph_token_features=(),
+            graph_token_edge_dim=None,
+            graph_token_dropout=0.0,
+            draw_pair_bboxes=draw_pair_bboxes,
+        )
+    if not include_graph_evidence:
+        raise ValueError("model.graph_evidence_mode='text_tokens' requires include_graph_evidence=true")
+    if not reuse_vision:
+        raise ValueError("model.graph_evidence_mode='text_tokens' requires input.reuse_frozen_vision=true")
+    edge_dim = int(token_cfg.get("edge_dim", 256))
+    if edge_dim <= 0:
+        raise ValueError(f"model.graph_tokens.edge_dim must be positive, got {edge_dim}")
+    dropout = float(token_cfg.get("dropout", 0.10))
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"model.graph_tokens.dropout must be in [0,1), got {dropout}")
     return GenerativeBuilders(
-        reuse_vision=bool(input_cfg.get("reuse_frozen_vision", False)),
-        include_graph_evidence=bool(model_cfg.get("include_graph_evidence", True)),
+        reuse_vision=reuse_vision,
+        include_graph_evidence=include_graph_evidence,
+        graph_evidence_mode=mode,
+        graph_token_features=normalize_graph_token_features(token_cfg.get("features")),
+        graph_token_edge_dim=edge_dim,
+        graph_token_dropout=dropout,
+        draw_pair_bboxes=draw_pair_bboxes,
     )
 
 
 def build_generative_objective(cfg, processor, device: torch.device, resume: Path | None = None):
-    """Generative yes/no objective with graph evidence written in the prompt as text."""
-    backbone, target_names = _make_lora_backbone(cfg, processor, device, resume)
+    """Build text-only or text-plus-inline-token generative objective."""
     builders = select_generative_builders(cfg)
+    graph_token_ids = (
+        configure_graph_tokenizer(processor.tokenizer)
+        if builders.graph_evidence_mode == "text_tokens"
+        else None
+    )
+    backbone, target_names = _make_lora_backbone(
+        cfg,
+        processor,
+        device,
+        resume,
+        expected_vocab_size=(len(processor.tokenizer) if graph_token_ids is not None else None),
+    )
     cache_size = (
         int(cfg.get("input", {}).get("vision_cache_size", 0))
         if builders.reuse_vision
@@ -488,11 +598,20 @@ def build_generative_objective(cfg, processor, device: torch.device, resume: Pat
         "qwen": str(cfg.model.get("qwen", QWEN)),
         "max_pixels": str(int(cfg.model.get("max_pixels", 200704))),
     }
+    graph_token_adapter = None
+    if graph_token_ids is not None:
+        graph_token_adapter = GraphTokenAdapter(
+            edge_dim=int(builders.graph_token_edge_dim),
+            hidden_size=int(backbone.get_input_embeddings().embedding_dim),
+            dropout=builders.graph_token_dropout,
+        )
     vlm = TextGenerativeVLM(
         backbone,
         vision_cache_size=cache_size,
         vision_disk_cache=disk_cache,
         vision_disk_metadata=disk_metadata,
+        graph_token_adapter=graph_token_adapter,
+        graph_token_ids=graph_token_ids,
     )
     direct_ids = generative_answer_token_ids(processor.tokenizer)
     objective = GenerativeObjective(
@@ -506,8 +625,24 @@ def _restore_vlm_modules(objective: GenerativeObjective, checkpoint: Path) -> di
     trainer_path = checkpoint / "trainer_state.pt"
     if not modules_path.exists() or not trainer_path.exists():
         raise FileNotFoundError(f"incomplete pair checkpoint: {checkpoint}")
-    # Text-evidence generative VLM has no extra trainable modules besides the LoRA
-    # adapter (restored from disk by PeftModel.from_pretrained); nothing to load here.
+    modules = torch.load(modules_path, map_location="cpu", weights_only=False)
+    if not isinstance(modules, Mapping):
+        raise ValueError(f"invalid pair module state in {modules_path}")
+    saved_adapter = modules.get("graph_token_adapter")
+    adapter = objective.vlm.graph_token_adapter
+    if adapter is None:
+        if saved_adapter is not None:
+            raise ValueError("checkpoint contains a graph-token adapter but current config uses text mode")
+    else:
+        if saved_adapter is None:
+            raise ValueError("checkpoint has no graph-token adapter; use its original text/text_tokens config")
+        expected_schema = tuple(slot.name for slot in GRAPH_TOKEN_SLOTS)
+        if tuple(modules.get("graph_token_schema", ())) != expected_schema:
+            raise ValueError("checkpoint graph-token schema does not match the current implementation")
+        saved_ids = {str(key): int(value) for key, value in modules.get("graph_token_ids", {}).items()}
+        if saved_ids != objective.vlm.graph_token_ids:
+            raise ValueError("checkpoint graph-token ids do not match the restored processor")
+        adapter.load_state_dict(saved_adapter, strict=True)
     return torch.load(trainer_path, map_location="cpu", weights_only=False)
 
 
@@ -522,9 +657,16 @@ def save_vlm_checkpoint(
     path.mkdir(parents=True, exist_ok=True)
     objective.vlm.backbone.save_pretrained(path / "adapter")
     processor.save_pretrained(path / "processor")
-    # Text-evidence generative VLM: graph evidence is prompt text; only the LoRA adapter
-    # (saved above) trains, so there are no extra modules to serialize.
-    modules = {"generative": True, "text_evidence": True}
+    modules: dict[str, Any] = {"generative": True, "text_evidence": True}
+    adapter = objective.vlm.graph_token_adapter
+    if adapter is not None:
+        modules.update(
+            {
+                "graph_token_schema": tuple(slot.name for slot in GRAPH_TOKEN_SLOTS),
+                "graph_token_ids": dict(objective.vlm.graph_token_ids or {}),
+                "graph_token_adapter": _cpu_state_dict(adapter),
+            }
+        )
     torch.save(modules, path / "pair_modules.pt")
     torch.save(
         {
@@ -603,10 +745,18 @@ def collect_generative_predictions(
         reuse_vision
         and getattr(objective, "direct_yes_no_token_ids", None) is not None
     )
+    token_kwargs = {
+        "graph_token_ids": objective.vlm.graph_token_ids,
+        "graph_token_edge_dim": objective.vlm.graph_token_edge_dim,
+    }
     eval_collate = (
-        make_text_generative_direct_eval_collate(processor, reuse_vision=True)
+        make_text_generative_direct_eval_collate(
+            processor, reuse_vision=True, **token_kwargs
+        )
         if direct_text_scoring
-        else make_text_generative_eval_collate(processor, reuse_vision=reuse_vision)
+        else make_text_generative_eval_collate(
+            processor, reuse_vision=reuse_vision, **token_kwargs
+        )
     )
     loader = make_validation_loader(
         eval_dataset, eval_collate, batch_size, num_workers,
@@ -818,6 +968,9 @@ def main() -> None:
     # otherwise raw_graph_predictions() below would score the graph on the hard subset
     # only, not the full population it needs to be compared against.
     route_threshold = _route_threshold(cfg)
+    train_population, low_confidence_weight = _routing_train_settings(
+        cfg, route_threshold
+    )
     epochs = int(cfg.train.epochs)
     num_samples = int(sampling_cfg.get("samples_per_epoch", 0))
     num_workers = int(cfg.train.get("num_workers", 4))
@@ -838,11 +991,38 @@ def main() -> None:
         train_cache,
         raw_image_cache_size=int(cfg.train.get("raw_image_cache_size", 16)),
         include_graph_evidence=builders.include_graph_evidence,
+        routing_threshold=route_threshold,
+        graph_evidence_mode=builders.graph_evidence_mode,
+        graph_token_features=builders.graph_token_features,
+        draw_pair_bboxes=builders.draw_pair_bboxes,
     )
-    collate = make_text_generative_collate(processor, reuse_vision=builders.reuse_vision)
     batch_size = int(cfg.train.bs)
     val_batch_size = int(cfg.val.bs)
-    if sampling_strategy == "once":
+    effective_sampling_strategy = sampling_strategy
+    low_confidence_indices: list[int] | None = None
+    if low_confidence_weight > 1.0:
+        # WeightedRandomSampler is required to oversample. Preserve the configured
+        # sample count (default: one selected-manifest length) so the boost changes
+        # the pair distribution, not the per-epoch optimizer-step budget.
+        if train_population != "full" or route_threshold is None:
+            raise AssertionError("validated full-population routing boost became invalid")
+        if num_samples <= 0:
+            num_samples = len(train_dataset)
+        weights = train_dataset.sample_weights(
+            balance_mode=balance_mode, hard_floor=hard_floor
+        )
+        weights, low_confidence_indices = boost_low_confidence_weights(
+            weights,
+            train_dataset.annotations,
+            train_cache,
+            threshold=route_threshold,
+            multiplier=low_confidence_weight,
+        )
+        if sampling_strategy == "once":
+            effective_sampling_strategy = "uniform"
+        # task-balanced strategies retain their base weighting and are multiplied
+        # by the routing boost above.
+    elif sampling_strategy == "once":
         # Exact-once traversal never changes the selected population size.
         num_samples = len(train_dataset)
         weights = None
@@ -855,6 +1035,12 @@ def main() -> None:
 
     # Generative training uses next-token CE (no BCE weighting).
     objective, target_names = build_generative_objective(cfg, processor, device, resume)
+    collate = make_text_generative_collate(
+        processor,
+        reuse_vision=builders.reuse_vision,
+        graph_token_ids=objective.vlm.graph_token_ids,
+        graph_token_edge_dim=objective.vlm.graph_token_edge_dim,
+    )
     module = objective
     lora_params, new_params = partition_vlm_parameters(objective)
     parameter_groups = [{"params": lora_params, "lr": float(cfg.optim.lr)}]
@@ -906,6 +1092,10 @@ def main() -> None:
             raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
             generative_prompt_seed=int(cfg.val.get("prompt_seed", seed)),
             include_graph_evidence=builders.include_graph_evidence,
+            routing_threshold=route_threshold,
+            graph_evidence_mode=builders.graph_evidence_mode,
+            graph_token_features=builders.graph_token_features,
+            draw_pair_bboxes=builders.draw_pair_bboxes,
         )
         val_loader = make_validation_loader(
             val_dataset,
@@ -954,11 +1144,22 @@ def main() -> None:
 
     print(
         f"[vlm] train={len(train_dataset)} samples/ep={num_samples} "
-        f"sampling={sampling_strategy} bs={batch_size} accum={accumulation} "
+        f"sampling={effective_sampling_strategy} (requested={sampling_strategy}) "
+        f"train_population={train_population} bs={batch_size} accum={accumulation} "
         f"reuse_vision={reuse_vision} group_by_frame={group_by_frame} "
         f"out={experiment_dir}",
         flush=True,
     )
+    if low_confidence_indices is not None:
+        low_weight = float(weights[low_confidence_indices].sum().item())
+        expected_fraction = low_weight / float(weights.sum().item())
+        print(
+            f"[vlm] low-confidence boost: conf<={route_threshold:g} "
+            f"pairs={len(low_confidence_indices)}/{len(train_dataset)} "
+            f"weight={low_confidence_weight:g}x "
+            f"expected_draw_fraction={expected_fraction:.1%}",
+            flush=True,
+        )
     # Persistent across epochs so train/running_loss is a continuous EMA rather than an
     # epoch-cumulative mean that resets (and visibly jumps) at every epoch boundary.
     train_loss_ema: dict[str, float] = {}
@@ -967,7 +1168,7 @@ def main() -> None:
             train_dataset,
             collate,
             weights,
-            sampling_strategy=sampling_strategy,
+            sampling_strategy=effective_sampling_strategy,
             num_samples=num_samples,
             batch_size=batch_size,
             num_workers=num_workers,

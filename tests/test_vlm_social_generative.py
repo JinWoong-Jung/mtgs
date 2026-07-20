@@ -9,6 +9,13 @@ from PIL import Image
 from vlm.social.data import SocialSample
 from vlm.social.objective import GenerativeObjective, generative_answer_token_ids
 from vlm.social.input import SocialVLMInput
+from vlm.social.graph_tokens import (
+    GRAPH_TOKEN_SLOTS,
+    GraphTokenAdapter,
+    GraphTokenPayload,
+    configure_graph_tokenizer,
+    extract_graph_token_payload,
+)
 from vlm.social.model import (
     TextGenerativeVLM,
     make_text_generative_collate,
@@ -44,6 +51,88 @@ def test_text_generative_vlm_runs_without_graph_features():
     out = vlm(inp)
     assert out.logits.shape == (2, 6, 32)
     assert out.loss is not None
+
+
+def test_graph_token_adapter_and_inline_replacement_preserve_slot_contract():
+    hidden_size, edge_dim = 8, 4
+    token_ids = {slot.name: 10 + index for index, slot in enumerate(GRAPH_TOKEN_SLOTS)}
+    adapter = GraphTokenAdapter(edge_dim=edge_dim, hidden_size=hidden_size, dropout=0.0)
+    vlm = TextGenerativeVLM(
+        _StubBackbone(), graph_token_adapter=adapter, graph_token_ids=token_ids
+    )
+    # A LAH sample owns only heatmap_a and edge_ab. The absent B slots must not
+    # change any ordinary text embedding or be treated as prompt markers.
+    input_ids = torch.tensor([[token_ids["heatmap_a"], 1, token_ids["edge_ab"], 2]])
+    embeds = torch.zeros(1, 4, hidden_size)
+    kwargs = {
+        "graph_token_present": torch.tensor([[True, False, True, False]]),
+        "graph_token_heatmaps": torch.ones(1, 2, 8, 8),
+        "graph_token_edges": torch.ones(1, 2, edge_dim),
+    }
+    injected = vlm._inject_graph_token_embeddings(
+        input_ids=input_ids, inputs_embeds=embeds, kwargs=kwargs
+    )
+    assert kwargs == {}
+    assert torch.count_nonzero(injected[:, 0]) > 0
+    assert torch.count_nonzero(injected[:, 2]) > 0
+    assert torch.count_nonzero(injected[:, 1]) == 0
+    assert torch.count_nonzero(injected[:, 3]) == 0
+    injected.sum().backward()
+    assert adapter.edge_encoder[1].weight.grad is not None
+    assert adapter.heatmap_encoder[0].weight.grad is not None
+
+    with pytest.raises(ValueError, match="mismatch"):
+        vlm._inject_graph_token_embeddings(
+            input_ids=input_ids,
+            inputs_embeds=embeds,
+            kwargs={
+                "graph_token_present": torch.tensor([[False, False, True, False]]),
+                "graph_token_heatmaps": torch.ones(1, 2, 8, 8),
+                "graph_token_edges": torch.ones(1, 2, edge_dim),
+            },
+        )
+
+
+def test_graph_token_payload_detaches_cache_and_trains_only_adapter():
+    edge_dim, hidden_size = 4, 8
+    cache = {
+        "gaze_heatmap": torch.randn(2, 8, 8, requires_grad=True),
+        "edge_pp": torch.randn(2, 2, edge_dim, requires_grad=True),
+        # Label-shaped tensors are intentionally present but must remain inaccessible.
+        "lah_gt": torch.ones(2, 2),
+        "inout_gt": torch.tensor([1, 0]),
+    }
+    payload = extract_graph_token_payload(
+        task="laeo", person_a=0, person_b=1, cache=cache,
+        features=("gaze_heatmap", "edge_pp"),
+    )
+    assert set(payload.values) == {"heatmap_a", "heatmap_b", "edge_ab", "edge_ba"}
+    assert not any(value.requires_grad for value in payload.values.values())
+
+    adapter = GraphTokenAdapter(edge_dim=edge_dim, hidden_size=hidden_size, dropout=0.0)
+    heatmaps = torch.stack(
+        (payload.values["heatmap_a"], payload.values["heatmap_b"])
+    ).unsqueeze(0)
+    edges = torch.stack(
+        (payload.values["edge_ab"], payload.values["edge_ba"])
+    ).unsqueeze(0)
+    adapter(heatmaps, edges).sum().backward()
+
+    assert cache["gaze_heatmap"].grad is None
+    assert cache["edge_pp"].grad is None
+    assert adapter.heatmap_encoder[0].weight.grad is not None
+    assert adapter.edge_encoder[1].weight.grad is not None
+
+
+def test_text_generative_vlm_rejects_graph_tokens_without_vision_reuse():
+    adapter = GraphTokenAdapter(edge_dim=4, hidden_size=8, dropout=0.0)
+    ids = {slot.name: 10 + index for index, slot in enumerate(GRAPH_TOKEN_SLOTS)}
+    vlm = TextGenerativeVLM(_StubBackbone(), graph_token_adapter=adapter, graph_token_ids=ids)
+    with pytest.raises(ValueError, match="reuse_frozen_vision"):
+        vlm({
+            "input_ids": torch.zeros(1, 2, dtype=torch.long),
+            "graph_token_present": torch.zeros(1, 4, dtype=torch.bool),
+        })
 
 
 def test_text_generative_vlm_accepts_vision_cache_size_and_exposes_cache_info():
@@ -116,6 +205,30 @@ def _local_qwen_processor():
     )
 
 
+def _graph_token_text_item():
+    return SocialVLMInput(
+        annotation=SocialSample(
+            sid="token",
+            task="lah",
+            person_i=0,
+            person_j=1,
+            label=1,
+            raw_i=1,
+            raw_j=0,
+        ),
+        image=Image.new("RGB", (56, 56), "black"),
+        prompt=(
+            "Person A's predicted gaze-distribution feature <|graph_heatmap_a|> and the "
+            "directed graph edge <|graph_edge_ab|> estimate P(Person A looks at Person B) = 0.5."
+        ),
+        vision_cache_key="/split/token/frame.png",
+        graph_token_payload=GraphTokenPayload({
+            "heatmap_a": torch.ones(8, 8),
+            "edge_ab": torch.full((4,), 2.0),
+        }),
+    )
+
+
 def _unmarked_text_item():
     return SocialVLMInput(
         annotation=SocialSample(
@@ -131,6 +244,26 @@ def _unmarked_text_item():
         prompt="Is Person A looking at Person B? Answer yes or no.",
         vision_cache_key="/split/tiny/frame.png",
     )
+
+
+def test_text_token_collate_packs_prompt_aligned_payloads():
+    processor = _local_qwen_processor()
+    token_ids = configure_graph_tokenizer(processor.tokenizer)
+    item = _graph_token_text_item()
+
+    batch = make_text_generative_collate(
+        processor,
+        reuse_vision=True,
+        graph_token_ids=token_ids,
+        graph_token_edge_dim=4,
+    )([item])
+
+    assert batch["graph_token_present"].tolist() == [[True, False, True, False]]
+    assert batch["graph_token_heatmaps"].shape == (1, 2, 8, 8)
+    assert batch["graph_token_edges"].shape == (1, 2, 4)
+    torch.testing.assert_close(batch["graph_token_edges"][0, 0], torch.full((4,), 2.0))
+    assert int(batch["input_ids"].eq(token_ids["heatmap_a"]).sum()) == 1
+    assert int(batch["input_ids"].eq(token_ids["edge_ab"]).sum()) == 1
 
 
 def test_make_text_generative_collate_reuse_flag_produces_vision_reuse_keys():
@@ -257,6 +390,25 @@ def test_text_generative_vlm_reuse_matches_no_reuse_numerically():
             torch.arange(len(items)), last
         ][:, [yes_id, no_id]]
         torch.testing.assert_close(direct_logits, expected, rtol=1e-4, atol=1e-4)
+
+        # The same real Qwen reuse path must accept inline dense graph tokens. These
+        # marker ids are resized before use and each is replaced before the language
+        # model sees the embedding sequence.
+        token_ids = configure_graph_tokenizer(processor.tokenizer)
+        backbone.resize_token_embeddings(len(processor.tokenizer))
+        wrapper.graph_token_adapter = GraphTokenAdapter(
+            edge_dim=4, hidden_size=32, dropout=0.0
+        )
+        wrapper.graph_token_ids = token_ids
+        token_batch = make_text_generative_collate(
+            processor,
+            reuse_vision=True,
+            graph_token_ids=token_ids,
+            graph_token_edge_dim=4,
+        )([_graph_token_text_item()])
+        with torch.no_grad():
+            token_output = wrapper(token_batch)
+        assert token_output.loss is not None and torch.isfinite(token_output.loss)
     finally:
         wrapper.close()
 

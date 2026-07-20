@@ -2,7 +2,7 @@
 
 #SBATCH --job-name=eval_vlm
 #SBATCH --gres=gpu:rtx6000:1
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH -c 8
 #SBATCH -p gpu
 #SBATCH --mem=48G
@@ -15,8 +15,12 @@ set -e
 # while our own tqdm bars and the final result table (printed via Python's stdout)
 # land in .out.
 
-# Set only the completed VLM training directory.
-RUN_DIR="/home/jinwoongjung/MTGS/experiments/VLM/VLM_v3(balanced)"
+# Set only the completed VLM training directory. Both RUN_DIR and OUT accept an
+# environment override, e.g. for an ad-hoc eval of an in-progress checkpoint without
+# touching that run's canonical test/ output:
+#   RUN_DIR=".../VLM_v5(full)-routing(0.8)-fulltrain" OUT_NAME=test_tmp sbatch eval_vlm.sh
+RUN_DIR="${RUN_DIR:-/home/jinwoongjung/MTGS/experiments/VLM/VLM_v5(full)-routing(0.8)}"
+OUT_NAME="${OUT_NAME:-test}"
 
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate mtgs
@@ -37,7 +41,7 @@ SPLIT="test"
 NAME="$(basename "$RUN_DIR")"
 CHECKPOINT="$RUN_DIR/train/checkpoints/best"
 CONFIG="$RUN_DIR/config_vlm.yaml"
-OUT="$RUN_DIR/test"
+OUT="$RUN_DIR/$OUT_NAME"
 DEVICE="auto"
 WANDB_OFF=1
 PROVENANCE="$RUN_DIR/input_provenance.env"

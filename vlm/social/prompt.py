@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 import re
+from typing import Mapping
 
 
 def _coords(box):
@@ -65,6 +66,12 @@ TEXT_CORRECTION_BANK = (
     "whenever the visual evidence disagrees.",
 )
 TEXT_CORRECTION = TEXT_CORRECTION_BANK[0]
+# Routing-only replacement for the ordinary graph-correction sentence. It occupies the
+# same prompt slot (rather than adding a new line), so low-confidence prompts explicitly
+# tell the VLM why visual reasoning is needed without growing the prompt contract.
+TEXT_ROUTED_CORRECTION = (
+    "The graph is not confident enough about this relation, so resolve it from the image."
+)
 # No-graph-evidence ablation variant of TEXT_CORRECTION_BANK: same register and length,
 # minus any mention of the graph (there is nothing to correct/verify against).
 TEXT_CORRECTION_BANK_NO_GRAPH = (
@@ -144,6 +151,12 @@ def _fmt_prob(p: float) -> str:
     return f"{float(p):.2f}"
 
 
+def _fmt_temporal_probs(probabilities) -> str:
+    if probabilities is None or len(probabilities) != 3:
+        raise ValueError("temporal graph probabilities must contain previous/current/next")
+    return "[" + ", ".join(_fmt_prob(value) for value in probabilities) + "]"
+
+
 def _fmt_box(box) -> str:
     return str(_coords(box))
 
@@ -167,54 +180,101 @@ def _alt_target_line(name: str, alt) -> str:
     )
 
 
-def _text_evidence_block(evidence) -> str:
+def _text_evidence_block(
+    evidence, graph_token_markers: Mapping[str, str] | None = None
+) -> str:
+    """Render graph evidence without exposing predicted gaze-point coordinates.
+
+    Dense heatmap markers in ``text_tokens`` mode remain available as distribution
+    features, but are no longer tied to a brittle argmax coordinate.
+    """
+    markers = graph_token_markers or {}
     task = evidence.task
     if task == "lah":
-        line = (
-            f"- The graph estimates P(Person A looks at Person B) = {_fmt_prob(evidence.p_ab)}"
-        )
-        if evidence.gaze_a_xy is not None:
-            line += (
-                f", and predicts Person A's gaze point is near {list(evidence.gaze_a_xy)}"
+        heat, edge = markers.get("heatmap_a"), markers.get("edge_ab")
+        if evidence.temporal_probs is not None:
+            features = []
+            if heat is not None:
+                features.append(f"Person A's predicted gaze-distribution feature {heat}")
+            if edge is not None:
+                features.append(f"the directed graph edge {edge}")
+            prefix = f"Using {' and '.join(features)}, the graph" if features else "The graph"
+            line = (
+                f"- {prefix} estimates P(Person A looks at Person B) across the previous, "
+                "current, and next context positions as "
+                f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively"
+            )
+        else:
+            relation = f"The directed graph edge {edge}" if edge is not None else "The graph"
+            heat_text = (
+                f", together with Person A's predicted gaze-distribution feature {heat},"
+                if heat is not None else ""
+            )
+            line = (
+                f"- {relation}{heat_text} estimates P(Person A looks at Person B) = "
+                f"{_fmt_prob(evidence.p_ab)}"
             )
         lines = ["Auxiliary graph evidence:", line + "."]
         if evidence.alt_a is not None:
             lines.append(_alt_target_line("Person A", evidence.alt_a))
         return "\n".join(lines)
+
     if task == "laeo":
-        line_a = f"- P(Person A looks at Person B) = {_fmt_prob(evidence.p_ab)}"
-        if evidence.gaze_a_xy is not None:
-            line_a += (
-                f", and the graph predicts Person A's gaze point is near {list(evidence.gaze_a_xy)}"
-            )
-        line_b = f"- P(Person B looks at Person A) = {_fmt_prob(evidence.p_ba)}"
-        if evidence.gaze_b_xy is not None:
-            line_b += (
-                f", and the graph predicts Person B's gaze point is near {list(evidence.gaze_b_xy)}"
-            )
+        heat_a, edge_ab = markers.get("heatmap_a"), markers.get("edge_ab")
+        heat_b, edge_ba = markers.get("heatmap_b"), markers.get("edge_ba")
+
+        def _direction_line(source, target, probability, heat, edge):
+            features = []
+            if heat is not None:
+                features.append(f"{source}'s predicted gaze-distribution feature {heat}")
+            if edge is not None:
+                features.append(f"the directed graph edge {edge}")
+            if features:
+                return (
+                    f"- {' and '.join(features)} support P({source} looks at {target}) = "
+                    f"{_fmt_prob(probability)}"
+                )
+            return f"- P({source} looks at {target}) = {_fmt_prob(probability)}"
+
+        line_a = _direction_line("Person A", "Person B", evidence.p_ab, heat_a, edge_ab)
+        line_b = _direction_line("Person B", "Person A", evidence.p_ba, heat_b, edge_ba)
         lines = ["Auxiliary graph evidence:", line_a + "."]
         if evidence.alt_a is not None:
             lines.append(_alt_target_line("Person A", evidence.alt_a))
         lines.append(line_b + ".")
         if evidence.alt_b is not None:
             lines.append(_alt_target_line("Person B", evidence.alt_b))
-        if evidence.task_prob is not None:
+        if evidence.temporal_probs is not None:
+            lines.append(
+                "- Across the previous, current, and next context positions, the graph's "
+                "direct LAEO decoder estimates the mutual-gaze probabilities as "
+                f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively."
+            )
+        elif evidence.task_prob is not None:
             lines.append(
                 "- The graph's direct LAEO decoder estimates the probability of mutual "
                 f"gaze as {_fmt_prob(evidence.task_prob)}."
             )
         return "\n".join(lines)
+
     if task == "sa":
         lines = ["Auxiliary graph evidence:"]
-        if evidence.task_prob is not None:
-            lines.append(
-                "- The graph's direct SA decoder estimates the probability of shared "
-                f"attention as {_fmt_prob(evidence.task_prob)}."
-            )
         for name, person in (("Person A", evidence.person_a), ("Person B", evidence.person_b)):
             if person is None:
                 raise ValueError(f"SA text evidence is missing {name}'s gaze summary")
-            # (1) top person target -- always shown.
+            slot = "heatmap_a" if name == "Person A" else "heatmap_b"
+            heat = markers.get(slot)
+            if heat is not None:
+                lines.append(
+                    f"- {name}'s predicted gaze-distribution feature {heat} accompanies the "
+                    f"graph's probability {_fmt_prob(person.nonperson_prob)} that {name} is "
+                    "looking within the image, but not at another annotated person."
+                )
+            else:
+                lines.append(
+                    f"- The graph estimates probability {_fmt_prob(person.nonperson_prob)} that "
+                    f"{name} is looking within the image, but not at another annotated person."
+                )
             if person.third_bbox is not None:
                 lines.append(
                     f"- {name}'s most likely person target is the head at "
@@ -222,21 +282,43 @@ def _text_evidence_block(evidence) -> str:
                     f"{_fmt_prob(person.third_prob)}."
                 )
             else:
+                lines.append(f"- No other visible person is a likely gaze target for {name}.")
+
+        if evidence.temporal_probs is not None:
+            edge_ab, edge_ba = markers.get("edge_ab"), markers.get("edge_ba")
+            if edge_ab is not None or edge_ba is not None:
+                edges = " ".join(edge for edge in (edge_ab, edge_ba) if edge is not None)
                 lines.append(
-                    f"- No other visible person is a likely gaze target for {name}."
+                    f"- Using the directed pair-edge features {edges}, across the previous, "
+                    "current, and next context positions the graph's direct SA decoder estimates "
+                    "the shared-attention probabilities as "
+                    f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively."
                 )
-            # (2) predicted gaze point + P(non-person scene) -- always shown, no gate.
+            else:
+                lines.append(
+                    "- Across the previous, current, and next context positions, the graph's "
+                    "direct SA decoder estimates the shared-attention probabilities as "
+                    f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively."
+                )
+        elif evidence.task_prob is not None:
             lines.append(
-                f"- The graph predicts {name}'s gaze point is near {list(person.gaze_xy)}, "
-                f"with probability {_fmt_prob(person.nonperson_prob)} that this gaze target "
-                f"is a non-person scene location rather than a person."
+                "- The graph's direct SA decoder estimates the probability of shared "
+                f"attention as {_fmt_prob(evidence.task_prob)}."
             )
         return "\n".join(lines)
     raise ValueError(f"unknown social task {task!r}")
 
 
 def compose_text_prompt(
-    task, box_a, box_b, evidence=None, *, rng=None, include_graph_evidence: bool = True
+    task,
+    box_a,
+    box_b,
+    evidence=None,
+    *,
+    rng=None,
+    include_graph_evidence: bool = True,
+    graph_needs_visual_review: bool = False,
+    graph_token_markers: Mapping[str, str] | None = None,
 ) -> str:
     """Render a compositional, task-stable natural-language prompt.
 
@@ -246,6 +328,14 @@ def compose_text_prompt(
     evidence block are omitted entirely, and the shared instruction / correction sentence
     are swapped for image-only wording that never mentions the graph. ``evidence`` is
     ignored (and may be left ``None``) in that case.
+
+    ``graph_needs_visual_review`` is set only for pairs routed to the VLM because the
+    frozen graph did not exceed the confidence threshold. It replaces the ordinary
+    graph-correction sentence in the same slot; it never adds an instruction line.
+
+    ``graph_token_markers`` is ``None`` for the legacy ``text`` mode.  In
+    ``text_tokens`` mode it maps task-specific token-slot names to registered special
+    placeholders; each marker stays adjacent to the graph value it represents.
 
     Training callers use the module RNG, producing fresh surface forms when a sample is
     revisited. Validation/test callers provide a sample-derived seeded RNG, making their
@@ -273,8 +363,12 @@ def compose_text_prompt(
     ]
     if include_graph_evidence:
         parts.append(r.choice(TEXT_GRAPH_INTRO_BANK))
-        parts.append(_text_evidence_block(evidence))
-        parts.append(r.choice(TEXT_CORRECTION_BANK))
+        parts.append(_text_evidence_block(evidence, graph_token_markers))
+        parts.append(
+            TEXT_ROUTED_CORRECTION
+            if graph_needs_visual_review
+            else r.choice(TEXT_CORRECTION_BANK)
+        )
     else:
         parts.append(r.choice(TEXT_CORRECTION_BANK_NO_GRAPH))
     parts.append(TEXT_FINAL_QUESTIONS[task])

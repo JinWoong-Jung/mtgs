@@ -445,7 +445,14 @@ def format_routing_comparison_table(
     key set -- directly comparable, and answers "does the VLM actually help on the cases
     it's asked about".
 
-    Rows 3-4: the locked per-target-pooled F1 (``compute_metrics.compute()``, via
+    Rows 3-4: flat threshold@0.5 F1 over the complementary retained pairs (graph
+    conf >= threshold), for the graph and for the routed system separately. Row 4 is a
+    consistency check, not a new measurement: routing answers these pairs with the raw
+    graph logit (no VLM forward), so rows 3 and 4 are expected to be identical -- a
+    divergence here would mean the router leaked a VLM prediction into a high-confidence
+    slot.
+
+    Rows 5-6: the locked per-target-pooled F1 (``compute_metrics.compute()``, via
     ``evaluate_predictions``) over the FULL population, for the graph alone and for the
     graph+VLM routed system -- answers "does the combined system beat the graph baseline
     overall". ``model_records``/``model_metrics`` come from a routed collector/evaluation
@@ -469,9 +476,15 @@ def format_routing_comparison_table(
     def num(value: object) -> str:
         return "N/A" if value is None else f"{float(value):.4f}"
 
+    all_keys = {record.key for record in model_records}
+    high_conf_keys = all_keys - low_conf_keys
+
     row1 = flat_f1(graph_records, low_conf_keys)
     row2 = flat_f1(model_records, low_conf_keys)
+    row3 = flat_f1(graph_records, high_conf_keys)
+    row4 = flat_f1(model_records, high_conf_keys)
     n_low = sum(1 for record in model_records if record.key in low_conf_keys)
+    n_high = len(high_conf_keys)
     n_full = len(model_records)
 
     lines = [
@@ -483,10 +496,14 @@ def format_routing_comparison_table(
         f"{num(row1['laeo'])} | {num(row1['sa'])} | {num(row1['macro'])} |",
         f"| 2. {model_name} | conf<{threshold} | {n_low} | {num(row2['lah'])} | "
         f"{num(row2['laeo'])} | {num(row2['sa'])} | {num(row2['macro'])} |",
-        f"| 3. Graph-only | full | {n_full} | {num(graph_metrics.get('F1_LAH'))} | "
+        f"| 3. Graph-only | conf>={threshold} | {n_high} | {num(row3['lah'])} | "
+        f"{num(row3['laeo'])} | {num(row3['sa'])} | {num(row3['macro'])} |",
+        f"| 4. {model_name} | conf>={threshold} | {n_high} | {num(row4['lah'])} | "
+        f"{num(row4['laeo'])} | {num(row4['sa'])} | {num(row4['macro'])} |",
+        f"| 5. Graph-only | full | {n_full} | {num(graph_metrics.get('F1_LAH'))} | "
         f"{num(graph_metrics.get('F1_LAEO'))} | {num(graph_metrics.get('F1_SA'))} | "
         f"{num(graph_metrics.get('mean_social_f1'))} |",
-        f"| 4. Graph+{model_name} routing | full | {n_full} | "
+        f"| 6. Graph+{model_name} routing | full | {n_full} | "
         f"{num(model_metrics.get('F1_LAH'))} | {num(model_metrics.get('F1_LAEO'))} | "
         f"{num(model_metrics.get('F1_SA'))} | {num(model_metrics.get('mean_social_f1'))} |",
     ]

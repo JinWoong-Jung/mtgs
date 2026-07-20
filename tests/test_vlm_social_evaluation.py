@@ -192,16 +192,17 @@ def _rec(sid, task, i, j, label, prob):
     )
 
 
-def test_routing_comparison_table_four_rows():
-    # Only (s0, lah, 0, 1) is in the low-confidence set; (s1, lah, 0, 1) is not, so it's
-    # excluded from rows 1-2 but still counted in rows 3-4 (n_full).
+def test_routing_comparison_table_six_rows():
+    # Only (s0, lah, 0, 1) is in the low-confidence set; (s1, lah, 0, 1) is the
+    # complementary high-confidence pair, so it's excluded from rows 1-2 but drives
+    # rows 3-4, and both are still counted in rows 5-6 (n_full).
     graph_records = [
         _rec("s0", "lah", 0, 1, label=1, prob=0.4),   # low-conf: graph predicts 0 (wrong)
-        _rec("s1", "lah", 0, 1, label=0, prob=0.5),   # not low-conf: ignored by rows 1-2
+        _rec("s1", "lah", 0, 1, label=0, prob=0.5),   # high-conf: label=0, pred=1 (FP)
     ]
     model_records = [
         _rec("s0", "lah", 0, 1, label=1, prob=0.9),   # low-conf: VLM predicts 1 (correct)
-        _rec("s1", "lah", 0, 1, label=0, prob=0.5),
+        _rec("s1", "lah", 0, 1, label=0, prob=0.5),   # high-conf: routing keeps graph's value
     ]
     low_conf_keys = {normalize_eval_key(("s0", "lah", 0, 1))}
     graph_metrics = {"F1_LAH": 0.5, "F1_LAEO": 0.6, "F1_SA": 0.7, "mean_social_f1": 0.6}
@@ -217,9 +218,13 @@ def test_routing_comparison_table_four_rows():
     assert "| 1. Graph-only | conf<0.8 | 1 | 0.0000 |" in table
     # Row 2: VLM on the SAME low-conf pair -- label=1, pred=1 -> F1=1.
     assert "| 2. VLM | conf<0.8 | 1 | 1.0000 |" in table
-    # Rows 3-4: the official pooled metrics passed straight through, full population (n=2).
-    assert "| 3. Graph-only | full | 2 | 0.5000 |" in table
-    assert "| 4. Graph+VLM routing | full | 2 | 0.8000 |" in table
+    # Rows 3-4: the complementary high-conf pair -- label=0, pred=1 -> F1=0 for both, since
+    # routing answers this pair with the raw graph value (no VLM forward): rows must match.
+    assert "| 3. Graph-only | conf>=0.8 | 1 | 0.0000 |" in table
+    assert "| 4. VLM | conf>=0.8 | 1 | 0.0000 |" in table
+    # Rows 5-6: the official pooled metrics passed straight through, full population (n=2).
+    assert "| 5. Graph-only | full | 2 | 0.5000 |" in table
+    assert "| 6. Graph+VLM routing | full | 2 | 0.8000 |" in table
 
 
 def test_routing_low_confidence_keys_matches_graph_confidence(tmp_path):

@@ -10,6 +10,11 @@ import torch
 import torch.nn as nn
 
 from vlm.social.data import SOCIAL_TASK_ID
+from vlm.social.graph_tokens import (
+    GRAPH_TOKEN_SLOT_INDEX,
+    GRAPH_TOKEN_SLOTS,
+    GraphTokenAdapter,
+)
 from vlm.social.input import SocialVLMInput
 from vlm.runtime.vision_cache import VisionDiskCache
 from vlm.social.prompt import generative_answer_yesno
@@ -20,6 +25,106 @@ from vlm.social.prompt import generative_answer_yesno
 _NON_MODEL_KEYS = (
     "graph_features", "graph_present", "task_ids", "pair_labels", "eval_keys", "num_pairs",
 )
+
+
+def _attach_graph_token_batch(
+    encoded: dict[str, Any],
+    items: Sequence[SocialVLMInput],
+    *,
+    graph_token_ids: Mapping[str, int] | None,
+    graph_token_edge_dim: int | None,
+) -> None:
+    """Pack inline graph-token cache payloads beside an already-tokenized batch.
+
+    The payload has no labels and is validated against the special-token ids in the
+    encoded text.  This catches prompt/collator schema drift before a feature can be
+    associated with the wrong relation direction.
+    """
+    payloads = [item.graph_token_payload for item in items]
+    has_payload = [payload is not None for payload in payloads]
+    if not any(has_payload):
+        if graph_token_ids is not None:
+            # ``text`` mode intentionally supplies no payload even when a caller has a
+            # tokenizer that happens to know graph special tokens.
+            return
+        return
+    if graph_token_ids is None or graph_token_edge_dim is None:
+        raise ValueError("graph token payload requires configured token ids and edge dimension")
+    if not all(has_payload):
+        raise ValueError("a graph-token batch cannot mix payload and text-only samples")
+    if not torch.is_tensor(encoded.get("input_ids")):
+        raise ValueError("tokenized graph batch is missing input_ids")
+
+    batch_size = len(items)
+    values = [payload.values for payload in payloads if payload is not None]
+    heat_example = next(
+        (value for payload in values for name, value in payload.items()
+         if GRAPH_TOKEN_SLOTS[GRAPH_TOKEN_SLOT_INDEX[name]].feature == "gaze_heatmap"),
+        None,
+    )
+    edge_example = next(
+        (value for payload in values for name, value in payload.items()
+         if GRAPH_TOKEN_SLOTS[GRAPH_TOKEN_SLOT_INDEX[name]].feature == "edge_pp"),
+        None,
+    )
+    if heat_example is None:
+        heatmaps = torch.zeros(batch_size, 2, 1, 1, dtype=torch.float32)
+    else:
+        if heat_example.ndim != 2:
+            raise ValueError(f"graph heatmap payload must be [H,W], got {tuple(heat_example.shape)}")
+        heatmaps = torch.zeros(
+            batch_size, 2, *heat_example.shape, dtype=heat_example.dtype
+        )
+    if edge_example is None:
+        edges = torch.zeros(batch_size, 2, graph_token_edge_dim, dtype=torch.float32)
+    else:
+        if edge_example.ndim != 1 or edge_example.shape[0] != graph_token_edge_dim:
+            raise ValueError(
+                f"graph edge payload must be [{graph_token_edge_dim}], got {tuple(edge_example.shape)}"
+            )
+        edges = torch.zeros(batch_size, 2, graph_token_edge_dim, dtype=edge_example.dtype)
+    present = torch.zeros(batch_size, len(GRAPH_TOKEN_SLOTS), dtype=torch.bool)
+
+    for batch_index, payload in enumerate(values):
+        for name, value in payload.items():
+            if name not in GRAPH_TOKEN_SLOT_INDEX:
+                raise ValueError(f"unknown graph token payload slot {name!r}")
+            slot_index = GRAPH_TOKEN_SLOT_INDEX[name]
+            slot = GRAPH_TOKEN_SLOTS[slot_index]
+            present[batch_index, slot_index] = True
+            if slot.feature == "gaze_heatmap":
+                target_index = 0 if name == "heatmap_a" else 1
+                if value.shape != heatmaps.shape[2:]:
+                    raise ValueError(
+                        f"graph heatmap shape mismatch for {name}: "
+                        f"expected {tuple(heatmaps.shape[2:])}, got {tuple(value.shape)}"
+                    )
+                heatmaps[batch_index, target_index] = value
+            elif slot.feature == "edge_pp":
+                target_index = 0 if name == "edge_ab" else 1
+                if value.shape != (graph_token_edge_dim,):
+                    raise ValueError(
+                        f"graph edge shape mismatch for {name}: expected "
+                        f"({graph_token_edge_dim},), got {tuple(value.shape)}"
+                    )
+                edges[batch_index, target_index] = value
+            else:  # Future registry entries must add a packing branch here.
+                raise ValueError(f"no batch packer registered for graph token feature {slot.feature!r}")
+
+    input_ids = encoded["input_ids"]
+    for slot_index, slot in enumerate(GRAPH_TOKEN_SLOTS):
+        token_id = graph_token_ids.get(slot.name)
+        if token_id is None:
+            raise ValueError(f"configured graph token ids are missing slot {slot.name!r}")
+        count = input_ids.eq(int(token_id)).sum(dim=1)
+        if bool((count > 1).any()) or not torch.equal(count.bool(), present[:, slot_index]):
+            raise ValueError(
+                f"prompt/payload mismatch for graph token {slot.name!r}: "
+                f"counts={count.tolist()} present={present[:, slot_index].tolist()}"
+            )
+    encoded["graph_token_present"] = present
+    encoded["graph_token_heatmaps"] = heatmaps
+    encoded["graph_token_edges"] = edges
 
 
 def _encode_reused_frame_batch(
@@ -122,7 +227,13 @@ def _text_generative_collate(processor: Any, answers_for):
     return collate
 
 
-def make_text_generative_collate(processor: Any, *, reuse_vision: bool = False):
+def make_text_generative_collate(
+    processor: Any,
+    *,
+    reuse_vision: bool = False,
+    graph_token_ids: Mapping[str, int] | None = None,
+    graph_token_edge_dim: int | None = None,
+):
     """Text-mode SFT with optional one-vision-encoding-per-unique-frame reuse."""
     processor.tokenizer.padding_side = "right"
 
@@ -178,13 +289,23 @@ def make_text_generative_collate(processor: Any, *, reuse_vision: bool = False):
             [item.annotation.label for item in items], dtype=torch.float32
         )
         out["eval_keys"] = [item.annotation.eval_key for item in items]
+        _attach_graph_token_batch(
+            out,
+            items,
+            graph_token_ids=graph_token_ids,
+            graph_token_edge_dim=graph_token_edge_dim,
+        )
         return out
 
     return collate
 
 
 def make_text_generative_direct_eval_collate(
-    processor: Any, *, reuse_vision: bool = False
+    processor: Any,
+    *,
+    reuse_vision: bool = False,
+    graph_token_ids: Mapping[str, int] | None = None,
+    graph_token_edge_dim: int | None = None,
 ):
     """Build one generation prompt per pair for direct one-token yes/no scoring.
 
@@ -220,6 +341,12 @@ def make_text_generative_direct_eval_collate(
         )
         out["eval_keys"] = [item.annotation.eval_key for item in items]
         out["num_pairs"] = len(items)
+        _attach_graph_token_batch(
+            out,
+            items,
+            graph_token_ids=graph_token_ids,
+            graph_token_edge_dim=graph_token_edge_dim,
+        )
         return out
 
     return collate
@@ -227,7 +354,11 @@ def make_text_generative_direct_eval_collate(
 
 
 def make_text_generative_eval_collate(
-    processor: Any, *, reuse_vision: bool = False
+    processor: Any,
+    *,
+    reuse_vision: bool = False,
+    graph_token_ids: Mapping[str, int] | None = None,
+    graph_token_edge_dim: int | None = None,
 ):
     """Build [yes_0..yes_B-1, no_0..no_B-1], optionally reusing each frame once."""
     processor.tokenizer.padding_side = "right"
@@ -287,6 +418,12 @@ def make_text_generative_eval_collate(
         )
         out["eval_keys"] = [item.annotation.eval_key for item in items]
         out["num_pairs"] = len(items)
+        _attach_graph_token_batch(
+            out,
+            expanded_items,
+            graph_token_ids=graph_token_ids,
+            graph_token_edge_dim=graph_token_edge_dim,
+        )
         return out
 
     return collate
@@ -525,6 +662,11 @@ class _VisionReuseMixin:
             input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
         )
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        inputs_embeds = self._inject_graph_token_embeddings(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            kwargs=kwargs,
+        )
         position_ids = vision_model.compute_3d_position_ids(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -562,12 +704,102 @@ class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
         vision_cache_size: int = 0,
         vision_disk_cache: str | None = None,
         vision_disk_metadata: Mapping[str, str] | None = None,
+        graph_token_adapter: GraphTokenAdapter | None = None,
+        graph_token_ids: Mapping[str, int] | None = None,
     ):
         super().__init__()
         self.backbone = backbone
+        self.graph_token_adapter = graph_token_adapter
+        self.graph_token_ids = (
+            None
+            if graph_token_ids is None
+            else {str(name): int(token_id) for name, token_id in graph_token_ids.items()}
+        )
+        if (self.graph_token_adapter is None) != (self.graph_token_ids is None):
+            raise ValueError(
+                "graph_token_adapter and graph_token_ids must either both be set or both be None"
+            )
+        if self.graph_token_ids is not None:
+            missing = [slot.name for slot in GRAPH_TOKEN_SLOTS if slot.name not in self.graph_token_ids]
+            if missing:
+                raise ValueError(f"graph token ids are missing slots: {missing}")
         self._init_vision_reuse(
             vision_cache_size, vision_disk_cache, vision_disk_metadata
         )
+
+    @property
+    def graph_token_edge_dim(self) -> int | None:
+        """Frozen cache edge width expected by the configured token adapter."""
+        return (
+            None
+            if self.graph_token_adapter is None
+            else int(self.graph_token_adapter.edge_dim)
+        )
+
+    def _inject_graph_token_embeddings(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        """Replace each inline graph placeholder with its learned dense embedding.
+
+        The graph cache itself stays frozen. Only ``GraphTokenAdapter`` is trainable;
+        it receives explicitly whitelisted cache tensors packed by the collator. The
+        per-slot count checks make a prompt-schema or A/B-direction mismatch fail fast
+        rather than silently injecting a feature at an unrelated text token.
+        """
+        present = kwargs.pop("graph_token_present", None)
+        heatmaps = kwargs.pop("graph_token_heatmaps", None)
+        edges = kwargs.pop("graph_token_edges", None)
+        supplied = (present is not None, heatmaps is not None, edges is not None)
+        if not any(supplied):
+            return inputs_embeds
+        if not all(supplied):
+            raise ValueError("graph token inputs must include present, heatmaps, and edges together")
+        if self.graph_token_adapter is None or self.graph_token_ids is None:
+            raise ValueError("received graph token inputs but TextGenerativeVLM has no adapter")
+        if not torch.is_tensor(present) or not torch.is_tensor(heatmaps) or not torch.is_tensor(edges):
+            raise TypeError("graph token inputs must be tensors")
+        expected_present = (input_ids.shape[0], len(GRAPH_TOKEN_SLOTS))
+        if present.shape != expected_present:
+            raise ValueError(
+                f"graph_token_present must be {expected_present}, got {tuple(present.shape)}"
+            )
+        if heatmaps.ndim != 4 or heatmaps.shape[:2] != (input_ids.shape[0], 2):
+            raise ValueError(
+                "graph_token_heatmaps must be [B,2,H,W] aligned with input_ids, got "
+                f"{tuple(heatmaps.shape)}"
+            )
+        if edges.shape != (input_ids.shape[0], 2, self.graph_token_adapter.edge_dim):
+            raise ValueError(
+                "graph_token_edges must be [B,2,D] aligned with the token adapter, got "
+                f"{tuple(edges.shape)}"
+            )
+
+        present = present.to(input_ids.device, dtype=torch.bool)
+        tokens = self.graph_token_adapter(
+            heatmaps.to(inputs_embeds.device), edges.to(inputs_embeds.device)
+        ).to(dtype=inputs_embeds.dtype)
+        for slot_index, slot in enumerate(GRAPH_TOKEN_SLOTS):
+            token_id = self.graph_token_ids[slot.name]
+            mask = input_ids.eq(token_id)
+            count = mask.sum(dim=1)
+            if bool((count > 1).any()) or not torch.equal(
+                count.to(dtype=torch.bool), present[:, slot_index]
+            ):
+                raise ValueError(
+                    f"graph token input/prompt mismatch for {slot.name!r}: "
+                    f"counts={count.tolist()} present={present[:, slot_index].tolist()}"
+                )
+            if bool(mask.any()):
+                inputs_embeds = torch.where(
+                    mask.unsqueeze(-1),
+                    tokens[:, slot_index].unsqueeze(1),
+                    inputs_embeds,
+                )
+        return inputs_embeds
 
     def close(self) -> None:
         self.clear_vision_cache()
@@ -679,6 +911,10 @@ class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
     def forward(self, model_inputs: Mapping[str, torch.Tensor]):
         device = next(self.backbone.parameters()).device
         reuse_vision = "vision_reuse_indices" in model_inputs
+        if "graph_token_present" in model_inputs and not reuse_vision:
+            raise ValueError(
+                "graph_evidence_mode='text_tokens' requires input.reuse_frozen_vision=true"
+            )
         kwargs = {
             key: value
             for key, value in model_inputs.items()
@@ -702,5 +938,4 @@ class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
         )
         hidden_output = self._forward_with_reused_vision(kwargs, device)
         return self._reused_generative_output(hidden_output, labels)
-
 

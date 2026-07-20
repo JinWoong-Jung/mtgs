@@ -43,11 +43,11 @@ class PersonGazeText:
     """SA-only per-person summary rendered as text.
 
     ``third_*`` is the most-likely OTHER person this person gazes at (excluding the pair
-    partner and non-visible slots); ``None`` when no such person exists. ``gaze_xy`` is the
-    graph's predicted normalized gaze point (where it thinks this person looks), and
+    partner and non-visible slots); ``None`` when no such person exists.
     ``nonperson_prob`` = sigmoid(null_in_logits) is the graph's probability that this gaze
-    target is a non-person scene location rather than a person. Both are always surfaced;
-    the VLM reconciles the coordinate and probability against the image."""
+    target is within the image but is not another annotated person. ``gaze_xy`` is retained
+    only for backwards-compatible construction of diagnostic objects; prompts deliberately
+    do not render the brittle argmax coordinate."""
     third_bbox: tuple[float, float, float, float] | None
     third_prob: float | None
     nonperson_prob: float | None
@@ -83,9 +83,13 @@ class TextGraphEvidence:
     ``task_prob`` uses the task decoder's canonical pair logit. Symmetric task directions
     are averaged in logit space before sigmoid, matching the locked graph evaluator.
 
-    ``gaze_a_xy`` / ``gaze_b_xy`` are the graph's predicted normalized gaze points for
-    Person A / Person B (where the graph thinks each looks). LAH surfaces only Person A's
-    (the looker's); LAEO surfaces both. SA carries per-person gaze inside ``person_a/b``.
+    ``temporal_probs`` contains the relation probability at the previous, current, and next
+    cached context positions. With the current MTGS settings these positions correspond to
+    raw-frame offsets ``[-3, 0, +3]``. The middle value is checked against the exported
+    center logit before the evidence is returned.
+
+    ``gaze_a_xy`` / ``gaze_b_xy`` remain as compatibility-only fields. They are not populated
+    by :func:`assemble_text_graph_evidence` and are never rendered into new prompts.
 
     ``alt_a`` / ``alt_b`` (LAH/LAEO only) are Person A's / Person B's best OTHER candidate,
     surfaced only when it outscores the queried pair probability (see ``AltTargetText``).
@@ -95,6 +99,7 @@ class TextGraphEvidence:
     p_ab: float | None = None
     p_ba: float | None = None
     task_prob: float | None = None
+    temporal_probs: tuple[float, float, float] | None = None
     person_a: PersonGazeText | None = None
     person_b: PersonGazeText | None = None
     gaze_a_xy: tuple[float, float] | None = None
@@ -109,7 +114,6 @@ def _sa_person_text(
     lah_logits: torch.Tensor,
     null_in_logits: torch.Tensor,
     head_bboxes: torch.Tensor,
-    gaze_point: torch.Tensor,
     vis_mask: torch.Tensor | None,
 ) -> PersonGazeText:
     n = lah_logits.shape[0]
@@ -129,17 +133,14 @@ def _sa_person_text(
         third_bbox = tuple(round(float(v), 2) for v in head_bboxes[best_k].tolist())
         third_prob = float(torch.sigmoid(torch.tensor(best_logit)))
 
-    # (2) the graph's predicted gaze point + P(non-person scene) = sigmoid(null_in), both
-    # surfaced unconditionally. No geometry gate: the coordinate says WHERE the graph
-    # thinks the gaze lands, the probability says how likely that target is a non-person,
-    # and the VLM reconciles both against the image.
-    gaze_xy = (round(float(gaze_point[self_idx, 0]), 2), round(float(gaze_point[self_idx, 1]), 2))
+    # (2) P(non-person scene) = sigmoid(null_in). The predicted argmax gaze point is
+    # intentionally not exposed: it behaved as a near-hard negative whenever it landed just
+    # outside the queried head box, even for genuinely positive relations.
     nonperson = float(torch.sigmoid(null_in_logits[self_idx].float()))
     return PersonGazeText(
         third_bbox=third_bbox,
         third_prob=third_prob,
         nonperson_prob=nonperson,
-        gaze_xy=gaze_xy,
         third_person_index=best_k,
     )
 
@@ -181,6 +182,51 @@ def _symmetric_task_probability(
     return float(torch.sigmoid(pair_logit.float()))
 
 
+def _temporal_relation_probabilities(
+    cache: Mapping[str, object],
+    *,
+    field: str,
+    center_logits: torch.Tensor,
+    person_a: int,
+    person_b: int,
+    symmetric: bool,
+) -> tuple[float, float, float]:
+    """Return probabilities at the cached context slots immediately around center.
+
+    The exporter stores the complete odd-length temporal window as ``[T,N,N]``. We use
+    slots ``center-1, center, center+1`` rather than the outermost context positions. With
+    the current ``temporal_stride=3`` this means raw-frame offsets ``[-3, 0, +3]``.
+    """
+    frames = _tensor(cache, field, 3).float()
+    n = center_logits.shape[0]
+    _check_shape(frames, (None, n, n), field)
+    if frames.shape[0] < 3 or frames.shape[0] % 2 == 0:
+        raise ValueError(f"{field} must have an odd temporal length >= 3, got {frames.shape[0]}")
+
+    center = frames.shape[0] // 2
+    selected = frames[center - 1:center + 2, person_a, person_b]
+    if symmetric:
+        selected = 0.5 * (
+            selected + frames[center - 1:center + 2, person_b, person_a]
+        )
+        center_logit = 0.5 * (
+            center_logits[person_a, person_b] + center_logits[person_b, person_a]
+        )
+    else:
+        center_logit = center_logits[person_a, person_b]
+    if not bool(torch.isfinite(selected).all()) or not bool(torch.isfinite(center_logit)):
+        raise ValueError(f"{field} contains a non-finite relation logit")
+
+    probabilities = torch.sigmoid(selected)
+    center_probability = torch.sigmoid(center_logit.float())
+    if not torch.isclose(probabilities[1], center_probability, atol=2e-3, rtol=2e-3):
+        raise ValueError(
+            f"{field} center probability {float(probabilities[1]):.6f} does not match "
+            f"the exported center probability {float(center_probability):.6f}"
+        )
+    return tuple(float(value) for value in probabilities)
+
+
 def assemble_text_graph_evidence(
     sample: SocialSample, cache: Mapping[str, object]
 ) -> TextGraphEvidence:
@@ -192,11 +238,6 @@ def assemble_text_graph_evidence(
         if not 0 <= idx < n:
             raise IndexError(f"{name}={idx} outside person range [0,{n})")
 
-    def _gaze_xy(idx: int) -> tuple[float, float]:
-        gaze_point = _tensor(cache, "gaze_point", 2)
-        _check_shape(gaze_point, (n, 2), "gaze_point")
-        return (round(float(gaze_point[idx, 0]), 2), round(float(gaze_point[idx, 1]), 2))
-
     bboxes = _tensor(cache, "head_bboxes", 2)
     if bboxes.shape[1] != 4:
         raise ValueError(f"head_bboxes must be [N,4] for {sample.sid!r}")
@@ -204,12 +245,14 @@ def assemble_text_graph_evidence(
     vis = vis if torch.is_tensor(vis) else None
 
     if sample.task == "lah":
-        # Only the looker's (Person A's) predicted gaze point is relevant to "does A look at B".
         p_ab = float(torch.sigmoid(lah[a, b]))
         return TextGraphEvidence(
             task="lah",
             p_ab=p_ab,
-            gaze_a_xy=_gaze_xy(a),
+            temporal_probs=_temporal_relation_probabilities(
+                cache, field="lah_logits_frames", center_logits=lah,
+                person_a=a, person_b=b, symmetric=False,
+            ),
             alt_a=_best_alt_target(a, b, p_ab, lah, bboxes, vis),
         )
     if sample.task == "laeo":
@@ -222,8 +265,10 @@ def assemble_text_graph_evidence(
             p_ab=p_ab,
             p_ba=p_ba,
             task_prob=_symmetric_task_probability(laeo, a, b),
-            gaze_a_xy=_gaze_xy(a),
-            gaze_b_xy=_gaze_xy(b),
+            temporal_probs=_temporal_relation_probabilities(
+                cache, field="laeo_logits_frames", center_logits=laeo,
+                person_a=a, person_b=b, symmetric=True,
+            ),
             alt_a=_best_alt_target(a, b, p_ab, lah, bboxes, vis),
             alt_b=_best_alt_target(b, a, p_ba, lah, bboxes, vis),
         )
@@ -231,12 +276,14 @@ def assemble_text_graph_evidence(
         sa = _tensor(cache, "sa_logits", 2).float()
         _check_shape(sa, (n, n), "sa_logits")
         null_in = _tensor(cache, "null_in_logits", 1)
-        gaze_point = _tensor(cache, "gaze_point", 2)
-        _check_shape(gaze_point, (n, 2), "gaze_point")
         return TextGraphEvidence(
             task="sa",
             task_prob=_symmetric_task_probability(sa, a, b),
-            person_a=_sa_person_text(a, b, lah, null_in, bboxes, gaze_point, vis),
-            person_b=_sa_person_text(b, a, lah, null_in, bboxes, gaze_point, vis),
+            temporal_probs=_temporal_relation_probabilities(
+                cache, field="sa_logits_frames", center_logits=sa,
+                person_a=a, person_b=b, symmetric=True,
+            ),
+            person_a=_sa_person_text(a, b, lah, null_in, bboxes, vis),
+            person_b=_sa_person_text(b, a, lah, null_in, bboxes, vis),
         )
     raise ValueError(f"unknown social task {sample.task!r}")

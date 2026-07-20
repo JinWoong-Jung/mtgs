@@ -60,24 +60,25 @@ if [ ! -f "$MANIFEST_ROOT/manifest_train.jsonl" ] || [ ! -f "$MANIFEST_ROOT/mani
     exit 2
 fi
 
-# Confidence-gated routing (config_vlm.yaml `routing.use`). When on, the VLM TRAINS only
-# on low-confidence TRAIN pairs (frozen-graph max(p,1-p) < threshold) -- the same pairs the
-# eval router queries; high-confidence pairs are answered by the graph directly. The VAL
-# manifest is intentionally left UNFILTERED (the full population): training.py reads the
-# same threshold from CONFIG and routes internally during validation (raw_graph scored on
-# the full val set, VLM forward only on its low-confidence remainder), exactly mirroring
-# eval_vlm.sh's test-time behaviour. Filtering val here too would instead score raw_graph
-# on the hard subset only -- not the graph-only vs graph+VLM-routing comparison we want.
-read -r ROUTING_USE ROUTING_THR < <(python - "$CONFIG" <<'PYCFG'
+# Confidence-gated routing can train on the VLM-routed remainder only, or on the full
+# train population as auxiliary data. Validation always remains full: training.py routes
+# it internally, mirroring eval_vlm.sh's held-out-test behaviour.
+read -r ROUTING_USE ROUTING_THR ROUTING_TRAIN_POPULATION < <(python - "$CONFIG" <<'PYCFG'
 import sys
 from omegaconf import OmegaConf
 r = OmegaConf.load(sys.argv[1]).get("routing", {})
-print(bool(r.get("use", False)), r.get("threshold", 0.8))
+population = str(r.get("train_population", "low_confidence")).lower().replace("-", "_")
+population = {"low_conf": "low_confidence"}.get(population, population)
+if population not in {"low_confidence", "full"}:
+    raise SystemExit(
+        "routing.train_population must be 'low_confidence' or 'full', got " + repr(population)
+    )
+print(bool(r.get("use", False)), r.get("threshold", 0.8), population)
 PYCFG
 )
 TRAIN_MANIFEST="$MANIFEST_ROOT/manifest_train.jsonl"
 VAL_MANIFEST="$MANIFEST_ROOT/manifest_val.jsonl"
-if [ "$ROUTING_USE" = "True" ]; then
+if [ "$ROUTING_USE" = "True" ] && [ "$ROUTING_TRAIN_POPULATION" = "low_confidence" ]; then
     LOWCONF_ROOT="$CACHE/manifests/${MANIFEST_PROFILE}_lowconf${ROUTING_THR}"
     mkdir -p "$LOWCONF_ROOT"
     python -m vlm.cache.filter_lowconf_manifest \
@@ -87,7 +88,9 @@ if [ "$ROUTING_USE" = "True" ]; then
         --report "$LOWCONF_ROOT/report_train.json" \
         --threshold "$ROUTING_THR"
     TRAIN_MANIFEST="$LOWCONF_ROOT/manifest_train.jsonl"
-    echo "[vlm] routing ON (threshold=$ROUTING_THR): training on low-confidence TRAIN pairs only; val stays full"
+    echo "[vlm] routing ON (threshold=$ROUTING_THR): train_population=low_confidence; val stays full"
+elif [ "$ROUTING_USE" = "True" ]; then
+    echo "[vlm] routing ON (threshold=$ROUTING_THR): train_population=full; val stays full"
 fi
 echo "[vlm] manifest_profile=$MANIFEST_PROFILE train_manifest=$TRAIN_MANIFEST val_manifest=$VAL_MANIFEST"
 RESUME_ARGS=()

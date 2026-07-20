@@ -5,7 +5,7 @@
 # dedicated experiment configs, not in the production/default training surface.
 
 experiment:
-  name: VLM_v3(full)-routing(0.9)
+  name: VLM_v6(full)-routing(0.8)
   out_root: experiments/VLM
   monitor: mean_social_f1          # locked mean AP across LAH / LAEO / SA
   monitor_mode: max
@@ -17,19 +17,30 @@ data:
   profile: full
 
 routing:
-  # Confidence-gated routing knob, read only by vlm.evaluate. use=false keeps the
-  # production/default behaviour (VLM scores every pair). The routing experiment
-  # (train on low-confidence pairs only + route at eval, report F1 only) lives in
-  # its dedicated config_vlm_routing.yaml + scripts/{train,eval}_vlm_routing.sh.
+  # use=false scores every pair with the VLM. use=true routes high-confidence
+  # pairs to the frozen graph and only the <=threshold remainder to the VLM at val/test.
   use: true
-  threshold: 0.9             # graph decision confidence max(p, 1-p); pairs below go to the VLM
+  threshold: 0.8             # graph decision confidence max(p, 1-p); conf<=threshold goes to the VLM
+  # Train only the pairs delegated to the VLM (current protocol), or retain the
+  # full train population as auxiliary supervision. Validation/test routing is
+  # unchanged in either case.
+  train_population: low_confidence   # low_confidence | full
+  # Full-population only. 1.0 disables it; e.g. 4.0 samples conf<=threshold
+  # pairs four times as often via weighted sampling while samples_per_epoch stays fixed.
+  low_confidence_weight: 1.0
 
 model:
   qwen: Qwen/Qwen3-VL-8B-Instruct
   max_pixels: 200704          # <= 448 x 448 pixels; aspect ratio is preserved
-  # Output is fixed to generative yes/no; graph evidence is fixed to prompt text.
-  # This switch is the graph-ablation control only.
+  # Output is fixed to generative yes/no. ``text`` writes the cached graph probabilities,
+  # including previous/current/next context; ``text_tokens`` additionally replaces inline
+  # placeholders with learned projections of frozen cache features.
   include_graph_evidence: true
+  graph_evidence_mode: text            # text | text_tokens
+  graph_tokens:                 # read only when graph_evidence_mode=text_tokens
+    features: [gaze_heatmap, edge_pp]
+    edge_dim: 256
+    dropout: 0.10
   gradient_checkpointing: true
   lora:
     rank: 8
@@ -42,6 +53,11 @@ input:
   reuse_frozen_vision: true
   group_by_frame: true        # only effective when reuse_frozen_vision=true
   vision_cache_size: 1       # bounded in-memory GPU LRU, in frames
+  # Draw the queried pair's head boxes on the frame (A=red, B=blue) so the VLM sees
+  # which people "Person A/B" refer to instead of resolving text coordinates. Each pair
+  # then has a distinct image, so per-frame vision reuse no longer saves compute
+  # (the vision cache key is made pair-unique to stay correct).
+  draw_pair_bboxes: true
 
 sampling:
   # once: visit every row in the selected train manifest exactly once per epoch.
@@ -60,14 +76,14 @@ train:
   wandb_log_interval: 25
 
 optim:
-  lr: 4.0e-4                  # LoRA parameters (the only trainable parameters here)
+  lr: 1.0e-4                  # LoRA parameters (the only trainable parameters here)
   weight_decay: 0.01
   grad_clip: 1.0
   scheduler: cosine
   warmup_ratio: 0.03
 
 val:
-  bs: 16
+  bs: 64
   num_workers: 8
   raw_image_cache_size: 1
   prompt_seed: 101            # fixed wording for comparable validation/test AP

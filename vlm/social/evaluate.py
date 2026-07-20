@@ -90,7 +90,8 @@ def _variant_settings(cfg, mode: str) -> dict[str, Any]:
         reuse_vision = builders.reuse_vision
         return {
             "output": "generative",
-            "graph_evidence": "text",
+            "graph_evidence": builders.graph_evidence_mode,
+            "graph_token_features": list(builders.graph_token_features),
             "include_graph_evidence": builders.include_graph_evidence,
             "lm_aux_weight": float(cfg.get("loss", {}).get("lm_aux_weight", 0.0)),
             "reuse_frozen_vision": reuse_vision,
@@ -158,6 +159,10 @@ def run_evaluation(args) -> dict[str, Any]:
             raw_image_cache_size=int(cfg.val.get("raw_image_cache_size", 16)),
             generative_prompt_seed=int(cfg.val.get("prompt_seed", cfg.train.get("seed", 101))),
             include_graph_evidence=generative_builders.include_graph_evidence,
+            routing_threshold=_route_threshold(cfg),
+            graph_evidence_mode=generative_builders.graph_evidence_mode,
+            graph_token_features=generative_builders.graph_token_features,
+            draw_pair_bboxes=generative_builders.draw_pair_bboxes,
         )
         annotations = dataset.annotations
     else:  # raw_graph: no VLM, no frames -- only the frozen graph logits are scored.
