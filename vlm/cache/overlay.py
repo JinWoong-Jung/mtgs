@@ -5,6 +5,8 @@ Provides PIL-based bounding-box drawing utilities and graph-informed or
 graph-free overlay construction for the VLM specialist inputs.
 """
 
+import math
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
@@ -75,6 +77,39 @@ def _draw(draw, bbox_norm, W, H, color, label, width, font_size=26):
         draw.text((tx + 3, ty + 1), label, fill="white", font=f)
 
 
+def _draw_gaze_arrow(draw, bbox_norm, gaze_vec, W, H, color, *, length_frac=0.13, width=6):
+    """Draw a constant-length gaze arrow from the head-bbox center in ``gaze_vec``'s
+    direction. (An eye-level start point was considered, but this pipeline has no eye
+    landmarks anywhere -- not in the raw HDF5 annotations, the graph cache, or the
+    gaze model's outputs -- so the bbox center is the only geometrically grounded
+    anchor available.) ``gaze_vec`` is ``(dx, dy)`` in the graph's normalized, y-down
+    image convention -- the SAME convention PIL uses for pixel coordinates, so it is
+    drawn directly with no sign flip (verified empirically against gaze_point in
+    evidence.py).
+
+    Length is a fixed fraction of the image's shorter side (not the person's bbox size)
+    so arrow length never doubles as an unintended distance/confidence cue. The endpoint
+    is clipped to the image bounds; the arrowhead is a solid filled triangle for visibility.
+    """
+    x1, y1, x2, y2 = [float(v) for v in bbox_norm]
+    cx, cy = (x1 + x2) / 2 * W, (y1 + y2) / 2 * H
+    dx, dy = float(gaze_vec[0]), float(gaze_vec[1])
+    norm = math.hypot(dx, dy)
+    if norm < 1e-6:
+        return
+    dx, dy = dx / norm, dy / norm
+    length = length_frac * min(W, H)
+    ex = min(max(cx + dx * length, 0.0), float(W))
+    ey = min(max(cy + dy * length, 0.0), float(H))
+    draw.line([cx, cy, ex, ey], fill=color, width=width)
+    head_len = max(14.0, width * 2.5)
+    angle = math.atan2(ey - cy, ex - cx)
+    wing = math.radians(22)
+    left = (ex - head_len * math.cos(angle - wing), ey - head_len * math.sin(angle - wing))
+    right = (ex - head_len * math.cos(angle + wing), ey - head_len * math.sin(angle + wing))
+    draw.polygon([(ex, ey), left, right], fill=color)
+
+
 def build_pointer_image(image_pil, task, i, j, cand_slots, bboxes_norm,
                         valid_slots, labels, null_in_slot, null_out_slot):
     """Graph-informed overlay. Only valid persons are drawn; labels are the
@@ -113,17 +148,33 @@ def build_token_overlay(image_pil, task, a, b, bboxes_norm, labels):
     return overlay
 
 
-def build_overlay_pair(image_pil, i, j, bboxes_norm, labels):
+def build_overlay_pair(image_pil, i, j, bboxes_norm, labels, *,
+                        task=None, gaze_vecs=None):
     """Graph-FREE overlay: draw ONLY the query pair — source i=red, target j=blue.
     Other people stay un-boxed (the full scene is still visible in the photo).
     This avoids clutter on crowd frames (videocoatt up to ~22 people) where boxing
     everyone obscures the scene and buries the queried pair. Other people's info,
-    if needed, is supplied as TEXT in the prompt, not drawn."""
+    if needed, is supplied as TEXT in the prompt, not drawn.
+
+    When ``gaze_vecs`` (indexable by person index, ``(dx, dy)`` per person -- same
+    tensor the cache stores) is given, also draws a constant-length gaze arrow from
+    each relevant person's head-bbox center, color-matched to their box. ``task``
+    selects who gets an arrow: "lah" draws only the source i (the looker being
+    evaluated; j is a location, not a gaze origin); "laeo"/"sa" draw both i and j.
+    """
     overlay = image_pil.convert("RGB").copy()
     W, H = overlay.size
     draw = ImageDraw.Draw(overlay)
-    _draw(draw, bboxes_norm[i], W, H, SOURCE_COLOR, labels[i], 4)    # red  = source
-    _draw(draw, bboxes_norm[j], W, H, PARTNER_COLOR, labels[j], 4)   # blue = target
+    _draw(draw, bboxes_norm[i], W, H, SOURCE_COLOR, labels[i], 4, font_size=16)    # red  = source
+    _draw(draw, bboxes_norm[j], W, H, PARTNER_COLOR, labels[j], 4, font_size=16)   # blue = target
+    if gaze_vecs is not None:
+        if task not in ("lah", "laeo", "sa"):
+            raise ValueError(f"gaze_vecs requires a known task, got {task!r}")
+        arrow_targets = [(i, SOURCE_COLOR)]
+        if task != "lah":
+            arrow_targets.append((j, PARTNER_COLOR))
+        for idx, color in arrow_targets:
+            _draw_gaze_arrow(draw, bboxes_norm[idx], gaze_vecs[idx], W, H, color)
     return overlay
 
 

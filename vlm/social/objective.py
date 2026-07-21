@@ -55,10 +55,23 @@ class GenerativeObjective(nn.Module):
         vlm: TextGenerativeVLM,
         *,
         direct_yes_no_token_ids: tuple[int, int] | None = None,
+        pos_weight_by_task_id: torch.Tensor | None = None,
     ):
         super().__init__()
         self.vlm = vlm
         self.direct_yes_no_token_ids = direct_yes_no_token_ids
+        # [num_tasks] positive-class loss weight indexed by SOCIAL_TASK_ID; ``None`` (or
+        # an all-ones tensor) leaves the CE unweighted. Only positive (label==1) examples
+        # are up-weighted, to counter the "no"-heavy answer distribution that drives the
+        # VLM to under-predict "yes". Registered as a buffer so it follows .to(device).
+        if pos_weight_by_task_id is None:
+            self.register_buffer("pos_weight_by_task_id", None, persistent=False)
+        else:
+            self.register_buffer(
+                "pos_weight_by_task_id",
+                pos_weight_by_task_id.to(dtype=torch.float),
+                persistent=False,
+            )
 
     def close(self) -> None:
         self.vlm.close()
@@ -69,8 +82,32 @@ class GenerativeObjective(nn.Module):
         task_ids: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
     ) -> GenerativeOutput:
+        model_inputs = self._maybe_attach_pos_weight(model_inputs, task_ids, labels)
         out = self.vlm(model_inputs)                 # backbone computes CE loss from labels
         return GenerativeOutput(loss=out.loss)
+
+    def _maybe_attach_pos_weight(
+        self,
+        model_inputs: Mapping[str, torch.Tensor],
+        task_ids: torch.Tensor | None,
+        labels: torch.Tensor | None,
+    ) -> Mapping[str, torch.Tensor]:
+        """Add a per-example ``pair_pos_weight`` [B] so positive pairs' CE is up-weighted.
+
+        A positive pair on task ``t`` gets weight ``pos_weight_by_task_id[t]``; every
+        negative pair (and every example when weighting is disabled) gets weight 1.0.
+        """
+        if self.pos_weight_by_task_id is None:
+            return model_inputs
+        if task_ids is None or labels is None:
+            raise ValueError(
+                "loss.pos_weight is configured but task_ids/pair_labels were not supplied"
+            )
+        weight = self.pos_weight_by_task_id.to(task_ids.device)[task_ids]
+        pair_pos_weight = torch.where(
+            labels.to(task_ids.device) == 1, weight, torch.ones_like(weight)
+        )
+        return {**model_inputs, "pair_pos_weight": pair_pos_weight}
 
     @torch.no_grad()
     def score(self, model_inputs: Mapping[str, torch.Tensor], num_pairs: int) -> torch.Tensor:

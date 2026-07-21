@@ -5,7 +5,7 @@
 #SBATCH --time=48:00:00
 #SBATCH -c 8
 #SBATCH -p gpu
-#SBATCH --mem=48G
+#SBATCH --mem=80G
 #SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.out
 #SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/vlm_%j.err
 
@@ -28,7 +28,7 @@ RESUME=""
 
 # This script defaults to train/validation only. Run held-out test evaluation
 # explicitly through eval_vlm.sh after selecting the final checkpoint.
-TEST_EVAL=0
+TEST_EVAL=1
 TEST_BATCH_SIZE=0
 TEST_NUM_WORKERS=-1
 TEST_OUT=""

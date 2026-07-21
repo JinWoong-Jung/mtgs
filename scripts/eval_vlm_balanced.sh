@@ -1,13 +1,13 @@
 #!/bin/bash
 
 #SBATCH --job-name=eval_vlm_bal
-#SBATCH --gres=gpu:mig48gb:1
+#SBATCH --gres=gpu:rtx6000:1
 #SBATCH --time=24:00:00
 #SBATCH -c 8
 #SBATCH -p gpu
-#SBATCH --mem=48G
-#SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_balanced_%j.out
-#SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_balanced_%j.err
+#SBATCH --mem=96G
+#SBATCH --output=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_balanced_full_%j.out
+#SBATCH --error=/home/jinwoongjung/MTGS/scripts/logs/eval_vlm_balanced_full_%j.err
 
 set -e
 
@@ -23,7 +23,7 @@ set -e
 # quick check, ahead of the full-profile run.
 
 # Set only the completed VLM training directory.
-RUN_DIR="/home/jinwoongjung/MTGS/experiments/VLM/VLM_v3(balanced)"
+RUN_DIR="/home/jinwoongjung/MTGS/experiments/VLM/VLM_v7(balanced_full)-routing(0.8)"
 
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate mtgs
@@ -39,10 +39,10 @@ fi
 mkdir -p scripts/logs
 MODE="vlm"
 SPLIT="test"
-NAME="$(basename "$RUN_DIR")_balanced"
+NAME="$(basename "$RUN_DIR")_balanced_full"
 CHECKPOINT="$RUN_DIR/train/checkpoints/best"
 CONFIG="$RUN_DIR/config_vlm.yaml"
-OUT="$RUN_DIR/test_balanced"
+OUT="$RUN_DIR/test_balanced_full"
 DEVICE="auto"
 WANDB_OFF=1
 PROVENANCE="$RUN_DIR/input_provenance.env"
@@ -59,7 +59,7 @@ fi
 CACHE="$VLM_CACHE"
 # Deliberately override the provenance's always-"full" test profile with
 # "balanced" -- that is this script's entire reason to exist.
-MANIFEST_PROFILE="balanced"
+MANIFEST_PROFILE="balanced_full"
 MANIFEST="$CACHE/manifests/$MANIFEST_PROFILE/manifest_$SPLIT.jsonl"
 FRAME_ROOT="$CACHE/overlays/$SPLIT"
 for required in "$CONFIG" "$CHECKPOINT" "$MANIFEST" "$FRAME_ROOT" "$CACHE/vlmgraph_$SPLIT.pt" "$CACHE/gtmeta_$SPLIT.pt"; do

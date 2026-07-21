@@ -44,6 +44,7 @@ def _fake_graph_cache():
             [0.60, 0.60, 0.85, 0.85],
         ]),
         "gaze_point": torch.tensor([[0.50, 0.50], [0.45, 0.45]]),
+        "gaze_vecs": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
         "vis_mask": torch.ones(num_people, dtype=torch.bool),
     }
 
@@ -71,6 +72,7 @@ def _make_dataset(
     graph_evidence_mode="text",
     graph_token_features=None,
     draw_pair_bboxes=False,
+    draw_gaze_arrows=False,
 ):
     frame_root = tmp_path / "frames"
     _write_frame(frame_root, "s0")
@@ -86,6 +88,7 @@ def _make_dataset(
         graph_evidence_mode=graph_evidence_mode,
         graph_token_features=graph_token_features,
         draw_pair_bboxes=draw_pair_bboxes,
+        draw_gaze_arrows=draw_gaze_arrows,
     )
 
 
@@ -107,6 +110,24 @@ def test_draw_pair_bboxes_on_draws_ab_boxes_and_pair_unique_cache_key(tmp_path):
     # Each pair gets a distinct vision-reuse key so the collator cannot reuse one pair's
     # boxed frame for the rest of the frame. A=person_i=1, B=person_j=0.
     assert item.vision_cache_key.endswith("frame.png::A1B0")
+
+
+def test_draw_gaze_arrows_requires_draw_pair_bboxes(tmp_path):
+    with pytest.raises(ValueError, match="draw_gaze_arrows requires draw_pair_bboxes"):
+        _make_dataset(tmp_path, draw_pair_bboxes=False, draw_gaze_arrows=True)
+
+
+def test_draw_gaze_arrows_on_adds_pixels_beyond_the_boxes(tmp_path):
+    boxes_only = _make_dataset(tmp_path / "a", draw_pair_bboxes=True, draw_gaze_arrows=False)[0]
+    with_arrows = _make_dataset(tmp_path / "b", draw_pair_bboxes=True, draw_gaze_arrows=True)[0]
+
+    def count(img, rgb):
+        return sum(1 for px in img.convert("RGB").getdata() if px == rgb)
+
+    # LAH draws an arrow only for the looker (A=person 1, gaze_vecs[1]=(0,1)); B's box
+    # gets no arrow, so blue pixel count must be unchanged while red increases.
+    assert count(with_arrows.image, (255, 0, 0)) > count(boxes_only.image, (255, 0, 0))
+    assert count(with_arrows.image, (0, 0, 255)) == count(boxes_only.image, (0, 0, 255))
 
 
 def test_text_mode_builds_text_prompt_on_plain_image(tmp_path):

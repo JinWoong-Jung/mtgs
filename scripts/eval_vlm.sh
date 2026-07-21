@@ -19,7 +19,7 @@ set -e
 # environment override, e.g. for an ad-hoc eval of an in-progress checkpoint without
 # touching that run's canonical test/ output:
 #   RUN_DIR=".../VLM_v5(full)-routing(0.8)-fulltrain" OUT_NAME=test_tmp sbatch eval_vlm.sh
-RUN_DIR="${RUN_DIR:-/home/jinwoongjung/MTGS/experiments/VLM/VLM_v5(full)-routing(0.8)}"
+RUN_DIR="${RUN_DIR:-/home/jinwoongjung/MTGS/experiments/VLM/VLM_v7(full)-routing(0.8)}"
 OUT_NAME="${OUT_NAME:-test}"
 
 source /opt/miniconda3/etc/profile.d/conda.sh

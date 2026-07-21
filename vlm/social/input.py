@@ -117,8 +117,12 @@ class SocialInputDataset(Dataset):
         graph_evidence_mode: str = "text",
         graph_token_features: Sequence[str] | None = None,
         draw_pair_bboxes: bool = False,
+        draw_gaze_arrows: bool = False,
     ):
         self.draw_pair_bboxes = bool(draw_pair_bboxes)
+        self.draw_gaze_arrows = bool(draw_gaze_arrows)
+        if self.draw_gaze_arrows and not self.draw_pair_bboxes:
+            raise ValueError("draw_gaze_arrows requires draw_pair_bboxes=True")
         self.include_graph_evidence = bool(include_graph_evidence)
         self.graph_evidence_mode = normalize_graph_evidence_mode(graph_evidence_mode)
         if self.graph_evidence_mode == "text_tokens":
@@ -202,12 +206,20 @@ class SocialInputDataset(Dataset):
             # image, so the vision-reuse cache key must be pair-unique (otherwise the
             # collator would encode only the first pair's boxed frame and reuse it for the
             # rest of the frame). This intentionally forgoes per-frame vision reuse.
+            gaze_vecs = None
+            if self.draw_gaze_arrows:
+                gaze_vecs = cache.get("gaze_vecs")
+                if not torch.is_tensor(gaze_vecs) or gaze_vecs.ndim != 2 or gaze_vecs.shape[1] != 2:
+                    shape = tuple(gaze_vecs.shape) if torch.is_tensor(gaze_vecs) else type(gaze_vecs).__name__
+                    raise ValueError(f"gaze_vecs for {sample.sid!r} must have shape [N,2], got {shape}")
             image = build_overlay_pair(
                 image,
                 sample.person_i,
                 sample.person_j,
                 bboxes,
                 {sample.person_i: "Person A", sample.person_j: "Person B"},
+                task=sample.task if gaze_vecs is not None else None,
+                gaze_vecs=gaze_vecs,
             )
             frame_key = f"{frame_key}::A{sample.person_i}B{sample.person_j}"
         graph_needs_visual_review = (

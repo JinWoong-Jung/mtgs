@@ -34,6 +34,7 @@ from vlm.social.objective import (
     GenerativeObjective,
     generative_answer_token_ids,
 )
+from vlm.social.data import SOCIAL_TASKS
 from vlm.social.input import (
     SocialInputDataset,
     boost_low_confidence_weights,
@@ -531,6 +532,7 @@ class GenerativeBuilders:
     graph_token_edge_dim: int | None
     graph_token_dropout: float
     draw_pair_bboxes: bool
+    draw_gaze_arrows: bool
 
 
 def select_generative_builders(cfg) -> GenerativeBuilders:
@@ -540,6 +542,9 @@ def select_generative_builders(cfg) -> GenerativeBuilders:
     include_graph_evidence = bool(model_cfg.get("include_graph_evidence", True))
     reuse_vision = bool(input_cfg.get("reuse_frozen_vision", False))
     draw_pair_bboxes = bool(input_cfg.get("draw_pair_bboxes", False))
+    draw_gaze_arrows = bool(input_cfg.get("draw_gaze_arrows", False))
+    if draw_gaze_arrows and not draw_pair_bboxes:
+        raise ValueError("input.draw_gaze_arrows requires input.draw_pair_bboxes=true")
     mode = normalize_graph_evidence_mode(model_cfg.get("graph_evidence_mode", "text"))
     token_cfg = model_cfg.get("graph_tokens", {})
     if mode == "text":
@@ -551,6 +556,7 @@ def select_generative_builders(cfg) -> GenerativeBuilders:
             graph_token_edge_dim=None,
             graph_token_dropout=0.0,
             draw_pair_bboxes=draw_pair_bboxes,
+            draw_gaze_arrows=draw_gaze_arrows,
         )
     if not include_graph_evidence:
         raise ValueError("model.graph_evidence_mode='text_tokens' requires include_graph_evidence=true")
@@ -570,11 +576,19 @@ def select_generative_builders(cfg) -> GenerativeBuilders:
         graph_token_edge_dim=edge_dim,
         graph_token_dropout=dropout,
         draw_pair_bboxes=draw_pair_bboxes,
+        draw_gaze_arrows=draw_gaze_arrows,
     )
 
 
-def build_generative_objective(cfg, processor, device: torch.device, resume: Path | None = None):
-    """Build text-only or text-plus-inline-token generative objective."""
+def build_generative_objective(
+    cfg, processor, device: torch.device, resume: Path | None = None,
+    pos_weights: Mapping[str, float] | None = None,
+):
+    """Build text-only or text-plus-inline-token generative objective.
+
+    ``pos_weights`` (task -> positive-class CE weight) enables class-imbalance loss
+    weighting; ``None`` (used by evaluation) leaves the CE unweighted.
+    """
     builders = select_generative_builders(cfg)
     graph_token_ids = (
         configure_graph_tokenizer(processor.tokenizer)
@@ -614,8 +628,15 @@ def build_generative_objective(cfg, processor, device: torch.device, resume: Pat
         graph_token_ids=graph_token_ids,
     )
     direct_ids = generative_answer_token_ids(processor.tokenizer)
+    pos_weight_by_task_id = None
+    if pos_weights is not None:
+        pos_weight_by_task_id = torch.tensor(
+            [float(pos_weights[task]) for task in SOCIAL_TASKS], dtype=torch.float
+        )
     objective = GenerativeObjective(
-        vlm, direct_yes_no_token_ids=direct_ids
+        vlm,
+        direct_yes_no_token_ids=direct_ids,
+        pos_weight_by_task_id=pos_weight_by_task_id,
     ).to(device=device)
     return objective, target_names
 
@@ -685,10 +706,10 @@ def _generative_batch(objective: GenerativeObjective, batch: dict[str, Any]):
     eval collate, not from this teacher-forced pass, so a placeholder prediction is used."""
     batch = dict(batch)
     task_ids = batch.pop("task_ids")
-    labels = batch.pop("pair_labels")          # [B] binary GT (for logging only here)
+    labels = batch.pop("pair_labels")          # [B] binary GT (logging + pos_weight gating)
     batch.pop("eval_keys")
     # batch still carries token-level "labels" + graph_features/graph_present for the vlm.
-    out = objective(batch, task_ids)
+    out = objective(batch, task_ids, labels)
     zeros = torch.zeros(labels.numel(), device=labels.device)
     decoder = type("GenDecoder", (), {
         "logits": zeros, "graph_logits": None, "delta_logits": None,
@@ -995,6 +1016,7 @@ def main() -> None:
         graph_evidence_mode=builders.graph_evidence_mode,
         graph_token_features=builders.graph_token_features,
         draw_pair_bboxes=builders.draw_pair_bboxes,
+        draw_gaze_arrows=builders.draw_gaze_arrows,
     )
     batch_size = int(cfg.train.bs)
     val_batch_size = int(cfg.val.bs)
@@ -1033,8 +1055,20 @@ def main() -> None:
             balance_mode=balance_mode, hard_floor=hard_floor
         )
 
-    # Generative training uses next-token CE (no BCE weighting).
-    objective, target_names = build_generative_objective(cfg, processor, device, resume)
+    # Generative training uses next-token CE, optionally with per-task positive-class
+    # weighting (loss.pos_weight) to counter the "no"-heavy answer distribution. Skip
+    # weighting entirely when loss.pos_weight is unset so the default stays unweighted.
+    pos_weights = None
+    if "loss" in cfg and cfg.get("loss", {}).get("pos_weight") is not None:
+        pos_weights = _resolve_pos_weights(cfg, train_dataset.annotations)
+        validate_sampler_loss_compatibility(balance_mode, pos_weights)
+        print(
+            "[vlm] loss.pos_weight (positive-class CE weight per task): "
+            + ", ".join(f"{t}={pos_weights[t]:.2f}" for t in SOCIAL_TASKS)
+        )
+    objective, target_names = build_generative_objective(
+        cfg, processor, device, resume, pos_weights=pos_weights
+    )
     collate = make_text_generative_collate(
         processor,
         reuse_vision=builders.reuse_vision,
@@ -1096,6 +1130,7 @@ def main() -> None:
             graph_evidence_mode=builders.graph_evidence_mode,
             graph_token_features=builders.graph_token_features,
             draw_pair_bboxes=builders.draw_pair_bboxes,
+            draw_gaze_arrows=builders.draw_gaze_arrows,
         )
         val_loader = make_validation_loader(
             val_dataset,

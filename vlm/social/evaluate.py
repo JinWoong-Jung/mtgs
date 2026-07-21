@@ -163,6 +163,7 @@ def run_evaluation(args) -> dict[str, Any]:
             graph_evidence_mode=generative_builders.graph_evidence_mode,
             graph_token_features=generative_builders.graph_token_features,
             draw_pair_bboxes=generative_builders.draw_pair_bboxes,
+            draw_gaze_arrows=generative_builders.draw_gaze_arrows,
         )
         annotations = dataset.annotations
     else:  # raw_graph: no VLM, no frames -- only the frozen graph logits are scored.

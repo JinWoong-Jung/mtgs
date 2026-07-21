@@ -453,3 +453,123 @@ def test_generative_answer_token_ids_use_unspaced_supervision_tokens():
             return {"yes": [17], "no": [23]}[text]
 
     assert generative_answer_token_ids(_Tokenizer()) == (17, 23)
+
+
+def test_weighted_supervised_ce_without_weights_matches_plain_mean():
+    from vlm.social.model import weighted_supervised_ce
+
+    logits = torch.tensor([[2.0, -1.0, 0.5], [0.1, 0.2, 0.3]])
+    labels = torch.tensor([0, 2])
+    got = weighted_supervised_ce(logits, labels)
+    expected = torch.nn.functional.cross_entropy(logits, labels)
+    torch.testing.assert_close(got, expected)
+
+
+def test_weighted_supervised_ce_upweights_positive_rows_by_weight_normalised_mean():
+    from vlm.social.model import weighted_supervised_ce
+
+    # Two examples, one supervised answer token each (rows 0 and 1).
+    logits = torch.tensor([[2.0, -1.0, 0.5], [0.1, 0.2, 0.3]])
+    labels = torch.tensor([0, 2])
+    rows = torch.tensor([0, 1])
+    weights = torch.tensor([3.0, 1.0])  # example 0 up-weighted 3x
+    got = weighted_supervised_ce(logits, labels, rows, weights)
+    ce = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+    expected = (weights * ce).sum() / weights.sum()  # sum(w*ce)/sum(w)
+    torch.testing.assert_close(got, expected)
+    # A pure up-weight of one example must sit between the two per-example losses.
+    assert min(ce).item() <= got.item() <= max(ce).item()
+
+
+def test_objective_attaches_per_example_pos_weight_only_for_positive_pairs():
+    # task_ids: [lah=0, laeo=1, sa=2, lah=0]; labels: [pos, neg, pos, neg].
+    captured = {}
+
+    class _CaptureVLM(TextGenerativeVLM):
+        def forward(self, model_inputs):
+            captured["pair_pos_weight"] = model_inputs.get("pair_pos_weight")
+            return SimpleNamespace(loss=torch.tensor(0.0))
+
+    pos_weight = torch.tensor([2.0, 5.0, 3.0])  # per task id
+    obj = GenerativeObjective(
+        _CaptureVLM(_StubBackbone()), pos_weight_by_task_id=pos_weight
+    )
+    task_ids = torch.tensor([0, 1, 2, 0])
+    labels = torch.tensor([1, 0, 1, 0])
+    obj({}, task_ids, labels)
+    # positives inherit their task weight; negatives stay 1.0.
+    torch.testing.assert_close(
+        captured["pair_pos_weight"], torch.tensor([2.0, 1.0, 3.0, 1.0])
+    )
+
+
+def test_objective_without_pos_weight_leaves_batch_untouched():
+    captured = {}
+
+    class _CaptureVLM(TextGenerativeVLM):
+        def forward(self, model_inputs):
+            captured["keys"] = set(model_inputs)
+            return SimpleNamespace(loss=torch.tensor(0.0))
+
+    obj = GenerativeObjective(_CaptureVLM(_StubBackbone()))
+    obj({"input_ids": torch.zeros(2, 3, dtype=torch.long)},
+        torch.tensor([0, 1]), torch.tensor([1, 0]))
+    assert "pair_pos_weight" not in captured["keys"]
+
+
+def test_objective_pos_weight_requires_task_ids_and_labels():
+    obj = GenerativeObjective(
+        TextGenerativeVLM(_StubBackbone()),
+        pos_weight_by_task_id=torch.tensor([2.0, 2.0, 2.0]),
+    )
+    with pytest.raises(ValueError, match="task_ids/pair_labels"):
+        obj({"input_ids": torch.zeros(1, 3, dtype=torch.long)})
+
+
+def test_reuse_forward_applies_positive_class_weight_to_the_supervised_ce():
+    class _ReuseBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head = nn.Linear(4, 8, bias=False)
+
+        def get_output_embeddings(self):
+            return self.head
+
+    class _ReuseVLM(TextGenerativeVLM):
+        def _forward_with_reused_vision(self, kwargs, device):
+            batch, length = kwargs["input_ids"].shape
+            hidden = torch.arange(batch * length * 4, dtype=torch.float).reshape(
+                batch, length, 4
+            )
+            self.last_hidden = hidden
+            return SimpleNamespace(
+                last_hidden_state=hidden, past_key_values=None,
+                hidden_states=None, attentions=None,
+            )
+
+    vlm = _ReuseVLM(_ReuseBackbone(), vision_cache_size=1)
+    labels = torch.tensor([[1, 2, 3, 4], [2, 3, 4, 5]])  # one supervised token per row
+    base = {"input_ids": torch.zeros(2, 4, dtype=torch.long),
+            "labels": labels, "vision_reuse_indices": torch.tensor([0, 0])}
+    try:
+        unweighted = vlm(dict(base)).loss
+        weighted = vlm({**base, "pair_pos_weight": torch.tensor([3.0, 1.0])}).loss
+        mask = labels[:, 1:] != -100
+        logits = vlm.backbone.head(vlm.last_hidden[:, :-1][mask])
+        ce = torch.nn.functional.cross_entropy(
+            logits.float(), labels[:, 1:][mask], reduction="none"
+        )
+        rows = mask.nonzero(as_tuple=True)[0]
+        w = torch.tensor([3.0, 1.0])[rows]
+        torch.testing.assert_close(weighted, (w * ce).sum() / w.sum())
+        assert not torch.allclose(weighted, unweighted)
+    finally:
+        vlm.close()
+
+
+def test_non_reuse_path_rejects_nontrivial_pos_weight():
+    vlm = TextGenerativeVLM(_StubBackbone())
+    with pytest.raises(ValueError, match="reuse_frozen_vision"):
+        vlm({"input_ids": torch.zeros(2, 4, dtype=torch.long),
+             "labels": torch.randint(0, 32, (2, 4)),
+             "pair_pos_weight": torch.tensor([2.0, 1.0])})

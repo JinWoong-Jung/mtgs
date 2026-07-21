@@ -72,6 +72,10 @@ TEXT_CORRECTION = TEXT_CORRECTION_BANK[0]
 TEXT_ROUTED_CORRECTION = (
     "The graph is not confident enough about this relation, so resolve it from the image."
 )
+TEXT_GAZE_POINT_APPROXIMATION = (
+    "The predicted gaze-point coordinates are approximate; inspect the surrounding visual "
+    "region rather than treating an exact coordinate as decisive."
+)
 # No-graph-evidence ablation variant of TEXT_CORRECTION_BANK: same register and length,
 # minus any mention of the graph (there is nothing to correct/verify against).
 TEXT_CORRECTION_BANK_NO_GRAPH = (
@@ -151,10 +155,6 @@ def _fmt_prob(p: float) -> str:
     return f"{float(p):.2f}"
 
 
-def _fmt_temporal_probs(probabilities) -> str:
-    if probabilities is None or len(probabilities) != 3:
-        raise ValueError("temporal graph probabilities must contain previous/current/next")
-    return "[" + ", ".join(_fmt_prob(value) for value in probabilities) + "]"
 
 
 def _fmt_box(box) -> str:
@@ -180,43 +180,44 @@ def _alt_target_line(name: str, alt) -> str:
     )
 
 
+
+def _gaze_line(name: str, xy, direction) -> str | None:
+    """One combined 'gaze point + direction' sentence when both are known, falling
+    back to whichever single field is present (keeps this robust even though the
+    current cache always supplies both together)."""
+    if xy is not None and direction is not None:
+        return f"- The graph predicts {name}'s gaze point is near {list(xy)} (direction: {direction})."
+    if xy is not None:
+        return f"- The graph predicts {name}'s gaze point is near {list(xy)}."
+    if direction is not None:
+        return f"- The graph predicts {name}'s gaze direction is {direction}."
+    return None
+
+
 def _text_evidence_block(
     evidence, graph_token_markers: Mapping[str, str] | None = None
 ) -> str:
-    """Render graph evidence without exposing predicted gaze-point coordinates.
-
-    Dense heatmap markers in ``text_tokens`` mode remain available as distribution
-    features, but are no longer tied to a brittle argmax coordinate.
-    """
+    """Render center-frame graph evidence plus approximate gaze-point cues."""
     markers = graph_token_markers or {}
     task = evidence.task
     if task == "lah":
         heat, edge = markers.get("heatmap_a"), markers.get("edge_ab")
-        if evidence.temporal_probs is not None:
-            features = []
-            if heat is not None:
-                features.append(f"Person A's predicted gaze-distribution feature {heat}")
-            if edge is not None:
-                features.append(f"the directed graph edge {edge}")
-            prefix = f"Using {' and '.join(features)}, the graph" if features else "The graph"
-            line = (
-                f"- {prefix} estimates P(Person A looks at Person B) across the previous, "
-                "current, and next context positions as "
-                f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively"
-            )
-        else:
-            relation = f"The directed graph edge {edge}" if edge is not None else "The graph"
-            heat_text = (
-                f", together with Person A's predicted gaze-distribution feature {heat},"
-                if heat is not None else ""
-            )
-            line = (
-                f"- {relation}{heat_text} estimates P(Person A looks at Person B) = "
-                f"{_fmt_prob(evidence.p_ab)}"
-            )
-        lines = ["Auxiliary graph evidence:", line + "."]
+        relation = f"The directed graph edge {edge}" if edge is not None else "The graph"
+        heat_text = (
+            f", together with Person A's predicted gaze-distribution feature {heat},"
+            if heat is not None else ""
+        )
+        lines = [
+            "Auxiliary graph evidence:",
+            f"- {relation}{heat_text} estimates P(Person A looks at Person B) = "
+            f"{_fmt_prob(evidence.p_ab)}.",
+        ]
+        gaze_line_a = _gaze_line("Person A", evidence.gaze_a_xy, evidence.gaze_a_dir)
+        if gaze_line_a is not None:
+            lines.append(gaze_line_a)
         if evidence.alt_a is not None:
             lines.append(_alt_target_line("Person A", evidence.alt_a))
+        lines.append(f"- {TEXT_GAZE_POINT_APPROXIMATION}")
         return "\n".join(lines)
 
     if task == "laeo":
@@ -239,22 +240,23 @@ def _text_evidence_block(
         line_a = _direction_line("Person A", "Person B", evidence.p_ab, heat_a, edge_ab)
         line_b = _direction_line("Person B", "Person A", evidence.p_ba, heat_b, edge_ba)
         lines = ["Auxiliary graph evidence:", line_a + "."]
+        gaze_line_a = _gaze_line("Person A", evidence.gaze_a_xy, evidence.gaze_a_dir)
+        if gaze_line_a is not None:
+            lines.append(gaze_line_a)
         if evidence.alt_a is not None:
             lines.append(_alt_target_line("Person A", evidence.alt_a))
         lines.append(line_b + ".")
+        gaze_line_b = _gaze_line("Person B", evidence.gaze_b_xy, evidence.gaze_b_dir)
+        if gaze_line_b is not None:
+            lines.append(gaze_line_b)
         if evidence.alt_b is not None:
             lines.append(_alt_target_line("Person B", evidence.alt_b))
-        if evidence.temporal_probs is not None:
-            lines.append(
-                "- Across the previous, current, and next context positions, the graph's "
-                "direct LAEO decoder estimates the mutual-gaze probabilities as "
-                f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively."
-            )
-        elif evidence.task_prob is not None:
+        if evidence.task_prob is not None:
             lines.append(
                 "- The graph's direct LAEO decoder estimates the probability of mutual "
                 f"gaze as {_fmt_prob(evidence.task_prob)}."
             )
+        lines.append(f"- {TEXT_GAZE_POINT_APPROXIMATION}")
         return "\n".join(lines)
 
     if task == "sa":
@@ -283,28 +285,25 @@ def _text_evidence_block(
                 )
             else:
                 lines.append(f"- No other visible person is a likely gaze target for {name}.")
+            gaze_line = _gaze_line(name, person.gaze_xy, person.gaze_dir)
+            if gaze_line is not None:
+                lines.append(gaze_line)
 
-        if evidence.temporal_probs is not None:
+        if evidence.task_prob is not None:
             edge_ab, edge_ba = markers.get("edge_ab"), markers.get("edge_ba")
             if edge_ab is not None or edge_ba is not None:
                 edges = " ".join(edge for edge in (edge_ab, edge_ba) if edge is not None)
                 lines.append(
-                    f"- Using the directed pair-edge features {edges}, across the previous, "
-                    "current, and next context positions the graph's direct SA decoder estimates "
-                    "the shared-attention probabilities as "
-                    f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively."
+                    f"- Using the directed pair-edge features {edges}, the graph's direct SA "
+                    f"decoder estimates the probability of shared attention as "
+                    f"{_fmt_prob(evidence.task_prob)}."
                 )
             else:
                 lines.append(
-                    "- Across the previous, current, and next context positions, the graph's "
-                    "direct SA decoder estimates the shared-attention probabilities as "
-                    f"{_fmt_temporal_probs(evidence.temporal_probs)}, respectively."
+                    "- The graph's direct SA decoder estimates the probability of shared "
+                    f"attention as {_fmt_prob(evidence.task_prob)}."
                 )
-        elif evidence.task_prob is not None:
-            lines.append(
-                "- The graph's direct SA decoder estimates the probability of shared "
-                f"attention as {_fmt_prob(evidence.task_prob)}."
-            )
+        lines.append(f"- {TEXT_GAZE_POINT_APPROXIMATION}")
         return "\n".join(lines)
     raise ValueError(f"unknown social task {task!r}")
 

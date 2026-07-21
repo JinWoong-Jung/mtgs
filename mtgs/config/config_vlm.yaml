@@ -5,7 +5,7 @@
 # dedicated experiment configs, not in the production/default training surface.
 
 experiment:
-  name: VLM_v6(full)-routing(0.8)
+  name: VLM_v8(full)-routing(0.8)
   out_root: experiments/VLM
   monitor: mean_social_f1          # locked mean AP across LAH / LAEO / SA
   monitor_mode: max
@@ -51,13 +51,17 @@ model:
 input:
   # The image is the plain frame; identities and graph evidence are supplied as text.
   reuse_frozen_vision: true
-  group_by_frame: true        # only effective when reuse_frozen_vision=true
+  group_by_frame: false        # only effective when reuse_frozen_vision=true
   vision_cache_size: 1       # bounded in-memory GPU LRU, in frames
   # Draw the queried pair's head boxes on the frame (A=red, B=blue) so the VLM sees
   # which people "Person A/B" refer to instead of resolving text coordinates. Each pair
   # then has a distinct image, so per-frame vision reuse no longer saves compute
   # (the vision cache key is made pair-unique to stay correct).
   draw_pair_bboxes: true
+  # Draw a constant-length gaze arrow (color-matched to each person's box) from their
+  # head-bbox center in the graph's predicted gaze_vecs direction. LAH draws only the
+  # looker (A); LAEO/SA draw both. Requires draw_pair_bboxes=true.
+  draw_gaze_arrows: true
 
 sampling:
   # once: visit every row in the selected train manifest exactly once per epoch.
@@ -65,6 +69,19 @@ sampling:
   # distribution ablations, never to choose a dataset subset.
   strategy: once              # once | uniform | task_balanced | task_label_balanced
   samples_per_epoch: 0        # resampling only; 0 = selected manifest length
+
+loss:
+  # Per-task positive-class cross-entropy weight. The training answers are "no"-heavy,
+  # so the VLM under-predicts "yes" (low recall, esp. LAH). Up-weighting positive pairs'
+  # CE raises P(yes) at the source instead of post-hoc threshold tuning.
+  # "auto" = clamped negative/positive ratio per task; the moderate cap keeps it a gentle
+  # correction (full balancing over-fires LAEO on the natural-distribution test set).
+  # Requires input.reuse_frozen_vision=true. Mutually exclusive with
+  # sampling.strategy=task_label_balanced (which already balances labels).
+  # Remove this whole section to train with plain unweighted CE.
+  pos_weight: auto            # "auto" | {lah: <w>, laeo: <w>, sa: <w>}
+  pos_weight_min: 1.0         # never down-weight positives
+  pos_weight_max: 2.0         # gentle upper bound on the up-weight
 
 train:
   epochs: 3

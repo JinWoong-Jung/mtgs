@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vlm.social.data import SOCIAL_TASK_ID
 from vlm.social.graph_tokens import (
@@ -21,10 +22,38 @@ from vlm.social.prompt import generative_answer_yesno
 
 
 # Batch keys that carry labels/metadata rather than model inputs; stripped before the
-# backbone forward.
+# backbone forward. ``pair_pos_weight`` is the optional per-example loss weight
+# (class-imbalance correction) consumed only by the reuse-path CE, never the backbone.
 _NON_MODEL_KEYS = (
     "graph_features", "graph_present", "task_ids", "pair_labels", "eval_keys", "num_pairs",
+    "pair_pos_weight",
 )
+
+
+def weighted_supervised_ce(
+    logits: torch.Tensor,
+    answer_labels: torch.Tensor,
+    supervised_rows: torch.Tensor | None = None,
+    pair_pos_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Cross-entropy over supervised answer tokens with optional per-example weighting.
+
+    ``logits`` / ``answer_labels`` are the flattened supervised-position tensors
+    ([num_supervised, V] and [num_supervised]). Without ``pair_pos_weight`` this is
+    exactly ``cross_entropy(..., reduction='mean')`` (backwards-compatible). With it,
+    each supervised token inherits its batch row's weight via ``supervised_rows``
+    (the row index of every supervised token, e.g. ``mask.nonzero()[:, 0]``), and the
+    loss is the weight-normalised mean ``sum(w*ce)/sum(w)`` -- the same normalisation
+    torch's ``CrossEntropyLoss(weight=...)`` uses, so the loss scale (and thus the
+    effective learning rate) is preserved regardless of the weight magnitude.
+    """
+    ce = F.cross_entropy(logits.float(), answer_labels, reduction="none")
+    if pair_pos_weight is None:
+        return ce.mean()
+    if supervised_rows is None:
+        raise ValueError("supervised_rows is required when pair_pos_weight is given")
+    weights = pair_pos_weight.to(ce.device)[supervised_rows]
+    return (weights * ce).sum() / weights.sum().clamp_min(1e-8)
 
 
 def _attach_graph_token_batch(
@@ -867,7 +896,8 @@ class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
         return torch.nn.functional.linear(final_hidden, weight, bias)  # [B,2]
 
     def _reused_generative_output(
-        self, hidden_output: Any, labels: torch.Tensor | None
+        self, hidden_output: Any, labels: torch.Tensor | None,
+        pair_pos_weight: torch.Tensor | None = None,
     ) -> TextGenerativeVLMOutput:
         """Apply causal NLL after the low-level vision-reuse language-model forward.
 
@@ -899,7 +929,12 @@ class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
             answer_hidden = hidden_states[:, :-1, :][supervised]
             answer_labels = shift_labels[supervised]
             logits = self.get_output_embeddings()(answer_hidden)
-            loss = torch.nn.functional.cross_entropy(logits.float(), answer_labels)
+            supervised_rows = (
+                None if pair_pos_weight is None else supervised.nonzero(as_tuple=True)[0]
+            )
+            loss = weighted_supervised_ce(
+                logits, answer_labels, supervised_rows, pair_pos_weight
+            )
         return TextGenerativeVLMOutput(
             loss=loss,
             logits=logits,
@@ -915,12 +950,23 @@ class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
             raise ValueError(
                 "graph_evidence_mode='text_tokens' requires input.reuse_frozen_vision=true"
             )
+        pair_pos_weight = model_inputs.get("pair_pos_weight")
         kwargs = {
             key: value
             for key, value in model_inputs.items()
             if key not in _NON_MODEL_KEYS
         }
         if not reuse_vision:
+            # The non-reuse path delegates CE to the frozen backbone, which offers no
+            # per-example weighting hook. Rather than silently drop the class-imbalance
+            # correction, fail fast: loss weighting requires input.reuse_frozen_vision=true.
+            if pair_pos_weight is not None and not bool(
+                torch.allclose(pair_pos_weight, torch.ones_like(pair_pos_weight))
+            ):
+                raise ValueError(
+                    "per-example loss weighting (loss.pos_weight) requires "
+                    "input.reuse_frozen_vision=true"
+                )
             kwargs = {
                 key: value.to(device) if torch.is_tensor(value) else value
                 for key, value in kwargs.items()
@@ -933,9 +979,11 @@ class TextGenerativeVLM(_VisionReuseMixin, nn.Module):
         labels = kwargs.pop("labels", None)
         if torch.is_tensor(labels):
             labels = labels.to(device)
+        if torch.is_tensor(pair_pos_weight):
+            pair_pos_weight = pair_pos_weight.to(device)
         kwargs.update(
             {"output_hidden_states": False, "return_dict": True, "use_cache": False}
         )
         hidden_output = self._forward_with_reused_vision(kwargs, device)
-        return self._reused_generative_output(hidden_output, labels)
+        return self._reused_generative_output(hidden_output, labels, pair_pos_weight)
 
