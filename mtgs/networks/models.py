@@ -86,6 +86,7 @@ class MTGSModel(pl.LightningModule):
             gaze_graph_use_null_out=getattr(cfg.gaze_graph, "use_null_out", True),
             gaze_graph_use_face_proj=getattr(cfg.gaze_graph, "use_face_proj", True),
             gaze_graph_use_node_geom=getattr(cfg.gaze_graph, "use_node_geom", True),
+            gaze_graph_detach_input=getattr(cfg.gaze_graph, "detach_input", True),
         )
 
         self.cfg = cfg
@@ -327,14 +328,20 @@ class MTGSModel(pl.LightningModule):
         # Fixed interaction trunk (people_interaction + people_temporal); the social
         # head is gaze_graph_block (highest LR). 4 param groups total.
         base_lr = self.cfg.optimizer.lr
+        # gaze_graph_block is random-init (absent from all checkpoints) and, under
+        # Option A (detach_input), the ONLY module the social loss trains — so it
+        # needs a much higher LR than the warm-started trunk it sits on. head_lr_mult
+        # scales ONLY the graph group; the trunk stays at base_lr (its finetune LR).
+        head_lr_mult = getattr(self.cfg.gaze_graph, "head_lr_mult", 3)
+        graph_lr = base_lr * head_lr_mult
         # Social head param group: GazeGraphBlock (use=True) or the original
-        # per-pair decoders (use=False). ×3 keeps the same 4-group structure/LR.
+        # per-pair decoders (use=False, kept at ×3 as before).
         if self.cfg.gaze_graph.use:
             social_head_group = {
                 "params": self.model.gaze_graph_block.parameters(),
                 "name": "gaze-graph-block",
-                "lr": base_lr * 3,
-                "init_lr": base_lr * 3,
+                "lr": graph_lr,
+                "init_lr": graph_lr,
             }
             social_head_prefixes = {"gaze_graph_block"}
         else:
@@ -385,8 +392,8 @@ class MTGSModel(pl.LightningModule):
         # param group stays at its constructed LR (base_lr / base_lr*3) for the whole
         # run. Returning the optimizer alone leaves the LR untouched by Lightning.
         if getattr(self.cfg.scheduler, "type", "CosineAnnealingLR") == "constant":
-            logger.info("Using constant LR (no scheduler): base=%g, fast=%g",
-                        base_lr, base_lr * 3)
+            logger.info("Using constant LR (no scheduler): base=%g, fast=%g, graph=%g",
+                        base_lr, base_lr * 3, graph_lr)
             return optimizer
 
         # Continuous (per-step) schedule: linear warmup → cosine decay.

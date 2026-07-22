@@ -42,7 +42,13 @@ gaze_graph:
   # Core graph architecture
   use: true             # true: GazeGraphBlock head | false: social decoder(person token pair→LAH/LAEO/SA)
   num_layers: 2
-  edge_dim: 256
+  edge_dim: 512         # edge/refiner width (raised 256→512 to match trunk relational scale)
+
+  # Option A — social→trunk gradient firewall. true: detach person_tokens before
+  # the graph so the social loss trains ONLY gaze_graph_block, not the trunk's
+  # people_interaction/temporal (they stay trained by gaze/heatmap/inout). Forces
+  # relational reasoning into the graph → row/col ablation becomes meaningful.
+  detach_input: true
 
   # Graph readout / edge features
   laeo_derive: "decoder"  # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
@@ -52,20 +58,25 @@ gaze_graph:
   # Ablation: node-init feature terms (capacity-controlled, same pattern as use_prior)
   # face_proj / node_geom_mlp are ALWAYS built, so param count is unchanged; a disabled
   # term's contribution is zeroed in forward (node = LN(person_token + face) + geom_emb).
-  use_face_proj: false   # detached raw-face re-injection (GazeEncoder token) into node init
+  use_face_proj: true   # detached raw-face re-injection (GazeEncoder token) into node init
   use_node_geom: false   # [cx,cy,w,h,gaze_vec] geometry MLP into node init
 
   # Training
   frozen: false
   lambda_null: 0.5      # weight for dual null-edge loss (null_in + null_out)
+  # LR multiplier for the gaze_graph_block param group ONLY (trunk stays at
+  # optimizer.lr). The graph is random-init and, under detach_input, the only
+  # module the social loss trains, so it needs a much higher LR than the
+  # warm-started trunk. peak graph LR = optimizer.lr * head_lr_mult.
+  head_lr_mult: 100
 
   # Ablation: row/column edge message passing (capacity-controlled)
   # Row/col edge-attention ablation (capacity-controlled: encoders always built, a
   # disabled branch only has its context zeroed, so all 4 settings share param count).
   # both=true/true (default), row-only=true/false, col-only=false/true, neither=false/false.
   # Ablates row/col ATTENTION only; node-update / re-inject / temporal steps still run.
-  use_row_attn: true    # source i attends over its Tl outgoing-edge targets
-  use_col_attn: true    # target k attends over its N incoming-edge sources
+  use_row_attn: false    # source i attends over its Tl outgoing-edge targets
+  use_col_attn: false    # target k attends over its N incoming-edge sources
 
   # Ablation: per-edge temporal message passing (step ⑥ only)
   # Graph's OWN per-edge temporal attention (refiner step ⑥ — NOT the MTGS

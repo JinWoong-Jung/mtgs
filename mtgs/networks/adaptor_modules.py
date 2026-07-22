@@ -675,7 +675,11 @@ class GazeGraphBlock(nn.Module):
         overlap   = _compute_bbox_overlap(hm_norm, bboxes_bt)           # (BT, N, N)
         overlap   = overlap.to(dtype).reshape(B, T, N, N)
 
-        in_prob          = torch.sigmoid(inout_logits)                  # (B, T, N)
+        # Detach inout_logits: same firewall pattern as gaze_vecs/gaze_heatmaps/
+        # gaze_feat below — the graph consumes the inout prediction as fixed
+        # evidence for the null_out prior; social-graph gradients (LAH/LAEO/SA/
+        # null via edge_feat_e) must not flow back into inout_decoder.
+        in_prob          = torch.sigmoid(inout_logits.detach())         # (B, T, N)
         person_bbox_mass = overlap.sum(-1).clamp(max=1.0)              # (B, T, N)
         null_in_prior    = 1.0 - person_bbox_mass
         null_out_prior   = 1.0 - in_prob

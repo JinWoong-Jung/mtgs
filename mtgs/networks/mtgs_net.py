@@ -63,11 +63,17 @@ class MTGS(nn.Module):
         gaze_graph_use_null_out: bool = True,
         gaze_graph_use_face_proj: bool = True,
         gaze_graph_use_node_geom: bool = True,
+        gaze_graph_detach_input: bool = True,
     ):
         super().__init__()
 
         self.patch_size = patch_size
         self.token_dim = token_dim
+        # Option A: detach person_tokens before the gaze_graph head so the social
+        # loss trains ONLY the graph, not the trunk's people_interaction/temporal
+        # (which stay trained by gaze/heatmap/inout losses). Forces relational
+        # reasoning into the graph so row/col ablation becomes meaningful.
+        self.gaze_graph_detach_input = gaze_graph_detach_input
         self.image_size = pair(image_size)
         self.hm_size = hm_size
         self.gaze_feature_dim = gaze_feature_dim
@@ -132,10 +138,7 @@ class MTGS(nn.Module):
                     num_heads=encoder_num_heads,
                     drop_path=0.3,
                     cffn_ratio=0.25,
-                    # checkpoint the frozen DINOv2 blocks run inside each stage:
-                    # identical math, ~10 GB less stored activations at train
-                    # shape for one extra encoder forward in backward.
-                    with_vit_cp=True,
+                    with_vit_cp=False,
                 )
                 for i in range(len(self.interaction_indexes))
             ]
@@ -380,9 +383,14 @@ class MTGS(nn.Module):
             )
 
         # ── gaze_graph: unified directed graph (persons + null_in + null_out) ──
+        # Option A firewall: optionally detach so social gradient does not flow
+        # back into the trunk's relational modules (people_interaction/temporal).
+        graph_person_tokens = (
+            person_tokens.detach() if self.gaze_graph_detach_input else person_tokens
+        )
         lah_mat, laeo_mat, sa_mat, null_in_mat, null_out_mat, edge_valid = (
             self.gaze_graph_block(
-                person_tokens.view(b, t, n, -1),   # (B, T, N, D)
+                graph_person_tokens.view(b, t, n, -1),   # (B, T, N, D)
                 num_valid_b,                        # (B,)
                 gaze_vec.view(b, t, n, -1),        # (B, T, N, 2)
                 x["head_bboxes"].view(b, t, n, -1),# (B, T, N, 4)
