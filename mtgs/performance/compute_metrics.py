@@ -101,8 +101,9 @@ def _process_laeo_pp(res):
 def compute(results, dataset=None, shuffle=False, thr=0.5):
     """Compute all VSGaze metrics and return a dict of scalar values.
 
-    Returns keys: lah_ap, lah_auc, laeo_ap, laeo_auc, coatt_ap, coatt_auc,
-    social_ap, and optionally dist, ap_io, f1_lah_pp, f1_laeo_pp.
+    Set ``dataset`` to one VSGaze source (childplay, videoattentiontarget,
+    laeo, or coatt) to recompute the same metrics for that subset only.
+    Tasks without valid labels are reported as N/A instead of raising.
     """
     gf_metrics = GFTestDistance()
     logger.info("Computing metrics...")
@@ -150,7 +151,6 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
         # ── LAH (model score) ─────────────────────────────────────────────
         lah_gt = batch["lah_gt"].cpu()
         lah_pred = batch["lah_pred"].cpu()
-        lah_pred_argmax = torch.zeros_like(lah_pred)
         lah_gt_metric = torch.zeros(batch_size, num_people).long() - 1
         lah_pred_metric = torch.zeros(batch_size, num_people)
         for bi in range(batch_size):
@@ -164,8 +164,7 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
                     if valid_indices.shape[0] > 0:
                         if (lah_gt[bi][valid_indices] != -1).sum() == 0:
                             continue
-                        max_val, max_idx = torch.max(lah_pred[bi][valid_indices], 0)
-                        lah_pred_argmax[bi][valid_indices[max_idx]] = max_val
+                        max_val, _ = torch.max(lah_pred[bi][valid_indices], 0)
                         lah_gt_metric[bi][pi] = min(
                             lah_gt[bi][valid_indices][
                                 lah_gt[bi][valid_indices] != -1
@@ -175,7 +174,9 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
                         gt_idx = torch.where(lah_gt[bi][valid_indices] == 1)[0]
                         if len(gt_idx) > 0:
                             gt_idx = gt_idx[0]
-                            lah_pred_metric[bi][pi] = lah_pred_argmax[bi][
+                            # Score the true-positive edge with the model's own
+                            # confidence on it, even when some other edge outranks it.
+                            lah_pred_metric[bi][pi] = lah_pred[bi][
                                 valid_indices
                             ][gt_idx]
                         else:
@@ -225,20 +226,52 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
             laeo_pp_gt_all.extend(g); laeo_pp_pred_all.extend(p)
 
     import numpy as np
-    lah_pp_gt   = np.array(lah_pp_gt_all)
+    lah_pp_gt = np.array(lah_pp_gt_all)
     lah_pp_pred = np.array(lah_pp_pred_all)
-    pp_mask     = lah_pp_gt != -1
-    laeo_pp_gt   = np.array(laeo_pp_gt_all)
+    pp_mask = lah_pp_gt != -1
+    laeo_pp_gt = np.array(laeo_pp_gt_all)
     laeo_pp_pred = np.array(laeo_pp_pred_all)
 
-    ret = {}   # collected scalar values to return
+    ret = {}
+
+    def _has_two_classes(labels):
+        return labels.numel() > 0 and torch.unique(labels).numel() == 2
+
+    def _log_binary_task(name, labels, scores, key_prefix):
+        """Log threshold metrics for any non-empty task; AP/AUC need two classes."""
+        logger.info("----- %s -----", name)
+        labels = labels.reshape(-1)
+        scores = scores.reshape(-1)
+        if labels.numel() == 0:
+            logger.info("N/A   : no valid labels")
+            return
+
+        if _has_two_classes(labels):
+            ap = average_precision_score(labels.numpy(), scores.numpy())
+            auc = roc_auc_score(labels.numpy(), scores.numpy())
+            logger.info("AP    : %.4f", ap)
+            logger.info("AUC   : %.4f", auc)
+            ret[f"{key_prefix}_ap"] = ap
+            ret[f"{key_prefix}_auc"] = auc
+        else:
+            logger.info("AP/AUC: N/A (single-class target)")
+
+        pred_thr = scores > thr
+        logger.info("Prec  : %.4f", precision_score(labels.numpy(), pred_thr.numpy(), zero_division=0))
+        logger.info("Recall: %.4f", recall_score(labels.numpy(), pred_thr.numpy(), zero_division=0))
+        logger.info(
+            "F1    : %.4f  (thr=%.1f)",
+            f1_score(labels.numpy(), pred_thr.numpy(), zero_division=0),
+            thr,
+        )
 
     # ══════════════════════════════════════════════════════════════════════
-    # Block 1: README 지표 (Dist / AP_IO / F1_LAH PP / F1_LAEO PP / AP_SA)
+    # Block 1: README-style metrics for the selected dataset scope
     # ══════════════════════════════════════════════════════════════════════
+    scope = f"{dataset} subset" if dataset is not None else "VSGaze test set"
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  PRIMARY METRICS  (VSGaze test set — README table)")
+    logger.info("  PRIMARY METRICS  (%s)", scope)
     logger.info("=" * 60)
 
     if distances:
@@ -249,97 +282,75 @@ def compute(results, dataset=None, shuffle=False, thr=0.5):
         logger.info("Avg Dist    : %.4f", torch.cat(avg_distances).mean().item())
 
     if inout_gt_all:
-        ap_io = average_precision_score(
-            torch.cat(inout_gt_all).float().numpy(),
-            torch.cat(inout_pred_all).float().numpy(),
-        )
-        logger.info("AP_IO       : %.4f", ap_io)
-        ret["ap_io"] = ap_io
+        inout_gt_cat = torch.cat(inout_gt_all).float()
+        inout_pred_cat = torch.cat(inout_pred_all).float()
+        if _has_two_classes(inout_gt_cat):
+            ap_io = average_precision_score(inout_gt_cat.numpy(), inout_pred_cat.numpy())
+            logger.info("AP_IO       : %.4f", ap_io)
+            ret["ap_io"] = ap_io
+        else:
+            logger.info("AP_IO       : N/A (single-class target)")
 
     if lah_pp_gt_all and pp_mask.sum() > 0:
-        f1_lah_pp = f1_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask])
+        f1_lah_pp = f1_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask], zero_division=0)
         logger.info("F1_LAH (PP) : %.4f", f1_lah_pp)
         ret["f1_lah_pp"] = f1_lah_pp
 
+    f1_laeo_pp = None
     if laeo_pp_gt_all and len(laeo_pp_gt) > 0 and laeo_pp_gt.sum() > 0 and laeo_pp_pred.sum() > 0:
-        f1_laeo_pp = f1_score(laeo_pp_gt, laeo_pp_pred)
+        f1_laeo_pp = f1_score(laeo_pp_gt, laeo_pp_pred, zero_division=0)
         logger.info("F1_LAEO(PP) : %.4f", f1_laeo_pp)
         ret["f1_laeo_pp"] = f1_laeo_pp
     elif laeo_pp_gt_all:
         logger.info("F1_LAEO(PP) : N/A (no positive predictions)")
 
+    coatt_gt_cat = coatt_pred_cat = None
     if coatt_gt_all:
-        coatt_gt_cat   = torch.cat(coatt_gt_all)
+        coatt_gt_cat = torch.cat(coatt_gt_all)
         coatt_pred_cat = torch.cat(coatt_pred_all)
-        ap_sa = average_precision_score(coatt_gt_cat.numpy(), coatt_pred_cat.numpy())
-        logger.info("AP_SA       : %.4f", ap_sa)
-        ret["coatt_ap"] = ap_sa
+        if _has_two_classes(coatt_gt_cat):
+            ap_sa = average_precision_score(coatt_gt_cat.numpy(), coatt_pred_cat.numpy())
+            logger.info("AP_SA       : %.4f", ap_sa)
+            ret["coatt_ap"] = ap_sa
+        else:
+            logger.info("AP_SA       : N/A (single-class target)")
 
     # ══════════════════════════════════════════════════════════════════════
-    # Block 2: 세부 지표 (AUC / AP / Prec / Recall / F1 per task)
+    # Block 2: task-specific metrics; unavailable task labels are N/A.
     # ══════════════════════════════════════════════════════════════════════
     logger.info("")
     logger.info("=" * 60)
     logger.info("  DETAILED METRICS")
     logger.info("=" * 60)
 
-    # LAEO
-    logger.info("----- LAEO -----")
-    if laeo_gt_all:
-        laeo_gt_cat   = torch.cat(laeo_gt_all)
-        laeo_pred_cat = torch.cat(laeo_pred_all)
-        laeo_ap  = average_precision_score(laeo_gt_cat, laeo_pred_cat)
-        laeo_auc = roc_auc_score(laeo_gt_cat, laeo_pred_cat)
-        logger.info("AP    : %.4f", laeo_ap)
-        logger.info("AUC   : %.4f", laeo_auc)
-        laeo_thr = laeo_pred_cat > thr
-        logger.info("Prec  : %.4f", precision_score(laeo_gt_cat, laeo_thr))
-        logger.info("Recall: %.4f", recall_score(laeo_gt_cat, laeo_thr))
-        logger.info("F1    : %.4f  (thr=%.1f)", f1_score(laeo_gt_cat, laeo_thr), thr)
-        ret["laeo_ap"]  = laeo_ap
-        ret["laeo_auc"] = laeo_auc
-        if laeo_pp_gt_all and len(laeo_pp_gt) > 0 and laeo_pp_gt.sum() > 0 and laeo_pp_pred.sum() > 0:
-            logger.info("F1 PP : %.4f  (geometric)", f1_laeo_pp)
-            logger.info("  Prec PP : %.4f", precision_score(laeo_pp_gt, laeo_pp_pred))
-            logger.info("  Rec  PP : %.4f", recall_score(laeo_pp_gt, laeo_pp_pred))
+    laeo_gt_cat = torch.cat(laeo_gt_all) if laeo_gt_all else torch.empty(0, dtype=torch.long)
+    laeo_pred_cat = torch.cat(laeo_pred_all) if laeo_pred_all else torch.empty(0)
+    _log_binary_task("LAEO", laeo_gt_cat, laeo_pred_cat, "laeo")
+    if f1_laeo_pp is not None:
+        logger.info("F1 PP : %.4f  (geometric)", f1_laeo_pp)
+        logger.info("  Prec PP : %.4f", precision_score(laeo_pp_gt, laeo_pp_pred, zero_division=0))
+        logger.info("  Rec  PP : %.4f", recall_score(laeo_pp_gt, laeo_pp_pred, zero_division=0))
 
-    # LAH
-    logger.info("----- LAH -----")
     if lah_gt_all:
-        lah_gt_cat   = torch.cat(lah_gt_all)
+        lah_gt_cat = torch.cat(lah_gt_all)
         lah_pred_cat = torch.cat(lah_pred_all)
-        mask_cat     = torch.cat(mask_all)
-        lah_gt_cat   = lah_gt_cat[mask_cat]
+        mask_cat = torch.cat(mask_all)
+        lah_gt_cat = lah_gt_cat[mask_cat]
         lah_pred_cat = lah_pred_cat[mask_cat]
-        if lah_gt_cat.sum() < len(lah_gt_cat):
-            lah_ap  = average_precision_score(lah_gt_cat, lah_pred_cat)
-            lah_auc = roc_auc_score(lah_gt_cat, lah_pred_cat)
-            logger.info("AP    : %.4f", lah_ap)
-            logger.info("AUC   : %.4f", lah_auc)
-            ret["lah_ap"]  = lah_ap
-            ret["lah_auc"] = lah_auc
-        lah_thr = lah_pred_cat > thr
-        logger.info("Prec  : %.4f", precision_score(lah_gt_cat, lah_thr))
-        logger.info("Recall: %.4f", recall_score(lah_gt_cat, lah_thr))
-        logger.info("F1    : %.4f  (thr=%.1f)", f1_score(lah_gt_cat, lah_thr), thr)
-        if lah_pp_gt_all and pp_mask.sum() > 0:
-            logger.info("F1 PP : %.4f  (geometric)", f1_lah_pp)
-            logger.info("  Prec PP : %.4f", precision_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask]))
-            logger.info("  Rec  PP : %.4f", recall_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask]))
+    else:
+        lah_gt_cat = torch.empty(0, dtype=torch.long)
+        lah_pred_cat = torch.empty(0)
+    _log_binary_task("LAH", lah_gt_cat, lah_pred_cat, "lah")
+    if lah_pp_gt_all and pp_mask.sum() > 0:
+        logger.info("F1 PP : %.4f  (geometric)", f1_lah_pp)
+        logger.info("  Prec PP : %.4f", precision_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask], zero_division=0))
+        logger.info("  Rec  PP : %.4f", recall_score(lah_pp_gt[pp_mask], lah_pp_pred[pp_mask], zero_division=0))
 
-    # CoAtt / SA
-    logger.info("----- CoAtt (SA) -----")
-    if coatt_gt_all:
-        coatt_auc = roc_auc_score(coatt_gt_cat, coatt_pred_cat)
-        logger.info("AP    : %.4f", ap_sa)
-        logger.info("AUC   : %.4f", coatt_auc)
-        coatt_thr = coatt_pred_cat > thr
-        logger.info("Prec  : %.4f", precision_score(coatt_gt_cat, coatt_thr))
-        logger.info("Recall: %.4f", recall_score(coatt_gt_cat, coatt_thr))
-        logger.info("F1    : %.4f  (thr=%.1f)", f1_score(coatt_gt_cat, coatt_thr), thr)
-        ret["coatt_auc"] = coatt_auc
+    if coatt_gt_cat is None:
+        coatt_gt_cat = torch.empty(0, dtype=torch.long)
+        coatt_pred_cat = torch.empty(0)
+    _log_binary_task("CoAtt (SA)", coatt_gt_cat, coatt_pred_cat, "coatt")
 
-    # social_ap = mean(lah_ap, laeo_ap, coatt_ap)
     ap_vals = [ret[k] for k in ("lah_ap", "laeo_ap", "coatt_ap") if k in ret]
     if ap_vals:
         ret["social_ap"] = sum(ap_vals) / len(ap_vals)

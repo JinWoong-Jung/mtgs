@@ -6,7 +6,7 @@
 device: cuda
 
 wandb:
-  project_name: MTGS
+  project_name: MTGS+graph
   username: gaze-social
   log: True
   watch_freq: 500
@@ -39,14 +39,50 @@ model:
 
 # ── Gaze Graph (social-prediction head; attached after the fixed interaction trunk) ──
 gaze_graph:
+  # Core graph architecture
   use: true             # true: GazeGraphBlock head | false: social decoder(person token pair→LAH/LAEO/SA)
   num_layers: 2
   edge_dim: 256
-  use_prior: true       # scale geometric edge features by learnable prior_w
-  prior_weight: 0.5     # initial value of prior_w
-  frozen: false
+
+  # Graph readout / edge features
   laeo_derive: "decoder"  # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
+  use_prior: false       # scale geometric edge features by learnable prior_w
+  prior_weight: 0.5     # initial value of prior_w
+
+  # Ablation: node-init feature terms (capacity-controlled, same pattern as use_prior)
+  # face_proj / node_geom_mlp are ALWAYS built, so param count is unchanged; a disabled
+  # term's contribution is zeroed in forward (node = LN(person_token + face) + geom_emb).
+  use_face_proj: false   # detached raw-face re-injection (GazeEncoder token) into node init
+  use_node_geom: false   # [cx,cy,w,h,gaze_vec] geometry MLP into node init
+
+  # Training
+  frozen: false
   lambda_null: 0.5      # weight for dual null-edge loss (null_in + null_out)
+
+  # Ablation: row/column edge message passing (capacity-controlled)
+  # Row/col edge-attention ablation (capacity-controlled: encoders always built, a
+  # disabled branch only has its context zeroed, so all 4 settings share param count).
+  # both=true/true (default), row-only=true/false, col-only=false/true, neither=false/false.
+  # Ablates row/col ATTENTION only; node-update / re-inject / temporal steps still run.
+  use_row_attn: true    # source i attends over its Tl outgoing-edge targets
+  use_col_attn: true    # target k attends over its N incoming-edge sources
+
+  # Ablation: per-edge temporal message passing (step ⑥ only)
+  # Graph's OWN per-edge temporal attention (refiner step ⑥ — NOT the MTGS
+  # people-temporal / gaze-temporal modules). Module-skip ablation: off => the
+  # temporal encoder is not built and step ⑥ is skipped (params removed, unlike
+  # row/col which are capacity-controlled). Only active when T>1 anyway.
+  use_temporal_attn: true
+
+  # Ablation: explicit null routing nodes (capacity-controlled)
+  # Null-node ablation (capacity-controlled: slot/params/heads always built; a disabled
+  # null node is masked in ev_bool so every E[i→null] stays 0 and is excluded as an
+  # attention key — cutting its info flow while head_sa keeps ni=0, dim unchanged).
+  # Its BCE aux loss is auto-dropped when off. null_in = in-frame scene-object node
+  # (SA's direct consumer); null_out = out-of-frame routing node.
+  #   Full: true/true | -Null_in: false/true | -Null_out: true/false | -Both: false/false
+  use_null_in: true
+  use_null_out: true
 
 head_detector:
   checkpoint_file: /home/jinwoongjung/MTGS/weights/crowdhuman_yolov5m.pt # update path

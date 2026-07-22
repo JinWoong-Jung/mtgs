@@ -105,8 +105,11 @@ class AUC(tm.Metric):
         for hm_pred, hm_gt, io_gt in zip(gaze_heatmap_pred, gaze_heatmap_gt, inout_gt):
             if io_gt == 1:
                 hm_gt_binary = (hm_gt > 0).int()
-                self.sum_auc += binary_auroc(hm_pred, hm_gt_binary)
-        self.n_observations += (inout_gt == 1).sum()
+                # AUROC is undefined for an all-positive or all-negative target.
+                # Exclude such samples from both the sum and denominator.
+                if hm_gt_binary.any() and (~hm_gt_binary.bool()).any():
+                    self.sum_auc += binary_auroc(hm_pred, hm_gt_binary)
+                    self.n_observations += 1
 
     def compute(self):
         if self.n_observations != 0:
@@ -141,9 +144,12 @@ class GFTestAUC(tm.Metric):
         size = gaze_heatmap_pred.shape[1:]  # (b, h, w) >> (h, w)
         for hm_pred, gp_gt in zip(gaze_heatmap_pred, gaze_pt):
             gp_gt = gp_gt[gp_gt[:, 0] != -1]  # discard invalid gaze points
+            if gp_gt.numel() == 0:
+                continue
             hm_gt_binary = generate_binary_gaze_heatmap(gp_gt, size=size)
-            self.sum_auc += binary_auroc(hm_pred, hm_gt_binary)
-        self.n_observations += len(gaze_heatmap_pred)
+            if hm_gt_binary.any() and (~hm_gt_binary.bool()).any():
+                self.sum_auc += binary_auroc(hm_pred, hm_gt_binary)
+                self.n_observations += 1
 
     def compute(self):
         auc = self.sum_auc / self.n_observations

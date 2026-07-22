@@ -75,6 +75,17 @@ class MTGSModel(pl.LightningModule):
             gaze_graph_prior_weight=cfg.gaze_graph.prior_weight,
             gaze_graph_laeo_derive=cfg.gaze_graph.laeo_derive,
             gaze_graph_use=cfg.gaze_graph.use,
+            # Row/col edge-attention ablation. Default True keeps existing configs and
+            # both-branch checkpoints working unchanged.
+            gaze_graph_use_row_attn=getattr(cfg.gaze_graph, "use_row_attn", True),
+            gaze_graph_use_col_attn=getattr(cfg.gaze_graph, "use_col_attn", True),
+            gaze_graph_use_temporal_attn=getattr(
+                cfg.gaze_graph, "use_temporal_attn", True
+            ),
+            gaze_graph_use_null_in=getattr(cfg.gaze_graph, "use_null_in", True),
+            gaze_graph_use_null_out=getattr(cfg.gaze_graph, "use_null_out", True),
+            gaze_graph_use_face_proj=getattr(cfg.gaze_graph, "use_face_proj", True),
+            gaze_graph_use_node_geom=getattr(cfg.gaze_graph, "use_node_geom", True),
         )
 
         self.cfg = cfg
@@ -105,12 +116,15 @@ class MTGSModel(pl.LightningModule):
         # Define Social Gaze Metrics
         self.val_coatt_auc = tm.AUROC(task="binary", ignore_index=-1)
         self.val_coatt_ap = tm.AveragePrecision(task="binary", ignore_index=-1)
+        self.val_coatt_f1 = tm.F1Score(task="binary", threshold=0.5, ignore_index=-1)
 
         self.val_laeo_auc = tm.AUROC(task="binary", ignore_index=-1)
         self.val_laeo_ap = tm.AveragePrecision(task="binary", ignore_index=-1)
+        self.val_laeo_f1 = tm.F1Score(task="binary", threshold=0.5, ignore_index=-1)
 
         self.val_lah_auc = tm.AUROC(task="binary", ignore_index=-1)
         self.val_lah_ap = tm.AveragePrecision(task="binary", ignore_index=-1)
+        self.val_lah_f1 = tm.F1Score(task="binary", threshold=0.5, ignore_index=-1)
 
         # Define Loss Function
         self.compute_hm_loss = compute_interact_loss
@@ -543,10 +557,19 @@ class MTGSModel(pl.LightningModule):
                 lah_gt,
                 num_valid_bt,
             )
-            loss_null = lam_null * (loss_null_out + loss_null_in)
+            # Null-node ablation: a masked null node's edge is 0, so its head reads a
+            # constant and the BCE supervises nothing meaningful — drop that term while
+            # keeping the other null's loss (e.g. -Null_in keeps null_out supervision).
+            w_in  = 1.0 if getattr(self.cfg.gaze_graph, "use_null_in", True) else 0.0
+            w_out = 1.0 if getattr(self.cfg.gaze_graph, "use_null_out", True) else 0.0
+            loss_null = lam_null * (w_out * loss_null_out + w_in * loss_null_in)
             loss = loss + loss_null
-            self.log("loss/train/null_out", loss_null_out.item(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
-            self.log("loss/train/null_in",  loss_null_in.item(),  batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+            # Inactive null heads read constant zero edges, so their raw BCE is not
+            # meaningful and should not be emitted to W&B.
+            if w_out:
+                self.log("loss/train/null_out", loss_null_out.item(), batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
+            if w_in:
+                self.log("loss/train/null_in", loss_null_in.item(),  batch_size=n, prog_bar=False, on_step=True, on_epoch=True)
 
         # Log Social Gaze Losses
         self.log(
@@ -820,6 +843,7 @@ class MTGSModel(pl.LightningModule):
             if coatt_mask.sum() > 0:
                 self.val_coatt_auc(coatt_pred, coatt_gt)
                 self.val_coatt_ap(coatt_pred, coatt_gt)
+                self.val_coatt_f1(coatt_pred, coatt_gt)
 
                 self.log(
                     "metric/val/coatt_auc",
@@ -839,6 +863,15 @@ class MTGSModel(pl.LightningModule):
                     on_epoch=True,
                     sync_dist=True,
                 )
+                self.log(
+                    "metric/val/coatt_f1",
+                    self.val_coatt_f1,
+                    batch_size=coatt_mask.sum(),
+                    prog_bar=True,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
 
         # Update LAEO metrics
         if laeo_pred.sum() != 0:
@@ -847,6 +880,7 @@ class MTGSModel(pl.LightningModule):
             if laeo_mask.sum() > 0:
                 self.val_laeo_auc(laeo_pred, laeo_gt)
                 self.val_laeo_ap(laeo_pred, laeo_gt)
+                self.val_laeo_f1(laeo_pred, laeo_gt)
 
                 self.log(
                     "metric/val/laeo_auc",
@@ -866,6 +900,15 @@ class MTGSModel(pl.LightningModule):
                     on_epoch=True,
                     sync_dist=True,
                 )
+                self.log(
+                    "metric/val/laeo_f1",
+                    self.val_laeo_f1,
+                    batch_size=laeo_mask.sum(),
+                    prog_bar=True,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
 
         # Update LAH metrics
         if lah_pred.sum() != 0:
@@ -874,6 +917,7 @@ class MTGSModel(pl.LightningModule):
             if lah_mask.sum() > 0:
                 self.val_lah_auc(lah_pred, lah_gt)
                 self.val_lah_ap(lah_pred, lah_gt)
+                self.val_lah_f1(lah_pred, lah_gt)
 
                 self.log(
                     "metric/val/lah_auc",
@@ -887,6 +931,15 @@ class MTGSModel(pl.LightningModule):
                 self.log(
                     "metric/val/lah_ap",
                     self.val_lah_ap,
+                    batch_size=lah_mask.sum(),
+                    prog_bar=True,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+                self.log(
+                    "metric/val/lah_f1",
+                    self.val_lah_f1,
                     batch_size=lah_mask.sum(),
                     prog_bar=True,
                     on_step=False,
@@ -920,6 +973,21 @@ class MTGSModel(pl.LightningModule):
             self.log(
                 "metric/val/social_auc",
                 torch.stack(aucs).mean(),
+                prog_bar=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        f1s = []
+        for m in (self.val_lah_f1, self.val_laeo_f1, self.val_coatt_f1):
+            try:
+                f1s.append(m.compute())
+            except Exception:
+                pass
+        if f1s:
+            self.log(
+                "metric/val/social_f1",
+                torch.stack(f1s).mean(),
                 prog_bar=True,
                 on_epoch=True,
                 sync_dist=True,
@@ -1030,15 +1098,18 @@ class MTGSModel(pl.LightningModule):
                     ),
                     inout_gt.reshape(batch_size * num_people, -1),
                 )
-                self.log(
-                    "metric/test/auc",
-                    test_auc,
-                    batch_size=ni,
-                    prog_bar=True,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                )
+                # AUC uses -1000 as its legacy no-observation sentinel. Do not send
+                # that placeholder, or a non-finite degenerate AUC, to W&B.
+                if ni > 0 and torch.isfinite(test_auc) and test_auc >= 0:
+                    self.log(
+                        "metric/test/auc",
+                        test_auc,
+                        batch_size=ni,
+                        prog_bar=True,
+                        on_step=False,
+                        on_epoch=True,
+                        sync_dist=True,
+                    )
             self.metrics["test_dist"].update(
                 gaze_pt_pred, batch["gaze_pts"][:, middle_frame_idx, :, :], inout_gt
             )
@@ -1096,7 +1167,6 @@ class MTGSModel(pl.LightningModule):
         if lah_pred.sum() != 0:
             lah_pred = torch.sigmoid(lah_pred)
             lah_gt = lah_gt.long()
-            lah_pred_argmax = torch.zeros_like(lah_pred)
             lah_gt_metric = torch.zeros(batch_size, num_people).long() - 1
             lah_pred_metric = torch.zeros(batch_size, num_people)
             for bi in range(batch_size):
@@ -1111,8 +1181,7 @@ class MTGSModel(pl.LightningModule):
                             if (lah_gt[bi][valid_indices] != -1).sum() == 0:
                                 continue
 
-                            max_val, max_idx = torch.max(lah_pred[bi][valid_indices], 0)
-                            lah_pred_argmax[bi][valid_indices[max_idx]] = max_val
+                            max_val, _ = torch.max(lah_pred[bi][valid_indices], 0)
 
                             lah_gt_metric[bi][pi] = min(
                                 lah_gt[bi][valid_indices][
@@ -1124,7 +1193,9 @@ class MTGSModel(pl.LightningModule):
                             if len(gt_idx) > 0:
                                 if len(gt_idx) > 1:
                                     gt_idx = gt_idx[0]
-                                lah_pred_metric[bi][pi] = lah_pred_argmax[bi][
+                                # Score the true-positive edge with the model's own
+                                # confidence on it, even when some other edge outranks it.
+                                lah_pred_metric[bi][pi] = lah_pred[bi][
                                     valid_indices
                                 ][gt_idx]
                             else:

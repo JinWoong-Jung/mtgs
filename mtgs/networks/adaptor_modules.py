@@ -277,9 +277,30 @@ class _RefinerLayer(nn.Module):
     Column attention covers only the first N+1 targets (null_out excluded).
     """
 
-    def __init__(self, edge_dim: int, heads: int):
+    def __init__(self, edge_dim: int, heads: int,
+                 use_row_attn: bool = True, use_col_attn: bool = True,
+                 use_temporal_attn: bool = True):
         super().__init__()
         De = edge_dim
+
+        # Row/col message-passing ablation (capacity-controlled): all modules are ALWAYS
+        # built (param count identical across the 4 settings); a disabled direction only
+        # has its contributions gated OUT in forward. Each flag now governs BOTH channels
+        # of its direction, because the node path duplicates the attention path:
+        #   use_row_attn → ① row edge-attention  AND  ④ source node-update (out_agg,
+        #                  source i aggregates its OUTGOING edges) → re-injected via v_src
+        #   use_col_attn → ② col edge-attention  AND  ④ target node-update (in_agg,
+        #                  target k aggregates its INCOMING edges) → re-injected via v_tgt
+        # ⑤ re-inject runs iff at least one direction is active (spreads the updated
+        # node(s) back into edges); with BOTH off there is no edge↔edge message passing,
+        # so E is shaped only by edge-init, refresh's bias, and temporal (⑥).
+        self.use_row_attn = bool(use_row_attn)
+        self.use_col_attn = bool(use_col_attn)
+        # Temporal edge-attention ablation (module-skip, NOT capacity-controlled): when
+        # off the encoder is not built and step ⑥ is skipped entirely, so its params are
+        # removed. This is the graph's OWN edge-temporal consistency (step ⑥), unrelated
+        # to the MTGS people-temporal / gaze-temporal modules elsewhere in the network.
+        self.use_temporal_attn = bool(use_temporal_attn)
 
         _enc = lambda: nn.TransformerEncoderLayer(
             d_model=De, nhead=heads, dim_feedforward=2 * De,
@@ -287,7 +308,7 @@ class _RefinerLayer(nn.Module):
         )
         self.row      = _enc()
         self.col      = _enc()
-        self.temporal = _enc()   # edge temporal consistency (2-D)
+        self.temporal = _enc() if self.use_temporal_attn else None   # edge temporal (2-D)
 
         self.refresh  = MLP(2 * De, De, De)
         self.norm_e   = nn.LayerNorm(De)
@@ -312,78 +333,99 @@ class _RefinerLayer(nn.Module):
         E_in = E   # edge state before this layer's row/col attention
 
         # ── ① Row: source i attends over all Tl targets ───────────────────
-        row_context = self.row(
-            E_in.reshape(B * T * N, Tl, De), src_key_padding_mask=row_kpm
-        ).reshape(B, T, N, Tl, De) * ev
+        #    Ablation: when row attention is disabled its context is zeroed (the
+        #    encoder still runs & holds params, so param count is unchanged), which
+        #    removes row message-passing from the refresh below without touching col.
+        if self.use_row_attn:
+            row_context = self.row(
+                E_in.reshape(B * T * N, Tl, De), src_key_padding_mask=row_kpm
+            ).reshape(B, T, N, Tl, De) * ev
+        else:
+            row_context = torch.zeros_like(E_in)
 
         # ── ② Col: target k (person + null_in) attends over N sources ─────
         #    Parallel to row: col also reads from E_in (not row_context).
         #    null_out excluded; its slot is filled with E_in so refresh has
         #    a well-defined 2-way concat for every edge position.
-        E_col_in = E_in[:, :, :, :N + 1, :]
-        E_col_out_N1 = self.col(
-            E_col_in.permute(0, 1, 3, 2, 4).reshape(B * T * (N + 1), N, De),
-            src_key_padding_mask=col_kpm,
-        ).reshape(B, T, N + 1, N, De).permute(0, 1, 3, 2, 4)  # (B, T, N, N+1, De)
-        col_context = torch.cat(
-            [E_col_out_N1, E_in[:, :, :, N + 1:, :]], dim=3
-        ) * ev
+        if self.use_col_attn:
+            E_col_in = E_in[:, :, :, :N + 1, :]
+            E_col_out_N1 = self.col(
+                E_col_in.permute(0, 1, 3, 2, 4).reshape(B * T * (N + 1), N, De),
+                src_key_padding_mask=col_kpm,
+            ).reshape(B, T, N + 1, N, De).permute(0, 1, 3, 2, 4)  # (B, T, N, N+1, De)
+            col_context = torch.cat(
+                [E_col_out_N1, E_in[:, :, :, N + 1:, :]], dim=3
+            ) * ev
+        else:
+            col_context = torch.zeros_like(E_in)
 
         # ── ③ Edge refresh: parallel row+col context, E_in as residual base ──
         #    edge = LN(E_in + MLP(concat(row_context, col_context)))
+        #    "neither" (both contexts zeroed) => refresh(cat(0,0)); E is still updated
+        #    here (and by steps ④⑤⑥ below), so this ablates row/col ATTENTION, not the
+        #    whole graph refinement. The zeroed-context state is the post-refresh E.
         E = self.norm_e(
             E_in + self.refresh(torch.cat([row_context, col_context], dim=-1))
         ) * ev
 
-        # ── ④ Node update: learned attention pooling ──────────────────────
-        # out_agg: source i attends over all Tl outgoing edges
-        scores_out = self.pool_out(E).squeeze(-1)                      # (B, T, N, Tl)
-        scores_out = scores_out.masked_fill(ev_sq == 0, float('-inf'))
-        safe_out   = scores_out.isinf().all(dim=-1, keepdim=True)
-        scores_out = scores_out.masked_fill(safe_out, 0.0)
-        alpha_out  = F.softmax(scores_out, dim=-1) * ev_sq            # (B, T, N, Tl)
-        out_agg    = (alpha_out.unsqueeze(-1) * E).sum(3)             # (B, T, N, De)
-
-        # in_agg: target k (person/null_in) attends over N incoming sources
-        E_col       = E[:, :, :, :N + 1, :].permute(0, 1, 3, 2, 4)  # (B, T, N+1, N, De)
-        scores_in_t = self.pool_in(E_col).squeeze(-1)                  # (B, T, N+1, N)
-        ev_in_t     = ev_sq[:, :, :, :N + 1].permute(0, 1, 3, 2)        # (B, T, N+1, N)
-        scores_in_t = scores_in_t.masked_fill(ev_in_t == 0, float('-inf'))
-        safe_in     = scores_in_t.isinf().all(dim=-1, keepdim=True)
-        scores_in_t = scores_in_t.masked_fill(safe_in, 0.0)
-        alpha_in    = F.softmax(scores_in_t, dim=-1) * ev_in_t          # (B, T, N+1, N)
-        in_agg_full = (alpha_in.unsqueeze(-1) * E_col).sum(3)           # (B, T, N+1, De)
-        in_agg_p    = in_agg_full[:, :, :N, :]                         # (B, T, N, De)
-        in_agg_ni   = in_agg_full[:, :, N:N + 1, :]                    # (B, T, 1, De)
-
-        v_src = self.norm_src(
-            v_src + self.upd_src(torch.cat([v_src, out_agg], dim=-1))
-        )
-        v_tgt_p = self.norm_tgt(
-            v_tgt[:, :, :N, :] + self.upd_tgt(
-                torch.cat([v_tgt[:, :, :N, :], in_agg_p], dim=-1)
+        # ── ④ Node update: learned attention pooling (row/col-gated) ──────
+        #    out_agg (source over OUTGOING edges) is the row-direction node channel;
+        #    in_agg (target over INCOMING edges) is the col-direction node channel. Each
+        #    is gated by its own flag so a disabled direction contributes no node update.
+        if self.use_row_attn:
+            # out_agg: source i attends over all Tl outgoing edges
+            scores_out = self.pool_out(E).squeeze(-1)                      # (B, T, N, Tl)
+            scores_out = scores_out.masked_fill(ev_sq == 0, float('-inf'))
+            safe_out   = scores_out.isinf().all(dim=-1, keepdim=True)
+            scores_out = scores_out.masked_fill(safe_out, 0.0)
+            alpha_out  = F.softmax(scores_out, dim=-1) * ev_sq            # (B, T, N, Tl)
+            out_agg    = (alpha_out.unsqueeze(-1) * E).sum(3)             # (B, T, N, De)
+            v_src = self.norm_src(
+                v_src + self.upd_src(torch.cat([v_src, out_agg], dim=-1))
             )
-        )  # (B, T, N, De)
 
-        v_ni = self.norm_nullin(
-            v_tgt[:, :, N:N + 1, :] + self.upd_nullin(
-                torch.cat([v_tgt[:, :, N:N + 1, :], in_agg_ni], dim=-1)
-            )
-        )  # (B, T, 1, De)
+        if self.use_col_attn:
+            # in_agg: target k (person/null_in) attends over N incoming sources
+            E_col       = E[:, :, :, :N + 1, :].permute(0, 1, 3, 2, 4)  # (B, T, N+1, N, De)
+            scores_in_t = self.pool_in(E_col).squeeze(-1)                  # (B, T, N+1, N)
+            ev_in_t     = ev_sq[:, :, :, :N + 1].permute(0, 1, 3, 2)        # (B, T, N+1, N)
+            scores_in_t = scores_in_t.masked_fill(ev_in_t == 0, float('-inf'))
+            safe_in     = scores_in_t.isinf().all(dim=-1, keepdim=True)
+            scores_in_t = scores_in_t.masked_fill(safe_in, 0.0)
+            alpha_in    = F.softmax(scores_in_t, dim=-1) * ev_in_t          # (B, T, N+1, N)
+            in_agg_full = (alpha_in.unsqueeze(-1) * E_col).sum(3)           # (B, T, N+1, De)
+            in_agg_p    = in_agg_full[:, :, :N, :]                         # (B, T, N, De)
+            in_agg_ni   = in_agg_full[:, :, N:N + 1, :]                    # (B, T, 1, De)
 
-        v_tgt = torch.cat([v_tgt_p, v_ni, v_tgt[:, :, N + 1:, :]], dim=2)
+            v_tgt_p = self.norm_tgt(
+                v_tgt[:, :, :N, :] + self.upd_tgt(
+                    torch.cat([v_tgt[:, :, :N, :], in_agg_p], dim=-1)
+                )
+            )  # (B, T, N, De)
+            v_ni = self.norm_nullin(
+                v_tgt[:, :, N:N + 1, :] + self.upd_nullin(
+                    torch.cat([v_tgt[:, :, N:N + 1, :], in_agg_ni], dim=-1)
+                )
+            )  # (B, T, 1, De)
+            v_tgt = torch.cat([v_tgt_p, v_ni, v_tgt[:, :, N + 1:, :]], dim=2)
 
-        # ── ⑤ Re-inject updated nodes into edges ──────────────────────────
-        src_exp = v_src.unsqueeze(3).expand(B, T, N, Tl, De)
-        tgt_exp = v_tgt.unsqueeze(2).expand(B, T, N, Tl, De)
-        E = self.norm_inj(
-            E + self.inject(torch.cat([E, src_exp, tgt_exp], dim=-1))
-        ) * ev
+        # ── ⑤ Re-inject updated nodes into edges (skip iff NO direction active) ──
+        #    Runs when row and/or col is on, spreading the updated node(s) back into
+        #    every edge. With both off there is no node message-passing to inject, so
+        #    E carries only edge-init + refresh + temporal.
+        if self.use_row_attn or self.use_col_attn:
+            src_exp = v_src.unsqueeze(3).expand(B, T, N, Tl, De)
+            tgt_exp = v_tgt.unsqueeze(2).expand(B, T, N, Tl, De)
+            E = self.norm_inj(
+                E + self.inject(torch.cat([E, src_exp, tgt_exp], dim=-1))
+            ) * ev
 
         # ── ⑥ Temporal edge attention: each edge attends over its T frames ──
         #    Edge validity is frame-independent, so no temporal kpm is needed;
         #    globally-invalid edges are re-zeroed by * ev afterwards.
-        if T > 1:
+        #    Ablation: when use_temporal_attn is off the module is None and this
+        #    step is skipped entirely (module removed, not zeroed).
+        if self.use_temporal_attn and T > 1:
             E_t = E.permute(0, 2, 3, 1, 4).reshape(B * N * Tl, T, De)
             E_t = self.temporal(E_t)
             E = E_t.reshape(B, N, Tl, T, De).permute(0, 3, 1, 2, 4) * ev
@@ -398,10 +440,14 @@ class _UnifiedRefiner(nn.Module):
     E shape throughout: (B, T, N, Tl, De)   where Tl = N + 2.
     """
 
-    def __init__(self, edge_dim: int, num_layers: int, heads: int):
+    def __init__(self, edge_dim: int, num_layers: int, heads: int,
+                 use_row_attn: bool = True, use_col_attn: bool = True,
+                 use_temporal_attn: bool = True):
         super().__init__()
         self.layers = nn.ModuleList(
-            [_RefinerLayer(edge_dim, heads) for _ in range(num_layers)]
+            [_RefinerLayer(edge_dim, heads, use_row_attn, use_col_attn,
+                           use_temporal_attn)
+             for _ in range(num_layers)]
         )
 
     @staticmethod
@@ -472,12 +518,32 @@ class GazeGraphBlock(nn.Module):
         prior_weight: float = 0.5,
         face_dim: int = 768,           # raw GazeEncoder token dim (pre-adaptor facial feature)
         laeo_derive: str = "lah_min",  # "decoder": use head_laeo | "lah_min": derived downstream
+        use_row_attn: bool = True,     # ablation: source-over-targets edge attention
+        use_col_attn: bool = True,     # ablation: target-over-sources edge attention
+        use_temporal_attn: bool = True, # ablation: per-edge temporal attention (step ⑥)
+        use_null_in: bool = True,      # ablation: in-frame scene-object null node
+        use_null_out: bool = True,     # ablation: out-of-frame null node
+        use_face_proj: bool = True,    # ablation: detached raw-face re-injection into node init
+        use_node_geom: bool = True,    # ablation: [cx,cy,w,h,gaze_vec] geometry encoding into node init
     ):
         super().__init__()
         D, De = token_dim, edge_dim
         self.De             = De
         self.use_prior      = use_prior
         self.laeo_derive    = laeo_derive
+        # Node-init feature ablation (capacity-controlled, same pattern as use_prior):
+        # face_proj / node_geom_mlp are ALWAYS built below, so param count is unchanged;
+        # a disabled term's contribution is zeroed in forward instead of the module being
+        # skipped.
+        self.use_face_proj  = bool(use_face_proj)
+        self.use_node_geom  = bool(use_node_geom)
+        # Null-node ablation (capacity-controlled, like row/col): the slot / node
+        # params / heads are ALWAYS built, so param count is unchanged; a disabled null
+        # node is masked in ev_bool (before edge-init and KPM generation) so every
+        # E[i→null] stays 0 and is excluded as an attention KEY — cutting all of its
+        # information flow while keeping head_sa's input dimension (ni=0) intact.
+        self.use_null_in    = bool(use_null_in)
+        self.use_null_out   = bool(use_null_out)
 
         # ── Null node parameters (one per null type) ──────────────────────────
         self.null_in_node  = nn.Parameter(torch.zeros(D))
@@ -516,7 +582,10 @@ class GazeGraphBlock(nn.Module):
         self.mlp_init = MLP(4 * De, De, De)
 
         # ── Unified refiner ───────────────────────────────────────────────────
-        self.refiner = _UnifiedRefiner(De, num_layers, heads)
+        self.refiner = _UnifiedRefiner(De, num_layers, heads,
+                                       use_row_attn=use_row_attn,
+                                       use_col_attn=use_col_attn,
+                                       use_temporal_attn=use_temporal_attn)
 
         # ── Readout heads ─────────────────────────────────────────────────────
         self.head_lah      = _SocialReadoutHead(De)
@@ -573,10 +642,20 @@ class GazeGraphBlock(nn.Module):
         # null_in / null_out: any valid source
         null_valid = node_valid.unsqueeze(2)  # (B, N, 1)
 
+        # Null-node ablation: masking a null column here (BEFORE edge-init and KPM
+        # generation below) is the single control point — ev, ev_bool_T, row_kpm,
+        # col_kpm and the readout edge_valid all derive from ev_bool, so a masked null
+        # edge is zeroed by ``* ev`` AND excluded as an attention key. Zeroing the value
+        # alone is insufficient: the attention K/V projections have bias, so a
+        # zero-valued key still absorbs softmax mass and leaks into person edges.
+        false_col = torch.zeros_like(null_valid)  # (B, N, 1) all-False
+        null_in_col  = null_valid if self.use_null_in  else false_col
+        null_out_col = null_valid if self.use_null_out else false_col
+
         ev_bool = torch.cat([
             p2p_valid,                           # (B, N, N)   person targets
-            null_valid.expand(B, N, 1),          # null_in
-            null_valid.expand(B, N, 1),          # null_out
+            null_in_col.expand(B, N, 1),         # null_in
+            null_out_col.expand(B, N, 1),        # null_out
         ], dim=2)  # (B, N, Tl)
 
         # expand over T
@@ -635,9 +714,17 @@ class GazeGraphBlock(nn.Module):
 
         # ── Unified node init (V14): node = LN(person_token + face) + geom ─────
         #    person_token = scene context; face = detached raw GazeEncoder token.
+        #    Ablation: use_face_proj / use_node_geom zero their term (same
+        #    capacity-controlled pattern as use_prior) instead of skipping the module.
         geom     = torch.cat([centers, wh, gaze_vecs], dim=-1).to(dtype)  # (B, T, N, 6)
-        geom_emb = self.node_geom_mlp(geom)                              # (B, T, N, D)
-        face     = self.face_proj(gaze_feat.detach().to(dtype))         # (B, T, N, D)
+        if self.use_node_geom:
+            geom_emb = self.node_geom_mlp(geom)                          # (B, T, N, D)
+        else:
+            geom_emb = torch.zeros(B, T, N, D, device=device, dtype=dtype)
+        if self.use_face_proj:
+            face = self.face_proj(gaze_feat.detach().to(dtype))         # (B, T, N, D)
+        else:
+            face = torch.zeros(B, T, N, D, device=device, dtype=dtype)
         node     = self.node_in_norm(person_tokens + face) + geom_emb   # (B, T, N, D)
 
         # src and tgt persons share the same node feature; nulls are target-only.

@@ -5,13 +5,13 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 #SBATCH --job-name=vsgaze_train
-#SBATCH --gres=gpu:mig48gb:1
+#SBATCH --gres=gpu:rtx6000:1
 #SBATCH --time=48:00:00
 #SBATCH -c 8
 #SBATCH -p gpu
-#SBATCH --mem=48G
-#SBATCH --output=logs/vg_gaze_graph_%j.out
-#SBATCH --error=logs/vg_gaze_graph_%j.err
+#SBATCH --mem=60G
+#SBATCH --output=logs/ARGUS-no_priors_%j.out
+#SBATCH --error=logs/ARGUS-no_priors_%j.err
 
 # conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
 source /opt/miniconda3/etc/profile.d/conda.sh
@@ -33,9 +33,9 @@ WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # GazeFol
 
 FROZEN=false
 
-EXP_NAME="MTGS+graph"
+EXP_NAME="ARGUS-no_priors"
 
-CHECKPOINT_MONITOR="metric/val/social_ap"
+CHECKPOINT_MONITOR="metric/val/social_f1"
 CHECKPOINT_MODE="max"
 
 LAEO_DERIVE="decoder"

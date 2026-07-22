@@ -2,10 +2,10 @@
 # Runs VSGaze test then computes post-processed metrics (Dist, AP_IO, F1_LAH, F1_LAEO, AP_SA).
 
 #SBATCH --job-name=metric_calculation
-#SBATCH --gres=gpu:rtx6000:1
+#SBATCH --gres=gpu:mig48gb:1
 #SBATCH --time=01:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
+#SBATCH --mem=48G
 #SBATCH -p gpu
 #SBATCH --output=logs/metric_calculation_%j.out
 
@@ -59,4 +59,18 @@ with open(sys.argv[1], 'rb') as f:
             except EOFError:
                 break
 compute(results, shuffle=False, thr=0.5)
+
+# VSGaze combines four source datasets. Reuse the completed prediction dump and
+# print one self-contained metric section per source; no additional test pass.
+def _dataset_names(batch):
+    value = batch.get("dataset", ())
+    return (value,) if isinstance(value, str) else value
+
+sources = sorted({name for batch in results for name in _dataset_names(batch)})
+if len(sources) > 1:
+    print("\n" + "=" * 60)
+    print("  PER-SOURCE VSGAZE METRICS")
+    print("=" * 60)
+    for source in sources:
+        compute(results, dataset=source, shuffle=False, thr=0.5)
 EOF

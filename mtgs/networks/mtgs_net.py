@@ -56,6 +56,13 @@ class MTGS(nn.Module):
         gaze_graph_prior_weight: float = 0.5,
         gaze_graph_laeo_derive: str = "decoder",
         gaze_graph_use: bool = True,
+        gaze_graph_use_row_attn: bool = True,
+        gaze_graph_use_col_attn: bool = True,
+        gaze_graph_use_temporal_attn: bool = True,
+        gaze_graph_use_null_in: bool = True,
+        gaze_graph_use_null_out: bool = True,
+        gaze_graph_use_face_proj: bool = True,
+        gaze_graph_use_node_geom: bool = True,
     ):
         super().__init__()
 
@@ -172,6 +179,13 @@ class MTGS(nn.Module):
                 prior_weight=gaze_graph_prior_weight,
                 face_dim=token_dim,   # raw GazeEncoder token dim (pre-adaptor face)
                 laeo_derive=gaze_graph_laeo_derive,  # skip head_laeo forward when "lah_min"
+                use_row_attn=gaze_graph_use_row_attn,
+                use_col_attn=gaze_graph_use_col_attn,
+                use_temporal_attn=gaze_graph_use_temporal_attn,
+                use_null_in=gaze_graph_use_null_in,
+                use_null_out=gaze_graph_use_null_out,
+                use_face_proj=gaze_graph_use_face_proj,
+                use_node_geom=gaze_graph_use_node_geom,
             )
         else:
             # Original social decoders: LAH (directed [h_i‖h_j]) + SA (symmetric
