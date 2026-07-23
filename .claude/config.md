@@ -42,7 +42,7 @@ data:
   temporal_stride: 3
   temporal_context: 2     # window_size = 2*2+1 = 5 프레임
   heatmap_size: 64
-  num_samples: 36000      # GazeFollow: 108955, VSGaze: 36000
+  num_samples: 36000      # 참고용 메모(GazeFollow: 108955, VSGaze: 36000) — 코드에서 실제로 읽지 않는 죽은 키
 ```
 
 ---
@@ -66,13 +66,20 @@ train:
   epochs: 20
   batch_size: 8
   freeze:
-    image_tokenizer: True   # DINOv2 관련 frozen (기본값)
+    gaze_encoder: False
+    gaze_encoder_backbone: False
+    image_tokenizer: True   # 미사용 모듈(forward에서 호출 안 됨)이라 실질 효과 없음
     vit_encoder: True
-  swa:
-    use: True
-    epoch_start: 12
-    annealing_epochs: 6
+    vit_adaptor: False
+    gaze_decoder: False     # output="point"일 때만 존재하는 모듈; heatmap 모드에선 미생성
+    inout_decoder: False
+    all_but_gaze_graph: False   # true면 위 플래그 전부 무시하고 trunk 전체 freeze + gaze_graph_block만 학습
+  checkpoint_monitor: "metric/val/dist"   # train_vsgaze.sh는 "metric/val/social_ap"로 오버라이드
+  checkpoint_mode: "min"                   # social_ap 사용 시 "max"
 ```
+
+> `depth_tokenizer` freeze 키는 존재하지 않는다 — config에 있어도 코드에서 읽지 않는 무효 키다.
+> SWA(Stochastic Weight Averaging)는 코드/콜백 어디에도 없다.
 
 ---
 
@@ -84,44 +91,47 @@ val:
 
 test:
   checkpoint: null          # CLI에서 test.checkpoint=<path>로 오버라이드
-  batch_size: 4             # test는 가변 N 패딩 때문에 train보다 작게 설정
-  max_people: 11            # 이 수보다 많은 사람이 있는 샘플은 스킵
-                            # null = 제한 없음 (VRAM 변동성 심함 주의)
-                            # VSGaze test 기준: N≤11 → 95.3% 샘플 커버
+  batch_size: 1             # num_people="all"(가변 N)이라 배치=1로 cross-sample padding 이슈 회피
 ```
 
-**`max_people` 동작 흐름:**
-`config.yaml` → `dataset.py:build_dataset()` → `VSGazeDataModule(max_people=11)`  
-→ `test_dataloader()` → `_filter_by_max_people()` → `Subset`으로 필터링
+`test.max_people` 같은 상한 필터는 없다 — variable-N 문제는 batch_size=1로 우회한다 (자세한 내용은
+[architecture.md](architecture.md)의 "Test 배치 처리" 참조).
 
 ---
 
-## Interaction 설정
+## Gaze Graph 설정 (social-prediction head)
 
 ```yaml
-interaction:
-  type: hypergraph      # "transformer" | "graph" | "hypergraph"
-  order: "extract_first" # "inject_first" (원본 순서) | "extract_first" (신규)
-  num_layers: 2         # HypergraphBlock / SocialGraphBlock 내부 iteration 수
-
-  graph:                # graph 모드 전용
-    aggr: "outgoing"
-    use_null_node: true   # dual-null (loss 전용; 예측엔 미사용)
-    lambda_null: 0.5
-    use_gaze_prior: true  # directed 블록 LAH 방향 prior
-    prior_weight: 0.5
-    use_sa_prior: true    # ★ 이제 undirected SA 블록의 gaze·gaze prior를 제어 (directed 블록은 use_sa_prior=False 고정)
-    sa_prior_weight: 0.5
-  use_gws: false          # GWS: trunk에 gaze_scene_proj+gaze_fusion 융합 (별도 _gws decoder 없음)
+gaze_graph:
+  use: true                # true: GazeGraphBlock 헤드 | false: 원본 social decoder(decoder_lah/decoder_sa)
+  num_layers: 2
+  edge_dim: 512             # node D(=token_dim)와 동일 차원
+  detach_input: true        # social loss가 trunk(people_interaction/temporal)로 안 흐르게 firewall
+  laeo_derive: "decoder"    # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
+  use_prior: true           # 4채널 기하 edge prior 사용 여부 (prior_w는 항상 zero-init)
+  use_face_proj: true       # detached raw-face(GazeEncoder token) node 재주입
+  use_node_geom: false      # [cx,cy,w,h,gaze_vec] geometry MLP node 재주입
+  use_type_embed: true      # person/null_in/null_out target-type embedding (edge init)
+  frozen: false             # true면 train.freeze.all_but_gaze_graph와 동일하게 동작
+  lambda_null: 0.5          # dual-null(null_in+null_out) aux loss weight
+  head_lr_mult: 100         # gaze_graph_block 전용 LR = optimizer.lr * head_lr_mult
+  use_row_attn: true        # ablation: row edge-attention (source→outgoing targets)
+  use_col_attn: true        # ablation: col edge-attention (target→incoming sources)
+  use_temporal_attn: true   # ablation: graph 자체의 per-edge temporal attention (T>1일 때만)
+  use_null_in: true         # ablation: in-frame scene-object null node
+  use_null_out: true        # ablation: out-of-frame null node
 ```
 
-**Graph 모드 구조 (2-graph 분리)**: directed `SocialGraphBlock`(LAH/LAEO/heatmap) + 전용 undirected `UndirectedSocialGraphBlock`(SA). LAEO는 `min(LAH_ij, LAH_ji)`로 derive (`decoder_laeo` 미사용). 자세한 내용은 [interaction_module.md](.claude/interaction_module.md), [architecture.md](.claude/architecture.md) 참조.
+`use_row_attn`/`use_col_attn`/`use_null_in`/`use_null_out`/`use_face_proj`/`use_node_geom`/`use_type_embed`는
+capacity-controlled ablation (모듈은 항상 생성, off면 forward에서 기여만 0으로 마스킹 → 체크포인트 호환 유지).
+`use_temporal_attn`만 module-skip 방식(off면 모듈 자체 미생성). `prior_weight` 키는 더 이상 없음 —
+`prior_w`는 항상 zero-init 학습 파라미터. 수식/버전 이력은 [gaze_graph_math.md](gaze_graph_math.md),
+[version.md](version.md) 참조.
 
-**`interaction.order` 동작:**
-- `inject_first`: Injector → ViT → Extractor → Social (원본)
-- `extract_first`: Extractor → Social → Injector → ViT (scene-aware social interaction)
-
-**모드 간 호환 주의**: GazeFollow Stage1과 VSGaze Stage2는 반드시 동일한 `type` + `order` 조합 사용.
+> **2026-06-13 제거됨**: `interaction.type` (`transformer`/`graph`/`hypergraph`)과 `SocialGraphBlock`/
+> `UndirectedSocialGraphBlock`/`HypergraphBlock` 기반 구조는 완전히 삭제되고 `gaze_graph`(GazeGraphBlock)
+> 단일 아키텍처로 리팩토링됐다. 과거 `interaction:` config 섹션은 더 이상 존재하지 않는다 —
+> 관련 문서는 [interaction_module.md](interaction_module.md)에 역사적 참고용으로만 남아있다.
 
 ---
 
@@ -133,9 +143,9 @@ optimizer:
   weight_decay: 1e-3
 
 scheduler:
-  type: CosineAnnealingWarmRestarts
-  warmup_epochs: 4
-  t_0_epochs: 20
+  type: CosineAnnealingLR   # "CosineAnnealingLR": step 단위 linear warmup→cosine decay | "constant": 고정 LR
+  warmup_epochs: 3          # linear warmup 길이 (epoch 단위, step으로 환산되어 적용)
+  eta_min: 0                # cosine decay 최종 LR 하한
 ```
 
 ---
@@ -145,14 +155,12 @@ scheduler:
 ```bash
 # test 단독 실행
 python main.py experiment.task=test \
-    test.checkpoint=/path/to/best.ckpt \
-    test.max_people=11
+    test.checkpoint=/path/to/best.ckpt
 
-# batch_size, max_people 조정
-python main.py experiment.task=test \
-    test.checkpoint=... \
-    test.batch_size=8 \
-    test.max_people=null
+# gaze_graph ablation 예시 (row/col attention 끄기)
+python main.py experiment.task=train+test \
+    gaze_graph.use_row_attn=false \
+    gaze_graph.use_col_attn=false
 ```
 
 ---

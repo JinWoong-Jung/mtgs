@@ -43,14 +43,14 @@ MTGS/
 ├── scripts/
 │   ├── main.py
 │   ├── main_llm.py
-│   ├── train_gazefollow.sh
-│   ├── train_vsgaze.sh
-│   ├── train_postgraph.sh    # post-training: trunk frozen, gaze_graph_block만 학습
+│   ├── train_vsgaze.sh       # VSGaze 파인튜닝 (FROZEN=true/false로 post-training 겸용)
 │   ├── train_llm_align.sh
-│   ├── test_gazefollow.sh
 │   └── test_vsgaze.sh
 └── logs/
 ```
+
+> 2026-07: `train_gazefollow.sh`, `train_postgraph.sh`, `test_gazefollow.sh`, `test_vat.sh` 삭제.
+> `train_postgraph.sh`는 `train_vsgaze.sh`에서 `FROZEN=true` + `gaze_graph.frozen=true` 조합으로 대체 가능해 중복 제거. GazeFollow stage-1 재학습이 필요하면 `train_vsgaze.sh`를 `experiment.dataset=gazefollow`로 오버라이드해서 사용.
 
 ---
 
@@ -125,18 +125,18 @@ MTGS/
 ## 학습 파이프라인
 
 ```bash
-# Stage 1: GazeFollow 사전학습
-sbatch scripts/train_gazefollow.sh   # EXP_NAME 상단에서 설정
+# Stage 1: GazeFollow 사전학습 (experiment.dataset=gazefollow로 오버라이드)
+sbatch scripts/train_vsgaze.sh       # EXP_NAME, WEIGHTS 상단에서 설정
 
 # Stage 2: VSGaze 파인튜닝 (train+test 자동 실행)
 sbatch scripts/train_vsgaze.sh       # WEIGHTS, EXP_NAME, LAEO_DERIVE 설정
 
 # Post-training: trunk frozen, gaze_graph_block만 재학습
-sbatch scripts/train_postgraph.sh    # FROZEN=true/false 설정
+# → train_vsgaze.sh에서 FROZEN=true (+ WEIGHTS를 VSGaze ckpt로) 설정하고 그대로 실행
+sbatch scripts/train_vsgaze.sh
 
 # test 단독 실행
 sbatch scripts/test_vsgaze.sh        # CHECKPOINT에 대상 ckpt 경로 설정
-sbatch scripts/test_gazefollow.sh
 ```
 
 ---
@@ -158,14 +158,27 @@ train은 `num_people=4` 고정, test는 `num_people="all"`(가변). test `batch_
 gaze_graph:
   use: true                 # true: GazeGraphBlock 헤드 | false: 원본 social decoder (decoder_lah/decoder_sa)
   num_layers: 2
-  edge_dim: 128
-  use_prior: true
-  prior_weight: 0.5
-  use_node_xattn: true
+  edge_dim: 512              # node D와 동일 차원 (V14~)
+  detach_input: true         # social loss가 trunk(people_interaction/temporal)로 안 흐르게 firewall
+  laeo_derive: "decoder"     # "decoder": head_laeo MLP | "lah_min": min(LAH_i→j, LAH_j→i)
+  use_prior: true            # 기하 edge prior(4채널) 사용 여부; prior_w는 zero-init 학습 스칼라
+  use_face_proj: true        # detached raw-face(GazeEncoder token) node 재주입
+  use_node_geom: false       # [cx,cy,w,h,gaze_vec] geometry MLP node 재주입
+  use_type_embed: true       # person/null_in/null_out target-type embedding (edge init)
   frozen: false
-  laeo_derive: "lah_min"    # "lah_min" | "decoder" (전용 MLP head 직접 사용)
-  lambda_null: 0.5          # null aux loss weight
+  lambda_null: 0.5           # dual-null(null_in+null_out) aux loss weight
+  head_lr_mult: 100          # gaze_graph_block 전용 LR 배수 (graph_lr = optimizer.lr * head_lr_mult)
+  use_row_attn: true         # ablation: source i가 자신의 outgoing edges attend
+  use_col_attn: true         # ablation: target k가 incoming edges attend
+  use_temporal_attn: true    # ablation: graph 자체의 per-edge temporal attention (step ⑥, T>1일 때만)
+  use_null_in: true          # ablation: in-frame scene-object null node
+  use_null_out: true         # ablation: out-of-frame null node
+```
 
+`prior_weight`는 제거됨 — `prior_w`는 항상 zero-init 학습 파라미터(`face_proj`/`node_geom_mlp`와 동일한 "safe no-op" 초기화 패턴)이므로 config로 초기값을 줄 필요가 없다.
+`use_row_attn`/`use_col_attn`/`use_null_in`/`use_null_out`/`use_face_proj`/`use_node_geom`/`use_type_embed`는 모두 **capacity-controlled ablation**: 모듈/파라미터는 항상 생성되고, 비활성 시 forward에서 해당 항목의 기여만 0으로 마스킹한다 (체크포인트 호환성 유지). 유일하게 `use_temporal_attn=false`는 모듈 자체를 생성하지 않는 module-skip 방식.
+
+```yaml
 vlm:                        # LLM alignment stage (별도 파이프라인)
   ...
 
@@ -173,7 +186,7 @@ test:
   batch_size: 1
 ```
 
-**`train_postgraph.sh` 전용:**
+**Post-training (trunk frozen) — `train_vsgaze.sh`의 `FROZEN` 변수:**
 ```bash
 FROZEN=true    # true: trunk FREEZE + gaze_graph_block만 학습 (stage-2 VSGaze ckpt 권장)
                # false: 전체 joint training (stage-1 GazeFollow ckpt 권장)

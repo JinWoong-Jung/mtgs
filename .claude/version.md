@@ -14,7 +14,9 @@
 | V11  | 없음 | `experiments/V11/train/checkpoints/best.ckpt` | 아래 diff로 재현 |
 | V12  | 없음 | `experiments/V12/...` | 아래 diff로 재현 |
 | V13  | 없음 | `experiments/V13/...` | 아래 diff로 재현 |
-| V14  | 없음 (현재 working tree) | `experiments/V14/...` (학습 예정) | 현재 코드 그대로 (node init 개편 + node 기반 SA) |
+| V14  | 없음 | `experiments/V14/...` | ⚠️ superseded — SA head를 node 기반으로 바꾼 실험이었으나 V14.5에서 롤백됨 |
+| V14.5 | 없음 | `experiments/V14.5/...` | SA head edge 기반(5×De)으로 롤백, node-update scoring은 V14 그대로(Linear) |
+| 현재 (V16+, ablation 시스템) | `daa428f`(ARGUS, HEAD) + working tree | — | 아래 "현재 아키텍처 (V16 이후)" 절 참조 — **지금 `train_vsgaze.sh`가 실제로 돌리는 코드** |
 
 ---
 
@@ -484,6 +486,48 @@ scores_in_t = self.pool_in(E_col).squeeze(-1)
 | V14   | node 기반 2×De | Linear(De→1) |
 | V14.5 | **edge 기반 5×De** | Linear(De→1) |
 | V15   | edge 기반 5×De | **MLP(cat[node,edge]→1)** |
+
+---
+
+## 현재 아키텍처 (V16 이후 — `train_vsgaze.sh`가 실제로 돌리는 코드)
+
+> git log상 V14.5 이후 `V14.7`, `V14.8`, `V16`, `V14.5++`, `graph-vlm routing`, `graph - detach`,
+> `ARGUS`(HEAD) 커밋이 이어졌고, 그 위에 현재 uncommitted 변경이 더 있다. 커밋별 상세 diff는
+> 이 문서에 개별 기록되어 있지 않으므로 필요하면 `git log --oneline -- mtgs/networks/adaptor_modules.py`
+> 로 직접 추적할 것. 아래는 **지금 코드의 최종 상태**만 정리한다 (V14.5 대비 달라진 점 중심).
+
+SA head / node-update scoring은 V14.5와 동일(edge 기반 5×De, node-update scoring=Linear). 그 위에
+추가된 것:
+
+### 1. `detach_input` (Option A firewall)
+`gaze_graph.detach_input=true`(기본)면 `GazeGraphBlock`에 들어가는 `person_tokens`를 detach —
+social loss(LAH/LAEO/SA/null)가 trunk의 `people_interaction`/`people_temporal`로 역전파되지 않고
+오직 `gaze_graph_block` 자체만 학습시킨다. row/col ablation이 의미를 가지려면 관계 추론이 그래프
+안에만 갇혀 있어야 하므로 도입됨.
+
+### 2. Row/Col/Temporal attention을 개별 ablation 스위치로 분리
+`use_row_attn`/`use_col_attn`/`use_temporal_attn` 3개 플래그 추가. row/col은
+capacity-controlled(모듈 항상 생성, off면 forward에서 기여만 0), temporal은 module-skip(off면
+아예 미생성). 상세 6단계 refiner 구조는 [gaze_graph_math.md](gaze_graph_math.md) §3 참조.
+
+### 3. Null node를 개별 ablation으로 분리
+`use_null_in`/`use_null_out`(기본 둘 다 true). 이전에는 사실상 하나의 dual-null 개념이었으나,
+"scene 응시(null_in)"와 "화면 밖(null_out)"을 독립적으로 끄고 켤 수 있게 분리.
+
+### 4. Node-init 항목별 ablation
+`use_face_proj`(face 재주입), `use_node_geom`(geometry MLP), `use_type_embed`(edge init의
+person/null_in/null_out type embedding) — V14의 "통합 node init" 자체를 항목별로 분해해 각각
+capacity-controlled ablation 대상으로 만듦.
+
+### 5. `prior_weight` 제거, `prior_w`는 항상 zero-init
+과거엔 `gaze_graph.prior_weight`(기본 0.5)로 `prior_w`의 초기값을 설정했으나, `face_proj`/
+`node_geom_mlp`와 같은 "zero-init = safe no-op" 패턴으로 통일하기 위해 config 초기값을 없애고
+`torch.zeros(())`로 고정.
+
+### 6. `head_lr_mult` 도입 (기본 100)
+`gaze_graph_block`은 random-init이고 `detach_input=true`에서는 social loss가 학습시키는 유일한
+모듈이라, warm-start된 trunk와 같은 LR(구버전엔 base×3 고정)로는 불충분 — `optimizer.lr *
+gaze_graph.head_lr_mult`로 독립 스케일링하도록 변경.
 
 ---
 

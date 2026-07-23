@@ -1,5 +1,12 @@
 # Interaction Module 상세 동작 분석
 
+> ⚠️ **DEPRECATED (2026-06-13)**: 이 문서는 `interaction.type` (`transformer`/`graph`/`hypergraph`)
+> 스위치와 `SocialGraphBlock`/`UndirectedSocialGraphBlock`/`TemporalGraphBlock`으로 구성됐던
+> **삭제된 아키텍처**를 다룬다. 해당 코드는 저장소에 더 이상 존재하지 않으며, `train_vsgaze.sh`를
+> 비롯한 현재 파이프라인과 무관하다. 현재 유일한 social-prediction head는 `GazeGraphBlock`이며,
+> 그 상세 동작은 [architecture.md](architecture.md)와 [gaze_graph_math.md](gaze_graph_math.md)를
+> 참조할 것. 이 문서는 과거 설계의 역사적 참고 자료로만 남겨둔다.
+
 N=3 (person 0, 1, 2), num_layers=2, use_null_node=True, use_gaze_prior=True 가정.
 
 ---
