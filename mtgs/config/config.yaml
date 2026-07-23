@@ -40,7 +40,7 @@ model:
 # ── Gaze Graph (social-prediction head; attached after the fixed interaction trunk) ──
 gaze_graph:
   # Core graph architecture
-  use: true             # true: GazeGraphBlock head | false: social decoder(person token pair→LAH/LAEO/SA)
+  use: false             # true: GazeGraphBlock head | false: social decoder(person token pair→LAH/LAEO/SA)
   num_layers: 2
   edge_dim: 512         # edge/refiner width (raised 256→512 to match trunk relational scale)
 
@@ -92,8 +92,8 @@ gaze_graph:
   # Its BCE aux loss is auto-dropped when off. null_in = in-frame scene-object node
   # (SA's direct consumer); null_out = out-of-frame routing node.
   #   Full: true/true | -Null_in: false/true | -Null_out: true/false | -Both: false/false
-  use_null_in: true
-  use_null_out: true
+  use_null_in: false
+  use_null_out: false
 
 head_detector:
   checkpoint_file: /home/jinwoongjung/MTGS/weights/crowdhuman_yolov5m.pt # update path

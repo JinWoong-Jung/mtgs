@@ -10,8 +10,8 @@
 #SBATCH -c 8
 #SBATCH -p gpu
 #SBATCH --mem=60G
-#SBATCH --output=logs/no_row&col_%j.out
-#SBATCH --error=logs/no_row&col_%j.err
+#SBATCH --output=logs/mtgs_%j.out
+#SBATCH --error=logs/mtgs_%j.err
 
 # conda 환경 활성화 (user site-packages 무시하여 ~/.local 충돌 방지)
 source /opt/miniconda3/etc/profile.d/conda.sh
@@ -33,7 +33,7 @@ WEIGHTS="/home/jinwoongjung/MTGS/weights/mtgs-static-gazefollow.ckpt"  # GazeFol
 
 FROZEN=false
 
-EXP_NAME="no_row&col"
+EXP_NAME="mtgs"
 
 CHECKPOINT_MONITOR="metric/val/social_ap"
 CHECKPOINT_MODE="max"
